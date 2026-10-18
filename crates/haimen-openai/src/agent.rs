@@ -32,6 +32,9 @@ enum SseLine {
 struct ChatMessage {
     role: String,
     content: String,
+    /// 本轮 id，仅用于进程内配对 user/assistant，不序列化进请求体
+    #[serde(skip)]
+    turn_id: u64,
 }
 
 /// OpenAI 兼容 Agent
@@ -91,31 +94,33 @@ impl OpenAIAgent {
         }
     }
 
-    /// 取出已有历史并追加本轮 user 消息；`session_id == None` 时生成新 id
+    /// 取出已有历史（含尚未完成的 in-flight user），追加本轮 user 并立刻写入。
+    /// 同 `session_id` 的并发请求因此能带上进行中的轮次，而不是等 SSE 结束后才可见。
+    /// `session_id == None` 时生成新 id。
     fn prepare_turn(
         &self,
         message: &str,
         session_id: Option<&str>,
-    ) -> Result<(String, Vec<ChatMessage>), String> {
+    ) -> Result<(String, Vec<ChatMessage>, u64), String> {
         let sid = match session_id.map(str::trim).filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
             None => new_session_id(),
         };
-        let mut messages = {
-            let guard = self
-                .history
-                .lock()
-                .map_err(|e| format!("读取会话历史失败: {e}"))?;
-            guard
-                .get(&sid)
-                .map(|q| q.iter().cloned().collect::<Vec<_>>())
-                .unwrap_or_default()
-        };
-        messages.push(ChatMessage {
+        let turn_id = next_turn_id();
+        let user = ChatMessage {
             role: "user".to_string(),
             content: message.to_string(),
-        });
-        Ok((sid, messages))
+            turn_id,
+        };
+        let mut guard = self
+            .history
+            .lock()
+            .map_err(|e| format!("读取会话历史失败: {e}"))?;
+        let queue = guard.entry(sid.clone()).or_default();
+        let mut messages: Vec<ChatMessage> = queue.iter().cloned().collect();
+        messages.push(user.clone());
+        push_capped(queue, self.history_cap, user);
+        Ok((sid, messages, turn_id))
     }
 
     /// `POST /chat/completions`。成功时返回响应体流；失败时读完错误正文再返回。
@@ -190,7 +195,7 @@ impl AgentProvider for OpenAIAgent {
         if message.trim().is_empty() {
             return Err("消息为空，无法调用 OpenAI".to_string());
         }
-        let (sid, messages) = self.prepare_turn(message, session_id)?;
+        let (sid, messages, turn_id) = self.prepare_turn(message, session_id)?;
         let response = self.post_chat(&messages, false).await?;
         let body = response.text().await.map_err(|e| {
             format!(
@@ -199,7 +204,7 @@ impl AgentProvider for OpenAIAgent {
             )
         })?;
         let text = extract_message_content(&body)?;
-        commit_history(&self.history, &sid, self.history_cap, message, &text)?;
+        commit_assistant(&self.history, &sid, self.history_cap, turn_id, &text)?;
         Ok((
             AgentOutput {
                 text,
@@ -219,7 +224,7 @@ impl AgentProvider for OpenAIAgent {
         if message.trim().is_empty() {
             return Err("消息为空，无法调用 OpenAI".to_string());
         }
-        let (sid, messages) = self.prepare_turn(message, session_id)?;
+        let (sid, messages, turn_id) = self.prepare_turn(message, session_id)?;
         let response = self.post_chat(&messages, true).await?;
         let (text_tx, text_rx) = mpsc::channel::<String>(32);
         spawn_sse_reader(
@@ -227,7 +232,7 @@ impl AgentProvider for OpenAIAgent {
             text_tx,
             Arc::clone(&self.history),
             sid.clone(),
-            message.to_string(),
+            turn_id,
             self.history_cap,
         );
         let stream: TextStream = Box::pin(ReceiverStream::new(text_rx));
@@ -270,22 +275,20 @@ impl AgentProvider for OpenAIAgent {
     }
 }
 
-/// 后台读 SSE：每解析出一个非空 delta 就发送，结束后把本轮写回历史
+/// 后台读 SSE：每解析出一个非空 delta 就发送，结束后把 assistant 插回对应 user 之后
 fn spawn_sse_reader(
     response: reqwest::Response,
     tx: mpsc::Sender<String>,
     history: Arc<Mutex<HashMap<String, VecDeque<ChatMessage>>>>,
     sid: String,
-    user: String,
+    turn_id: u64,
     cap: usize,
 ) {
     let started = Instant::now();
     tokio::spawn(async move {
         let assistant = collect_sse(response, &tx).await;
-        if !assistant.is_empty() {
-            if let Err(err) = commit_history(&history, &sid, cap, &user, &assistant) {
-                tracing::warn!(error = %err, "写入 OpenAI 会话历史失败");
-            }
+        if let Err(err) = commit_assistant(&history, &sid, cap, turn_id, &assistant) {
+            tracing::warn!(error = %err, "写入 OpenAI 会话历史失败");
         }
         drop(tx);
         tracing::debug!(
@@ -453,34 +456,45 @@ fn extract_message_content(body: &str) -> Result<String, String> {
     Ok(content.to_string())
 }
 
-/// 成功后追加 user 与 assistant，超出上限时从头部丢弃
-fn commit_history(
+/// 把 assistant 插到对应 in-flight user 之后；空回复或 cap=0 时不写入
+fn commit_assistant(
     history: &Mutex<HashMap<String, VecDeque<ChatMessage>>>,
     sid: &str,
     cap: usize,
-    user: &str,
+    turn_id: u64,
     assistant: &str,
 ) -> Result<(), String> {
+    if cap == 0 || assistant.is_empty() {
+        return Ok(());
+    }
     let mut guard = history
         .lock()
         .map_err(|e| format!("写入会话历史失败: {e}"))?;
     let queue = guard.entry(sid.to_string()).or_default();
-    push_capped(
-        queue,
-        cap,
-        ChatMessage {
-            role: "user".to_string(),
-            content: user.to_string(),
-        },
-    );
-    push_capped(
-        queue,
-        cap,
+    let Some(user_pos) = queue
+        .iter()
+        .position(|m| m.turn_id == turn_id && m.role == "user")
+    else {
+        return Ok(());
+    };
+    let insert_at = user_pos + 1;
+    if queue
+        .get(insert_at)
+        .is_some_and(|m| m.turn_id == turn_id && m.role == "assistant")
+    {
+        return Ok(());
+    }
+    queue.insert(
+        insert_at,
         ChatMessage {
             role: "assistant".to_string(),
             content: assistant.to_string(),
+            turn_id,
         },
     );
+    while queue.len() > cap {
+        queue.pop_front();
+    }
     Ok(())
 }
 
@@ -504,6 +518,12 @@ fn new_session_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("openai_{millis}_{n}")
+}
+
+/// 生成进程内唯一的轮次 id，用于把流式 assistant 插回对应 user 之后
+fn next_turn_id() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// 错误文案里去掉 api_key，避免密钥进入日志或返回值
@@ -571,22 +591,116 @@ mod tests {
         assert_eq!(extract_delta("not-json"), None);
     }
 
+    fn chat(role: &str, content: &str, turn_id: u64) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            turn_id,
+        }
+    }
+
+    fn roles_and_contents(queue: &VecDeque<ChatMessage>) -> Vec<(&str, &str)> {
+        queue
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_str()))
+            .collect()
+    }
+
     #[test]
     fn test_history_cap() {
         let mut queue = VecDeque::new();
         for i in 0..25 {
-            push_capped(
-                &mut queue,
-                20,
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: i.to_string(),
-                },
-            );
+            push_capped(&mut queue, 20, chat("user", &i.to_string(), i as u64));
         }
         assert_eq!(queue.len(), 20);
         assert_eq!(queue.front().expect("队列非空").content, "5");
         assert_eq!(queue.back().expect("队列非空").content, "24");
+    }
+
+    #[test]
+    fn test_in_flight_user_visible_to_next_prepare() {
+        let agent = OpenAIAgent::new("http://127.0.0.1:1", None, "m", 0);
+        let (sid, first, _) = agent
+            .prepare_turn("hello", Some("sess"))
+            .expect("首轮 prepare 应成功");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].content, "hello");
+        let (_, second, _) = agent
+            .prepare_turn("interrupt", Some(&sid))
+            .expect("打断轮 prepare 应成功");
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].content, "hello");
+        assert_eq!(second[1].content, "interrupt");
+        let guard = agent.history.lock().expect("历史锁");
+        let queue = guard.get(&sid).expect("会话应已存在");
+        assert_eq!(
+            roles_and_contents(queue),
+            vec![("user", "hello"), ("user", "interrupt")]
+        );
+    }
+
+    #[test]
+    fn test_assistant_inserts_after_matching_in_flight_user() {
+        let agent = OpenAIAgent::new("http://127.0.0.1:1", None, "m", 0);
+        let (sid, _, turn_a) = agent
+            .prepare_turn("hello", Some("sess"))
+            .expect("首轮 prepare 应成功");
+        let (_, _, turn_b) = agent
+            .prepare_turn("interrupt", Some(&sid))
+            .expect("打断轮 prepare 应成功");
+        commit_assistant(&agent.history, &sid, DEFAULT_HISTORY_CAP, turn_a, "reply-a")
+            .expect("写入 A 的 assistant 应成功");
+        {
+            let guard = agent.history.lock().expect("历史锁");
+            let queue = guard.get(&sid).expect("会话应已存在");
+            assert_eq!(
+                roles_and_contents(queue),
+                vec![
+                    ("user", "hello"),
+                    ("assistant", "reply-a"),
+                    ("user", "interrupt")
+                ]
+            );
+        }
+        commit_assistant(&agent.history, &sid, DEFAULT_HISTORY_CAP, turn_b, "reply-b")
+            .expect("写入 B 的 assistant 应成功");
+        let guard = agent.history.lock().expect("历史锁");
+        let queue = guard.get(&sid).expect("会话应已存在");
+        assert_eq!(
+            roles_and_contents(queue),
+            vec![
+                ("user", "hello"),
+                ("assistant", "reply-a"),
+                ("user", "interrupt"),
+                ("assistant", "reply-b")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_later_turn_finishing_first_does_not_reorder_pairs() {
+        let agent = OpenAIAgent::new("http://127.0.0.1:1", None, "m", 0);
+        let (sid, _, turn_a) = agent
+            .prepare_turn("hello", Some("sess"))
+            .expect("首轮 prepare 应成功");
+        let (_, _, turn_b) = agent
+            .prepare_turn("interrupt", Some(&sid))
+            .expect("打断轮 prepare 应成功");
+        commit_assistant(&agent.history, &sid, DEFAULT_HISTORY_CAP, turn_b, "reply-b")
+            .expect("后开始的轮次先完成也应成功");
+        commit_assistant(&agent.history, &sid, DEFAULT_HISTORY_CAP, turn_a, "reply-a")
+            .expect("先开始的轮次后完成也应成功");
+        let guard = agent.history.lock().expect("历史锁");
+        let queue = guard.get(&sid).expect("会话应已存在");
+        assert_eq!(
+            roles_and_contents(queue),
+            vec![
+                ("user", "hello"),
+                ("assistant", "reply-a"),
+                ("user", "interrupt"),
+                ("assistant", "reply-b")
+            ]
+        );
     }
 
     #[test]
@@ -600,15 +714,13 @@ mod tests {
 
     #[test]
     fn test_payload_shape() {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "hi".to_string(),
-        }];
+        let messages = vec![chat("user", "hi", 0)];
         let payload = build_chat_payload("demo-model", &messages, false);
         assert_eq!(payload["model"], "demo-model");
         assert_eq!(payload["stream"], false);
         assert_eq!(payload["messages"][0]["role"], "user");
         assert_eq!(payload["messages"][0]["content"], "hi");
+        assert!(payload["messages"][0].get("turn_id").is_none());
         assert!(payload.get("messages").and_then(|v| v.as_array()).is_some());
     }
 }
