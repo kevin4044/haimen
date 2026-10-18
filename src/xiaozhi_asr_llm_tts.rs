@@ -655,12 +655,18 @@ fn create_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>, String> 
             let api_key = cfg
                 .get_credential("api_key")
                 .ok_or_else(|| "ASR API Key 未配置（当前提供商: doubao）".to_string())?;
+            // 火山已下线 1.0 语音识别（volc.bigasr.sauc.duration 返回 403），
+            // 默认改用 2.0 小时版；允许通过配置覆盖（并发版为 volc.seedasr.sauc.concurrent）。
+            let resource_id = cfg
+                .get_credential("resource_id")
+                .unwrap_or_else(|| "volc.seedasr.sauc.duration".to_string());
             Ok(Box::new(DoubaoAsr::new(DoubaoAsrOption {
                 base: BaseProviderOption {
                     language: Some("zh-CN".into()),
                     ..Default::default()
                 },
                 api_key: Some(api_key),
+                resource_id: Some(resource_id),
                 mode: DoubaoAsrMode::Streaming,
                 ..Default::default()
             })))
@@ -727,12 +733,18 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
             let api_key = cfg
                 .get_credential("api_key")
                 .ok_or_else(|| "ASR API Key 未配置（当前提供商: doubao）".to_string())?;
+            // 火山已下线 1.0 语音识别（volc.bigasr.sauc.duration 返回 403），
+            // 默认改用 2.0 小时版；允许通过配置覆盖（并发版为 volc.seedasr.sauc.concurrent）。
+            let resource_id = cfg
+                .get_credential("resource_id")
+                .unwrap_or_else(|| "volc.seedasr.sauc.duration".to_string());
             Ok(Box::new(DoubaoAsr::new(DoubaoAsrOption {
                 base: BaseProviderOption {
                     language: Some("zh-CN".into()),
                     ..Default::default()
                 },
                 api_key: Some(api_key),
+                resource_id: Some(resource_id),
                 mode: DoubaoAsrMode::Streaming,
                 sample_rate: 16000,
                 bits: 16,
@@ -1112,159 +1124,169 @@ impl AsrLlmTtsStrategy {
 
         let asr_handle: tokio::task::JoinHandle<Result<String, String>> = tokio::spawn(
             async move {
-                let mut stream = asr
-                    .listen_stream(audio_stream)
-                    .await
-                    .map_err(|e| format!("流式 ASR 启动失败: {}", e))?;
+                let result: Result<String, String> = async {
+                    let mut stream = asr
+                        .listen_stream(audio_stream)
+                        .await
+                        .map_err(|e| format!("流式 ASR 启动失败: {}", e))?;
 
-                let mut full_text = String::new();
-                let mut chunk_count = 0;
-                let mut vad_triggered = false;
-                // 记录最后一个非空 ASR 文本，用于判断是否已稳定
-                let mut last_nonempty_text = String::new();
-                const TEXT_STABLE_MS: u64 = 1500;
+                    let mut full_text = String::new();
+                    let mut chunk_count = 0;
+                    let mut vad_triggered = false;
+                    // 记录最后一个非空 ASR 文本，用于判断是否已稳定
+                    let mut last_nonempty_text = String::new();
+                    const TEXT_STABLE_MS: u64 = 1500;
 
-                loop {
-                    // 如果已识别到非空文本，增加文本稳定超时检测
-                    let needs_stability_check = !last_nonempty_text.is_empty();
+                    loop {
+                        // 如果已识别到非空文本，增加文本稳定超时检测
+                        let needs_stability_check = !last_nonempty_text.is_empty();
 
-                    if needs_stability_check {
-                        let stability_delay =
-                            tokio::time::sleep(std::time::Duration::from_millis(TEXT_STABLE_MS));
-                        tokio::pin!(stability_delay);
+                        if needs_stability_check {
+                            let stability_delay =
+                                tokio::time::sleep(std::time::Duration::from_millis(TEXT_STABLE_MS));
+                            tokio::pin!(stability_delay);
 
-                        tokio::select! {
-                            chunk_opt = stream.next() => {
-                                match chunk_opt {
-                                    Some(Ok(chunk)) => {
-                                        chunk_count += 1;
+                            tokio::select! {
+                                chunk_opt = stream.next() => {
+                                    match chunk_opt {
+                                        Some(Ok(chunk)) => {
+                                            chunk_count += 1;
 
-                                        let is_vad_endpoint = chunk
-                                            .segment
-                                            .as_ref()
-                                            .and_then(|s| s.confidence)
-                                            .map(|c| c >= 0.99)
-                                            .unwrap_or(false);
+                                            let is_vad_endpoint = chunk
+                                                .segment
+                                                .as_ref()
+                                                .and_then(|s| s.confidence)
+                                                .map(|c| c >= 0.99)
+                                                .unwrap_or(false);
 
-                                        let tag = match (chunk.is_final, is_vad_endpoint) {
-                                            (true, _) => "最终",
-                                            (false, true) => "VAD",
-                                            (false, false) => "中间",
-                                        };
-                                        let display_text = if chunk.text.is_empty() {
-                                            "(空)".to_string()
-                                        } else {
-                                            chunk.text.clone()
-                                        };
+                                            let tag = match (chunk.is_final, is_vad_endpoint) {
+                                                (true, _) => "最终",
+                                                (false, true) => "VAD",
+                                                (false, false) => "中间",
+                                            };
+                                            let display_text = if chunk.text.is_empty() {
+                                                "(空)".to_string()
+                                            } else {
+                                                chunk.text.clone()
+                                            };
+                                            tracing::info!(
+                                                "🎤 [ASR {}] #{}: \"{}\"",
+                                                tag,
+                                                chunk_count,
+                                                display_text,
+                                            );
+
+                                            if is_vad_endpoint && !vad_triggered {
+                                                vad_triggered = true;
+                                                tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
+                                                vad_notify.notify_one();
+                                            }
+
+                                            if chunk.is_final && !chunk.text.is_empty() {
+                                                full_text.push_str(&chunk.text);
+                                            }
+
+                                            if !chunk.text.is_empty() {
+                                                asr_text_received.store(true, Ordering::Release);
+                                                last_nonempty_text = chunk.text.clone();
+                                            }
+                                        }
+                                        Some(Err(e)) => {
+                                            tracing::warn!("🎤 [ASR 错误] {}", e);
+                                        }
+                                        None => {
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ = &mut stability_delay => {
+                                    if !vad_triggered {
                                         tracing::info!(
-                                            "🎤 [ASR {}] #{}: \"{}\"",
-                                            tag,
-                                            chunk_count,
-                                            display_text,
+                                            "🎤 [文本稳定 VAD] 文本 \"{}\" 已稳定 {}ms，通知 ws.rs 开始处理",
+                                            last_nonempty_text,
+                                            TEXT_STABLE_MS,
                                         );
-
-                                        if is_vad_endpoint && !vad_triggered {
-                                            vad_triggered = true;
-                                            tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
-                                            vad_notify.notify_one();
-                                        }
-
-                                        if chunk.is_final && !chunk.text.is_empty() {
-                                            full_text.push_str(&chunk.text);
-                                        }
-
-                                        if !chunk.text.is_empty() {
-                                            asr_text_received.store(true, Ordering::Release);
-                                            last_nonempty_text = chunk.text.clone();
-                                        }
+                                        vad_notify.notify_one();
                                     }
-                                    Some(Err(e)) => {
-                                        tracing::warn!("🎤 [ASR 错误] {}", e);
-                                    }
-                                    None => {
-                                        break;
-                                    }
+                                    break;
                                 }
                             }
-                            _ = &mut stability_delay => {
-                                if !vad_triggered {
+                        } else {
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    chunk_count += 1;
+
+                                    let is_vad_endpoint = chunk
+                                        .segment
+                                        .as_ref()
+                                        .and_then(|s| s.confidence)
+                                        .map(|c| c >= 0.99)
+                                        .unwrap_or(false);
+
+                                    let tag = match (chunk.is_final, is_vad_endpoint) {
+                                        (true, _) => "最终",
+                                        (false, true) => "VAD",
+                                        (false, false) => "中间",
+                                    };
+                                    let display_text = if chunk.text.is_empty() {
+                                        "(空)".to_string()
+                                    } else {
+                                        chunk.text.clone()
+                                    };
                                     tracing::info!(
-                                        "🎤 [文本稳定 VAD] 文本 \"{}\" 已稳定 {}ms，通知 ws.rs 开始处理",
-                                        last_nonempty_text,
-                                        TEXT_STABLE_MS,
+                                        "🎤 [ASR {}] #{}: \"{}\"",
+                                        tag,
+                                        chunk_count,
+                                        display_text,
                                     );
-                                    vad_notify.notify_one();
+
+                                    if is_vad_endpoint && !vad_triggered {
+                                        vad_triggered = true;
+                                        tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
+                                        vad_notify.notify_one();
+                                    }
+
+                                    if chunk.is_final && !chunk.text.is_empty() {
+                                        full_text.push_str(&chunk.text);
+                                    }
+
+                                    if !chunk.text.is_empty() {
+                                        asr_text_received.store(true, Ordering::Release);
+                                        last_nonempty_text = chunk.text.clone();
+                                    }
                                 }
-                                break;
-                            }
-                        }
-                    } else {
-                        match stream.next().await {
-                            Some(Ok(chunk)) => {
-                                chunk_count += 1;
-
-                                let is_vad_endpoint = chunk
-                                    .segment
-                                    .as_ref()
-                                    .and_then(|s| s.confidence)
-                                    .map(|c| c >= 0.99)
-                                    .unwrap_or(false);
-
-                                let tag = match (chunk.is_final, is_vad_endpoint) {
-                                    (true, _) => "最终",
-                                    (false, true) => "VAD",
-                                    (false, false) => "中间",
-                                };
-                                let display_text = if chunk.text.is_empty() {
-                                    "(空)".to_string()
-                                } else {
-                                    chunk.text.clone()
-                                };
-                                tracing::info!(
-                                    "🎤 [ASR {}] #{}: \"{}\"",
-                                    tag,
-                                    chunk_count,
-                                    display_text,
-                                );
-
-                                if is_vad_endpoint && !vad_triggered {
-                                    vad_triggered = true;
-                                    tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
-                                    vad_notify.notify_one();
+                                Some(Err(e)) => {
+                                    tracing::warn!("🎤 [ASR 错误] {}", e);
                                 }
-
-                                if chunk.is_final && !chunk.text.is_empty() {
-                                    full_text.push_str(&chunk.text);
+                                None => {
+                                    break;
                                 }
-
-                                if !chunk.text.is_empty() {
-                                    asr_text_received.store(true, Ordering::Release);
-                                    last_nonempty_text = chunk.text.clone();
-                                }
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!("🎤 [ASR 错误] {}", e);
-                            }
-                            None => {
-                                break;
                             }
                         }
                     }
-                }
 
-                // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
-                // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
-                tracing::warn!(
-                    "🎤 [ASR 完成] 共收到 {} 个结果块，完整文本长度: {}",
-                    chunk_count,
-                    full_text.len(),
-                );
+                    // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+                    // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+                    tracing::warn!(
+                        "🎤 [ASR 完成] 共收到 {} 个结果块，完整文本长度: {}",
+                        chunk_count,
+                        full_text.len(),
+                    );
 
-                if full_text.is_empty() {
-                    Err("ASR 识别结果为空（可能为静音或无有效语音）".to_string())
-                } else {
-                    Ok(full_text)
+                    if full_text.is_empty() {
+                        Err("ASR 识别结果为空（可能为静音或无有效语音）".to_string())
+                    } else {
+                        Ok(full_text)
+                    }
                 }
+                .await;
+
+                // 任务异常退出时把原因打出来：调用方从不 await 这个 handle，
+                // 不打日志的话错误（如 403、鉴权失败、网络错误）会彻底静默。
+                if let Err(err) = &result {
+                    tracing::error!("流式 ASR 任务异常退出: {}", err);
+                }
+                result
             },
         );
 

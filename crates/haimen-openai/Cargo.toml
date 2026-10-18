@@ -1,0 +1,19 @@
+[package]
+name = "haimen-openai"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "AI 网关 OpenAI 兼容 Agent（HTTP /chat/completions，SSE 流式）"
+license = "MIT"
+repository = "https://github.com/kevin4044/haimen"
+
+[dependencies]
+haimen-core = { path = "../haimen-core", version = "0.1" }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }

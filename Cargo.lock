@@ -935,6 +935,7 @@ dependencies = [
  "haimen-core",
  "haimen-hermes",
  "haimen-lark",
+ "haimen-openai",
  "haimen-openclaw",
  "haimen-xiaozhi",
  "hex",
@@ -1023,6 +1024,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "haimen-openai"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "haimen-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
