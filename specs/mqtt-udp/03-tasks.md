@@ -85,8 +85,25 @@ impl UdpCrypto {
 }
 
 /// 错误类型
-#[derive(Debug, thiserror::Error)]
-pub enum UdpProtoError { ... }
+///
+/// 注意：`thiserror` 虽然在工作区依赖里（Cargo.toml:47），但
+/// `haimen-xiaozhi` 这个 crate 并没有引用它，而本任务**禁止改动依赖清单**。
+/// 所以请手写 `std::fmt::Display` + `std::error::Error`（约 15 行），
+/// 不要 `use thiserror::Error`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UdpProtoError {
+    /// hex 字符串非法（长度不是 32，或含非 hex 字符）
+    InvalidHex { field: &'static str, reason: String },
+    /// 数据包短于 16 字节头
+    PacketTooShort { len: usize },
+    /// payload_len 字段与实际载荷长度不符
+    LengthMismatch { declared: u16, actual: usize },
+    /// 载荷过长，无法用 u16 表示
+    PayloadTooLarge { len: usize },
+}
+
+impl std::fmt::Display for UdpProtoError { /* 中文错误描述 */ }
+impl std::error::Error for UdpProtoError {}
 ```
 
 **B. 错误处理**
