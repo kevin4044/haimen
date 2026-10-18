@@ -368,7 +368,50 @@ async fn run_loop(
     stop_playbacks(&shared).await;
 }
 
+/// 控制面转发主题前缀。
+///
+/// 任何 MQTT 客户端把消息发到 `haimen/ctl/<目标 client_id>`，传输层就会把
+/// payload **原样**作为下行推给该设备（topic 由设备忽略，用固定值即可）。
+///
+/// 用途：
+/// - 联调/测试：外部脚本可以直接让设备播报，不必改 haimen 代码
+/// - M4 主动播报的基础：HA 自动化或任何脚本都能触发
+///
+/// 之所以放在传输层而不是 broker：broker 的 `handle_packet` 只能看到当前连接，
+/// 拿不到全局注册表；而传输层的 `incoming()` 天然能收到所有客户端的 PUBLISH。
+const CONTROL_TOPIC_PREFIX: &str = "haimen/ctl/";
+
 async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
+    // ── 控制面转发：haimen/ctl/<target_client_id> → 直接推给该设备 ──
+    if let Some(target) = msg.topic.strip_prefix(CONTROL_TOPIC_PREFIX) {
+        let target = target.trim();
+        if target.is_empty() {
+            tracing::warn!(topic = %msg.topic, "控制主题缺少目标 client_id，丢弃");
+            return;
+        }
+        let payload_len = msg.payload.len();
+        let result = shared
+            .broker
+            .publish_to(BrokerOutgoing {
+                client_id: target.to_owned(),
+                topic: format!("haimen/down/{target}"),
+                payload: msg.payload,
+            })
+            .await;
+        match result {
+            Ok(true) => tracing::warn!(target, payload_len, "控制面消息已转发给设备"),
+            Ok(false) => tracing::warn!(target, "控制面消息转发失败：设备不在线"),
+            Err(err) => tracing::warn!(
+                target,
+                %err,
+                "控制面消息转发失败"
+            ),
+        }
+        return;
+    }
+
+    // ── 以下是设备上行消息的正常处理 ──
+
     {
         let mut tables = shared.tables.lock().await;
         let session = ensure_session(&mut tables, &msg.client_id);
