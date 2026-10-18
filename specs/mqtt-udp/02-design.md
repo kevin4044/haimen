@@ -389,6 +389,98 @@ MQTT 的 `client_id` 需要 `body.mac_address`（`types.rs:168`），必须改�
 
 ---
 
+## 6.5 协议更正（Agent A 深度源码核验，固件 2.5.3）
+
+> 以下条目修正或补充了前文的描述，**以本节为准**。
+
+### C1. timestamp 不是毫秒 —— 是不透明字段
+
+```cpp
+// protocols/protocol.h:23 的注释写着 ms，但实际行为不是
+// 默认 sdkconfig CONFIG_USE_SERVER_AEC=n
+```
+
+- **上行**：设备 timestamp **恒为 0**
+- **下行**：设备只在 `task.timestamp > 0` 时用它做服务端 AEC 参考（`audio_service.cc:361`），
+  AEC 关闭时完全不参与逻辑
+- **结论**：下行可以填单调递增的毫秒值，无害；但要保证**非 0**（见 C2）
+
+### C2. ★ 上下行共用 key → 必须规避 CTR IV 复用
+
+IV 就是包头 16 字节。上下行共用同一对 key/nonce，若某个上行包的包头与下行包的包头
+完全相同，就会**keystream 重用**（可被异或还原明文）。
+
+设备上行包头（设备保留我们 nonce 的 [0..2) 和 [4..8)，覆写其余）：
+```
+01 00 | payload_len | <session_id> | timestamp=0 | seq=设备seq
+```
+下行包头：
+```
+01 00 | payload_len | <session_id> | timestamp=我们填 | seq=我们seq
+```
+
+**规避方案（必须实现）**：下行 timestamp **固定填非 0**（如从 1 开始按 60 递增的毫秒），
+这样上下行包头在 [8..12) 必然不同，**不可能碰撞**。
+
+### C3. 下行包硬性约束
+
+- `header[0]` 必须 `0x01`
+- `16 + payload_len == datagram_size`（严格相等，否则设备丢包）
+- `sequence` **首包 ≥ 1，严格递增**，每次 hello 设备会把 `remote_sequence_` 清零 → 我们要跟着重置
+- **单包总长 ≤ 1500 字节**（组件 recv 缓冲 1500）
+- 下行音频必须按 **~60ms/包实时**发送：设备解码队列只有 20 包（1.2s），满了**静默丢包**
+
+### C4. hello 握手的硬性要求（任一不满足 = 静默 10 秒超时）
+
+```cpp
+// mqtt_protocol.cc:284-298
+// 设备发 hello 后只等 10000ms，且没有任何 ACK
+```
+
+- 必须**先收到设备 hello 才能回 hello**（提前发会被清事件位，并且会重置 key/seq）
+- 响应必填：`type=="hello"`、`transport=="udp"`、`udp` 是 object
+- `udp.port` ∈ 1..65535
+- `udp.key` / `udp.nonce` hex 解码后**正好 16 字节**
+- 握手**无 ACK**，设备不回任何确认 → 我们只能靠"后续收到 UDP 包"判断成功
+
+### C5. UDP 无握手，服务器后知设备地址
+
+设备 `connect()` 是**本地操作，不发包**。所以：
+- 服务器收到设备**第一个上行 UDP 包**之前，不知道设备地址
+- 必须用 `udp.port` 指定的**同一个 socket、同一本地 IP** 回包
+- 无法在设备开口前主动推音频
+
+### C6. 下行 `frame_duration` 必须合法
+
+`audio_params.frame_duration` ∈ {5, 10, 20, 40, 60, 80, 100, 120}。
+我们固定用 **60**。
+
+### C7. 会话识别只能靠 `nonce[4..8)`
+
+设备保留我们 nonce 的 `[4..8)`（会话 ID）原样回传。
+所以**一个 UDP 端口服务多设备时，用 `nonce[4..8)` 区分会话，不能只看源地址**
+（源地址可能因 NAT/重连变化）。
+
+### C8. 其他已知坑
+
+| 坑 | 后果 | 对策 |
+|---|---|---|
+| `publish_topic` 为空 | 设备完全发不出，且不报错 | OTA 里非空校验 |
+| 端口 8883 | **强制 TLS** + CA bundle 校验 | 明文必须用 1883 |
+| MQTT 断线 | 只在 Idle 重连一次 | broker 侧保持连接稳定 |
+| `Publish` 失败 | 污染 `error_occurred_`，后续全失败 | 不要在错误态下继续发 |
+| 设备无 no-speech 自动回 Idle | 会话挂死 | 服务器必须驱动 `goodbye` |
+| 设备不在 Speaking 时收到音频 | 应用层丢弃，但协议层 seq 已前进 | 必须等 `tts start` 后再发音频 |
+
+### C9. 设备只认 `publish_topic`，且 OnMessage 忽略 topic 参数
+
+（源码实证：`mqtt_protocol.cc:116` 的 lambda 接收 `topic` 但**从不使用**）
+
+**推论：下行 topic 是什么都行**——设备根本不看。
+但为了可读性和调试方便，仍按约定命名。
+
+---
+
 ## 7. 交付顺序
 
 ```

@@ -57,8 +57,16 @@ case "$TASK" in
     ALLOWED_PREFIXES=("specs/mqtt-udp/")
     TARGET="crates/haimen-xiaozhi/src/protocol_udp.rs"
     ;;
+  T2)
+    ALLOWED_FILES=(
+        "crates/haimen-xiaozhi/src/mqtt_broker.rs"
+        "crates/haimen-xiaozhi/src/lib.rs"
+    )
+    ALLOWED_PREFIXES=("specs/mqtt-udp/")
+    TARGET="crates/haimen-xiaozhi/src/mqtt_broker.rs"
+    ;;
   *)
-    fail "未知任务 $TASK（当前脚本只实现了 T1）"
+    fail "未知任务 $TASK（已实现 T1 / T2）"
     echo; echo "验收失败：$FAILURES 项"; exit 1
     ;;
 esac
@@ -134,6 +142,48 @@ if [ "$TASK" = "T1" ]; then
     fi
 fi
 
+if [ "$TASK" = "T2" ]; then
+    for sym in \
+        "struct MqttBrokerConfig" \
+        "struct BrokerIncoming" \
+        "struct BrokerOutgoing" \
+        "struct MqttBrokerHandle" \
+        "enum MqttBrokerError" \
+        "fn start" \
+        "fn publish_to" \
+        "fn connected_clients" \
+        "fn incoming" \
+        "CONNECT" \
+        "CONNACK" \
+        "PUBLISH" \
+        "PUBACK" \
+        "SUBSCRIBE" \
+        "SUBACK" \
+        "PINGREQ" \
+        "PINGRESP"
+    do
+        if has "$sym" "$TARGET"; then
+            pass "存在 $sym"
+        else
+            fail "缺少 $sym"
+        fi
+    done
+
+    # 变长整数必须有续位处理（0x80 掩码）
+    if has "0x80" "$TARGET" || has "0b1000_0000" "$TARGET"; then
+        pass "存在变长整数续位处理"
+    else
+        fail "缺少 MQTT remaining_length 变长整数编解码（续位 0x80）"
+    fi
+
+    # 必须有独立的 TCP 监听
+    if has "TcpListener" "$TARGET"; then
+        pass "使用 TcpListener 监听"
+    else
+        fail "缺少 TcpListener（broker 需要 TCP 监听）"
+    fi
+fi
+
 # ─────────────────────────────────────────────
 # 4. 禁止事项
 # ─────────────────────────────────────────────
@@ -187,10 +237,11 @@ fi
 # ─────────────────────────────────────────────
 TEST_COUNT=$(grep -c "#\[test\]" "$TARGET" 2>/dev/null)
 TEST_COUNT=${TEST_COUNT:-0}
-if [ "${TEST_COUNT:-0}" -ge 10 ]; then
-    pass "单元测试数量 ${TEST_COUNT} >= 10"
+if [ "$TASK" = "T2" ]; then MIN_TESTS=8; else MIN_TESTS=10; fi
+if [ "${TEST_COUNT:-0}" -ge "$MIN_TESTS" ]; then
+    pass "测试数量 ${TEST_COUNT} >= ${MIN_TESTS}"
 else
-    fail "单元测试数量 ${TEST_COUNT} < 10"
+    fail "测试数量 ${TEST_COUNT} < ${MIN_TESTS}"
 fi
 
 # ─────────────────────────────────────────────

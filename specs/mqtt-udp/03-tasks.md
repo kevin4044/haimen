@@ -152,18 +152,205 @@ cargo test -- --test-threads=1
 
 ---
 
-### T2 — `mqtt.rs` + `udp_audio.rs`：I/O 层
+### T2 — `mqtt_broker.rs`：内置最小 MQTT broker
 
-（待 T1 完成后细化）
+### 为什么必须自建 broker（不可跳过）
+
+**固件从不订阅任何主题**（已三重验证）：
+- `main/protocols/mqtt_protocol.cc` 全文只有 `Publish` / `OnMessage`，无 `Subscribe`
+- `78/esp-ml307` 的 `EspMqtt::Connect()` 只做 `esp_mqtt_client_init/start`，不订阅
+- 全固件仓库 grep `subscribe` → **0 行**；grep `subscribe_topic` → **0 行**
+
+后果：设备走 MQTT 时**永远收不到服务器消息**。而语音链路必须有下行：
+hello 响应（UDP key/nonce）、stt、tts start / sentence_start / stop、mcp。
+
+标准 broker（Mosquitto / EMQX 默认配置）只投递"已订阅"的消息 →
+**MQTT 模式在它们上面完全不可用**（表现为"连上了但一唤醒就 10 秒超时"）。
+
+自建 broker 才能直接对连接下发 PUBLISH，无需订阅。这也是社区 golang 服务端的做法。
+
+### 目标
+
+在 haimen 内实现一个**最小但正确**的 MQTT 3.1.1 broker，够设备用：
+收设备上行 PUBLISH、向指定 client 主动下发 PUBLISH、维持心跳。
+
+### 不做（明确划界）
+
+- 不做 QoS 2（设备只用 QoS 0/1）
+- 不做 retained message
+- 不做 wildcard 订阅路由（订阅请求照常回 SUBACK，但不建立转发关系 —— 我们只做定向推送）
+- 不做 TLS（局域网页明，M2' 不做 8883）
+- 不做持久会话（`clean_session=false` 也按 false 应答但不恢复状态）
+
+### 要实现的协议子集
+
+**固定头**：`| type(1B) | flags(1B) | remaining_length(varint) |`
+**变长整数编码**：每字节低 7 位有效，最高位为续位，最多 4 字节
+
+| type | 名称 | 方向 | 处理 |
+|---|---|---|---|
+| 1 | CONNECT | 设备→broker | 解析 client_id / username / password / keepalive / clean_session |
+| 2 | CONNACK | broker→设备 | 回 `session_present=0` + `return_code=0`（成功） |
+| 3 | PUBLISH | 双向 | 上行：解析 topic + payload，投递给 haimen 上层；下行：由 haimen 主动构造 |
+| 4 | PUBACK | 双向 | QoS1 确认 |
+| 8 | SUBSCRIBE | 设备→broker | **解析并回 SUBACK（granted_qos 原样）**，但不建立转发关系 |
+| 9 | SUBACK | broker→设备 | |
+| 10 | UNSUBSCRIBE | 设备→broker | 回 UNSUBACK |
+| 11 | UNSUBACK | broker→设备 | |
+| 12 | PINGREQ | 设备→broker | 回 PINGRESP |
+| 13 | PINGRESP | broker→设备 | |
+| 14 | DISCONNECT | 设备→broker | 关闭连接，不回报文 |
+
+**QoS 处理**：
+- 收到 QoS 0 PUBLISH：直接投递，不回包
+- 收到 QoS 1 PUBLISH：投递后回 PUBACK（用对方的 packet id）
+- 向下发 QoS 0 PUBLISH：最简单，优先用这个（设备不要求 ack）
+
+### 公开 API（照此实现，不要自行改签名）
+
+```rust
+/// broker 启动参数
+#[derive(Debug, Clone)]
+pub struct MqttBrokerConfig {
+    /// 监听地址，如 "0.0.0.0:1883"
+    pub bind_addr: String,
+    /// 单连接最大包体（防止恶意大包），默认 256 KiB
+    pub max_packet_size: usize,
+}
+
+/// 一条从设备上来的应用消息
+#[derive(Debug, Clone)]
+pub struct BrokerIncoming {
+    /// 发起连接的 client_id（haimen 靠它反解设备 MAC）
+    pub client_id: String,
+    pub topic: String,
+    pub payload: Vec<u8>,
+    /// QoS 0 时为 None
+    pub packet_id: Option<u16>,
+}
+
+/// 一条要下发给设备的消息
+#[derive(Debug, Clone)]
+pub struct BrokerOutgoing {
+    /// 目标 client_id
+    pub client_id: String,
+    pub topic: String,
+    pub payload: Vec<u8>,
+}
+
+/// broker 句柄，可 clone，内部用 Arc
+#[derive(Clone)]
+pub struct MqttBrokerHandle {
+    /* 内部：注册表 Arc<Mutex<HashMap<String, ConnSender>>> + 接收队列 */
+}
+
+impl MqttBrokerHandle {
+    /// 启动 broker（绑定监听端口），返回句柄。
+    /// 内部 spawn 一个 accept task。
+    pub async fn start(cfg: MqttBrokerConfig) -> Result<Self, MqttBrokerError>;
+
+    /// 向指定 client 下发一条消息。client 不在线则返回 Ok(false)。
+    pub async fn publish_to(&self, msg: BrokerOutgoing) -> Result<bool, MqttBrokerError>;
+
+    /// 当前在线 client 列表（便于调试/诊断）。
+    pub async fn connected_clients(&self) -> Vec<String>;
+
+    /// 取一条上行消息。用 tokio mpsc 的 Receiver。
+    /// 建议签名：pub fn take_incoming(&self) -> mpsc::Receiver<BrokerIncoming>
+    /// 或在 start() 时就把 Receiver 返回。
+    pub fn incoming(&self) -> tokio::sync::mpsc::Receiver<BrokerIncoming>;
+}
+
+#[derive(Debug)]
+pub enum MqttBrokerError {
+    Io(std::io::Error),
+    Protocol(String),
+    NotStarted,
+}
+```
+
+**建议**：`MqttBrokerHandle::start` 返回 `(handle, incoming_rx)` 更简单，二选一都行，
+但必须在文档注释里写清楚。
+
+### 实现要点（每一条都是坑）
+
+1. **CONNECT 的 client_id 必须按二进制读**，不要假设是 UTF-8 安全字符串。
+   小智的 client_id 形如 `GID_xxx@@@84_c7_bb_59_93_64@@@84_c7_bb_59_93_64`。
+
+2. **读完 CONNECT 必须回 CONNACK**，否则设备的 `esp_mqtt_client` 会一直等，
+   `Connect()` 超时返回，表现为"连不上"。
+
+3. **变长整数（remaining_length）**：编码时用小端续位，
+   `0x00..0x7F` 一字节；解码要循环到最高位为 0。**最多 4 字节，超出报错。**
+
+4. **PUBLISH 的 topic 是长度前缀的**（2 字节大端长度 + UTF-8 字节），
+   QoS>0 时后面还有 2 字节 packet id。
+
+5. **每个连接一个独立 tokio task** 做读循环；写用 `mpsc` 投递到该连接的写 task。
+   **不要**在注册表的锁里做 I/O。
+
+6. **断连必须从注册表摘除**，否则 `publish_to` 会一直往死连接写。
+
+7. **keepalive**：设备连上时协商的 keepalive 秒数（小智默认 240），
+   超过 1.5 倍无包视为超时 → 主动断开。**M2' 可以先不实现超时检测**，
+   但要记录 keepalive 值。
+
+8. **SUBSCRIBE 必须回 SUBACK**，否则某些客户端会重传。
+
+9. **PINGREQ 必须回 PINGRESP**，否则 240 秒后连接被设备断开。
+
+10. **写失败要能感知**：写 task 出错时清理注册表。用 `tokio::sync::mpsc::Sender`
+    的 `send().await` 返回 Err 表示写 task 已退出。
+
+### 单元/集成测试（至少 8 个）
+
+**纯函数测试（不需要网络）**：
+1. 变长整数编码/解码：`0`、`127`、`128`、`16383`、`16384`、`2097151`、`268435455`
+2. 变长整数：超过 4 字节 → 报错
+3. CONNECT 报文解析：构造一个真实的 CONNECT 字节流，断言 client_id / keepalive / clean_session
+4. PUBLISH 报文解析：QoS0 与 QoS1 各一例，断言 topic / payload / packet_id
+5. CONNACK 构造：断言字节序列
+6. PINGRESP 构造：断言字节序列 `[0xD0, 0x00]`
+
+**回环集成测试（用 `127.0.0.1:0` 起 broker + 自己写客户端）**：
+7. 完整握手：CONNECT → CONNACK → PUBLISH 上行 → 能在 `incoming()` 收到
+8. `publish_to` 下发：断言客户端能收到 PUBLISH 且 topic/payload 正确
+9. 客户端断开后 `connected_clients()` 不再包含它
+10. PINGREQ → PINGRESP
+
+> 测试里不要依赖外部 broker，用 `127.0.0.1:0` 自动选端口。
+
+### 硬性约束
+
+- **只改/新增**：`crates/haimen-xiaozhi/src/mqtt_broker.rs`、`crates/haimen-xiaozhi/src/lib.rs`
+- **不改** `ws.rs` / `protocol.rs` / `strategy.rs` / `types.rs` / `ota.rs`
+- **不加新依赖**（`tokio` 已在，`serde_json` 不需要 —— broker 只管字节，不解析 JSON）
+- 库代码禁止 `unwrap()` / `expect()` / `panic!()`；错误用 `MqttBrokerError`
+  手写 `Display` + `std::error::Error`（不要引入 thiserror）
+- 注释用中文，关键处说明「为什么」
+
+### 自检
+
+```bash
+cargo fmt --all && cargo fmt --all -- --check
+cargo clippy -- -D warnings
+cargo test -- --test-threads=1
+```
+
+---
+
+### T3 — `mqtt.rs` + `udp_audio.rs`：I/O 层
+
+（待 T2 完成后细化）
 
 - `mqtt.rs`：rumqttc 封装，连接/订阅/发布 + 事件流（`mpsc`）
 - `udp_audio.rs`：单 UDP socket 多设备复用，按源地址分流，收发队列，序列号管理
 
 ---
 
-### T3 — `mqtt_udp.rs`：传输层
+### T4 — `mqtt_udp.rs`：传输层
 
-（待 T2 完成后细化）
+（待 T3 完成后细化）
 
 - 会话状态机（`AwaitingHello / Ready / Recording / Playing`）
 - hello 握手、UDP 建链、对接 `strategy.rs`
@@ -171,9 +358,9 @@ cargo test -- --test-threads=1
 
 ---
 
-### T4 — OTA 改造 + 配置
+### T5 — OTA 改造 + 配置
 
-（待 T3 完成后细化）
+（待 T4 完成后细化）
 
 - `types.rs`：`OtaResponse.mqtt: Option<MqttInfo>`，`websocket` 改 `Option`
 - `ota.rs`：`Json(_body)` → `Json(body)`，用 `body.mac_address` 生成 client_id / subscribe_topic
@@ -182,9 +369,9 @@ cargo test -- --test-threads=1
 
 ---
 
-### T5 — 设备模拟器 + 端到端脚本
+### T6 — 设备模拟器 + 端到端脚本
 
-（待 T4 完成后细化）
+（待 T5 完成后细化）
 
 - `scripts/xiaozhi_sim/device_sim.py`
 - `scripts/test-mqtt-udp.sh`
