@@ -1,0 +1,10 @@
+target/
+web-ui/node_modules/
+web-ui/.storybook/
+.git/
+.github/
+.agents/
+docs/
+tests/
+*.md
+!README.md

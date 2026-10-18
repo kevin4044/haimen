@@ -1,0 +1,29 @@
+# haimen 二次开发环境（编译 / 测试 / Lint）
+#
+# 本机不需要装 Rust —— 所有 cargo 命令都在这个容器里跑。
+# 用法见 scripts/dev.sh
+#
+# 构建：docker build -f Dockerfile.dev -t haimen-dev:rust .
+
+FROM rust:slim-bookworm
+
+# opus2 用 bundled feature（编译 libopus 的 C 源码），需要 C 工具链
+# openssl-sys 需要 libssl-dev
+RUN HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= NO_PROXY= no_proxy= \
+    apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config cmake make clang libclang-dev \
+        libssl-dev zlib1g-dev \
+        git curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# 仓库的 rust-toolchain.toml 把工具链固定成 1.96，
+# 但镜像自带的只有最新版，且 rustup 默认只装 rustc/cargo ——
+# 这里显式装好 1.96 + fmt/clippy，否则 cargo fmt / clippy 会报组件缺失。
+RUN HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= NO_PROXY= no_proxy= \
+    rustup toolchain install 1.96 \
+        --profile minimal \
+        --component rustfmt \
+        --component clippy \
+ && rustup component add rustfmt clippy --toolchain 1.96 || true
+
+WORKDIR /src
