@@ -569,18 +569,36 @@ fn no_speech_threshold_frames(timeout_ms: u64) -> u64 {
 
 /// 计算 PCM16 mono 帧的 RMS 能量值
 fn compute_pcm_rms(pcm_bytes: &[u8]) -> f64 {
-    let samples = pcm_bytes.len() / 2;
-    if samples == 0 {
-        return 0.0;
-    }
-    let sum_sq: f64 = pcm_bytes
+    compute_pcm_stats(pcm_bytes).1
+}
+
+/// 返回 (直流均值, 去直流后的 RMS)
+///
+/// 为什么必须去直流：INMP441 这类 MEMS 麦克风常带固定直流偏置（实测本机
+/// 静音时偏置可达数千 LSB）。直接对采样平方求和会把偏置算进 RMS，
+/// 导致"静音时 RMS 也有 3000~12000"，静音阈值无论怎么调都区分不开人声与静音
+/// —— 本地能量 VAD 因此从不触发。
+///
+/// 先减去帧内均值再算 RMS，得到的才是真正的交流（声音）能量。
+fn compute_pcm_stats(pcm_bytes: &[u8]) -> (f64, f64) {
+    let samples: Vec<i16> = pcm_bytes
         .chunks_exact(2)
-        .map(|b| {
-            let sample = i16::from_le_bytes([b[0], b[1]]);
-            (sample as f64).powi(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let n = samples.len();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let nf = n as f64;
+    let mean = samples.iter().map(|&s| s as f64).sum::<f64>() / nf;
+    let sum_sq: f64 = samples
+        .iter()
+        .map(|&s| {
+            let centered = s as f64 - mean;
+            centered * centered
         })
         .sum();
-    (sum_sq / samples as f64).sqrt()
+    (mean, (sum_sq / nf).sqrt())
 }
 
 /// 根据配置创建 ASR 提供者实例
@@ -1624,10 +1642,12 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             // 用于判断 SILENCE_RMS_THRESHOLD 对当前麦克风是否过高。
             if state.frame_count - state.last_log_frame >= 50 {
                 state.last_log_frame = state.frame_count;
+                let (dc_mean, _) = compute_pcm_stats(&pcm_bytes);
                 tracing::warn!(
-                    "ASR 诊断: 第 {} 帧, RMS={:.0}, 阈值={:.0}, speech_detected={}, 已识别文字={}, 静音帧计数={}, 无语音帧={}",
+                    "ASR 诊断: 第 {} 帧, RMS={:.0}, 直流={:.0}, 阈值={:.0}, speech_detected={}, 已识别文字={}, 静音帧计数={}, 无语音帧={}",
                     state.frame_count,
                     rms,
+                    dc_mean,
                     SILENCE_RMS_THRESHOLD,
                     state.speech_detected,
                     self.asr_received_text.load(Ordering::Acquire),
