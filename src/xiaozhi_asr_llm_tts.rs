@@ -1273,11 +1273,30 @@ impl AsrLlmTtsStrategy {
                         full_text.len(),
                     );
 
-                    if full_text.is_empty() {
-                        Err("ASR 识别结果为空（可能为静音或无有效语音）".to_string())
-                    } else {
-                        Ok(full_text)
+                    if !full_text.is_empty() {
+                        return Ok(full_text);
                     }
+
+                    // 没有收到 is_final 块时兜底。
+                    //
+                    // 什么时候会发生：本地能量 VAD（MAX_SILENCE_FRAMES × 60ms）
+                    // 与豆包服务端 VAD（end_window_size）在赛跑。本地先触发时
+                    // 会替换 pcm_tx 关闭音频流，服务端还没到自己的判停窗口，
+                    // 于是只发中间结果、不发 is_final，`full_text` 就一直是空的。
+                    //
+                    // 为什么可以兜底：univoice 的 `chunk.text` 是【累积文本】
+                    // 而非增量（同一句会反复推送 "关掉" → "关掉书房的" →
+                    // "关掉书房的灯。"），所以最后一次非空中间结果就是完整转写。
+                    if !last_nonempty_text.is_empty() {
+                        tracing::warn!(
+                            "🎤 [ASR 兜底] 未收到 is_final 块，使用最后中间结果（{} 字）: {:?}",
+                            last_nonempty_text.chars().count(),
+                            last_nonempty_text,
+                        );
+                        return Ok(last_nonempty_text);
+                    }
+
+                    Err("ASR 识别结果为空（可能为静音或无有效语音）".to_string())
                 }
                 .await;
 
