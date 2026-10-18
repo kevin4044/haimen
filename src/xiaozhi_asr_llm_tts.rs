@@ -550,11 +550,13 @@ pub struct AsrLlmTtsStrategy {
 ///
 /// 经验值：PCM16 满幅 32768，正常语音 RMS ≈ 3000~15000，
 /// 环境底噪 RMS ≈ 100~800，阈值 1500 可区分底噪和轻声说话。
-const SILENCE_RMS_THRESHOLD: f64 = 1500.0;
+/// 1500 在空调/风扇噪音下容易误判"还在说话"导致空等，提到 2000。
+const SILENCE_RMS_THRESHOLD: f64 = 2000.0;
 
-/// 连续静音帧数阈值（60ms/帧），约 2.4s 静音后触发本地 VAD。
-/// 中文口语中思考停顿/语气词后的迟疑常超 1.2s，故取较宽容的 2.4s。
-const MAX_SILENCE_FRAMES: u64 = 40;
+/// 连续静音帧数阈值（60ms/帧），触发本地 VAD。
+/// 40 帧 = 2400ms 太长（小智云端用 Silero VAD 只要 1000ms）。
+/// 降到 20 帧 = 1200ms，作为服务端 VAD 的兜底。
+const MAX_SILENCE_FRAMES: u64 = 20;
 
 /// 无语音超时帧数阈值：按 60ms/帧向上取整，保证实际时长 ≥ 配置值
 fn no_speech_threshold_frames(timeout_ms: u64) -> u64 {
@@ -735,11 +737,24 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
                 sample_rate: 16000,
                 bits: 16,
                 channel: 1,
-                // VAD 端点检测：1500ms 静音强制判停（与本地能量 VAD 的 2.4s 配合，
-                // 给中文口语停顿留出余地，避免说话中途被截断）
-                end_window_size: Some(1500),
-                // 至少 1s 音频后才允许判停（避免极短音频误判）
-                force_to_speech_time: Some(1000),
+                // 服务端 VAD 判停窗口：静音超过这么久就判定用户说完了。
+                // 云端复刻版用 200ms，这里默认 400ms（更保守），可通过配置覆盖：
+                //   [asr.providers.doubao]
+                //   end_window_size = "400"
+                // 注意：这是【服务端】判停；本地能量 VAD（MAX_SILENCE_FRAMES）是兜底，
+                // 两者取先触发者。
+                end_window_size: Some(
+                    cfg.get_credential("end_window_size")
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(400),
+                ),
+                // 至少累积这么多音频后才允许判停，避免"嗯"之类极短音频误判。
+                // 原值 1000ms 对"开灯"这类短指令是浪费，降到 200ms。
+                force_to_speech_time: Some(
+                    cfg.get_credential("force_to_speech_time")
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(200),
+                ),
                 ..Default::default()
             })))
         }

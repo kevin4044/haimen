@@ -86,14 +86,15 @@ case "$cmd" in
 
     clippy)
         require_docker
-        # 与上游 .github/workflows/ci.yml 保持一致（不加 --all-targets）
-        in_dev cargo clippy -- -D warnings "$@"
+        # workspace 级：覆盖 crates/ 下全部成员 crate 的 lib/bin
+        # （不加 --all-targets：test target 下存在既有的 cfg(test) 代码告警）
+        in_dev cargo clippy --workspace -- -D warnings "$@"
         fix_owner
         ;;
 
     test)
         require_docker
-        # 与上游 CI 一致：单线程，避免环境变量竞争
+        # 单线程，避免环境变量竞争；只跑根 crate（不跑整个 workspace 是有意为之）
         in_dev cargo test -- --test-threads=1 "$@"
         fix_owner
         ;;
@@ -103,7 +104,7 @@ case "$cmd" in
         echo "▶ fmt"
         in_dev cargo fmt --all -- --check
         echo "▶ clippy"
-        in_dev cargo clippy -- -D warnings
+        in_dev cargo clippy --workspace -- -D warnings
         echo "▶ test"
         in_dev cargo test -- --test-threads=1
         fix_owner
