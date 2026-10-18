@@ -108,11 +108,50 @@ if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
 fi
 
 echo "  启动新容器"
-docker run -d --name "$CONTAINER" \
-    -p "${HOST_PORT}:9527" \
-    -v "$CONFIG_DIR":/root/.haimen \
-    --restart unless-stopped \
-    "$RUN_IMAGE" >/dev/null
+
+# 小智传输协议。mqtt 模式下必须额外暴露 broker 端口与 UDP 音频端口，
+# 否则设备连不上（OTA 下发的是宿主机局域网地址）。
+XZ_PROTOCOL="websocket"
+if [ -f "$CONFIG_DIR/settings.toml" ]; then
+    PARSED=$(grep -E '^\s*protocol\s*=\s*"mqtt"' "$CONFIG_DIR/settings.toml" 2>/dev/null | head -1)
+    [ -n "$PARSED" ] && XZ_PROTOCOL="mqtt"
+fi
+
+# MQTT broker 端口：取 settings 里 endpoint 的端口，缺省 1883
+MQTT_PORT="1883"
+if [ -f "$CONFIG_DIR/settings.toml" ]; then
+    EP=$(grep -E '^\s*endpoint\s*=' "$CONFIG_DIR/settings.toml" 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    if [ -n "$EP" ] && echo "$EP" | grep -q ':'; then
+        MQTT_PORT="${EP##*:}"
+    fi
+fi
+
+# UDP 音频端口：取 settings 里 bind_addr 的端口，缺省 8888
+UDP_PORT="8888"
+if [ -f "$CONFIG_DIR/settings.toml" ]; then
+    UB=$(grep -E '^\s*bind_addr\s*=' "$CONFIG_DIR/settings.toml" 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    if [ -n "$UB" ] && echo "$UB" | grep -q ':'; then
+        UDP_PORT="${UB##*:}"
+    fi
+fi
+
+if [ "$XZ_PROTOCOL" = "mqtt" ]; then
+    echo "  小智协议: mqtt  → 额外暴露 TCP ${MQTT_PORT}（broker）与 UDP ${UDP_PORT}（音频）"
+    docker run -d --name "$CONTAINER" \
+        -p "${HOST_PORT}:9527" \
+        -p "${MQTT_PORT}:${MQTT_PORT}" \
+        -p "${UDP_PORT}:${UDP_PORT}/udp" \
+        -v "$CONFIG_DIR":/root/.haimen \
+        --restart unless-stopped \
+        "$RUN_IMAGE" >/dev/null
+else
+    echo "  小智协议: websocket（只暴露 HTTP ${HOST_PORT}）"
+    docker run -d --name "$CONTAINER" \
+        -p "${HOST_PORT}:9527" \
+        -v "$CONFIG_DIR":/root/.haimen \
+        --restart unless-stopped \
+        "$RUN_IMAGE" >/dev/null
+fi
 
 # ─────────────────────────────────────────────
 # 5. 【强制校验】容器用的确实是刚构建的镜像
