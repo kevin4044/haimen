@@ -64,6 +64,15 @@ pub struct MqttUdpConfig {
     pub prebuffer_count: usize,
     /// 帧时长毫秒，默认 60。
     pub frame_duration_ms: u32,
+    /// 下发 hello 时告诉设备的 UDP 服务器地址。
+    ///
+    /// 为什么需要显式指定：容器里 `local_ip()` 拿到的是容器 IP（如 192.168.215.2），
+    /// 局域网里的真机根本到不了。所以应填入**设备可达的主机地址** ——
+    /// 最自然的值就是 MQTT endpoint 里的 host（设备既然能连上 broker，
+    /// 就一定也能用同一地址发 UDP）。
+    ///
+    /// `None` 时回退到自动探测（裸机部署下可用）。
+    pub advertise_ip: Option<String>,
 }
 
 impl Default for MqttUdpConfig {
@@ -77,6 +86,7 @@ impl Default for MqttUdpConfig {
             downlink_topic_template: "devices/p2p/{mac}".to_owned(),
             prebuffer_count: 5,
             frame_duration_ms: 60,
+            advertise_ip: None,
         }
     }
 }
@@ -405,12 +415,16 @@ async fn handle_hello(shared: &Arc<Shared>, client_id: &str, value: serde_json::
         .unwrap_or_else(uplink_defaults);
     // 下行参数由策略决定。AsrLlmTtsStrategy 会把采样率改成 24000。
     let downlink = shared.strategy.hello_audio_params(&client_params);
-    let server = match lan_ip() {
-        Some(ip) => ip,
-        None => {
-            tracing::warn!(%client_id, "没有可用的局域网 IP，不能下发 hello");
-            return;
-        }
+    // 优先用显式配置的地址（容器部署必须指定，否则会下发容器 IP）
+    let server = match shared.cfg.advertise_ip.clone() {
+        Some(ip) if !ip.trim().is_empty() => ip.trim().to_string(),
+        _ => match lan_ip() {
+            Some(ip) => ip,
+            None => {
+                tracing::warn!(%client_id, "没有可用的局域网 IP，不能下发 hello");
+                return;
+            }
+        },
     };
 
     let key = random_bytes();
@@ -1435,6 +1449,7 @@ mod tests {
                 downlink_topic_template: "devices/p2p/{mac}".to_owned(),
                 prebuffer_count: 5,
                 frame_duration_ms: 60,
+                advertise_ip: None,
             };
             let transport = MqttUdpTransport::start(cfg, mock.clone())
                 .await

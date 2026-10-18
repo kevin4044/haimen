@@ -204,10 +204,10 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
                     let mqtt_cfg = build_mqtt_udp_config(&config.xiaozhi);
                     match haimen_xiaozhi::MqttUdpTransport::start(mqtt_cfg, strategy).await {
                         Ok(t) => {
-                            tracing::info!(
+                            tracing::warn!(
                                 broker = %t.broker_addr(),
                                 udp = %t.udp_addr(),
-                                "小智 MQTT+UDP 传输层已启动"
+                                "小智 MQTT+UDP 传输层已启动（protocol=mqtt）"
                             );
                             xiaozhi_mqtt_transport = Some(t);
                         }
@@ -482,7 +482,9 @@ pub async fn start_echo() -> Result<(), String> {
 /// 设备从 OTA 拿到 `endpoint` 后直接连，端口对不上就是连不上。
 /// OTA 侧用的是 `xiaozhi.mqtt.endpoint` 里写的端口（缺端口会补 1883），
 /// 这里按同一规则解析，保证两边一致。
-fn build_mqtt_udp_config(x: &haimen_xiaozhi::XiaozhiConfig) -> haimen_xiaozhi::MqttUdpConfig {
+pub(crate) fn build_mqtt_udp_config(
+    x: &haimen_xiaozhi::XiaozhiConfig,
+) -> haimen_xiaozhi::MqttUdpConfig {
     let endpoint = x.mqtt.endpoint.trim();
     let port = endpoint
         .rsplit(':')
@@ -490,6 +492,13 @@ fn build_mqtt_udp_config(x: &haimen_xiaozhi::XiaozhiConfig) -> haimen_xiaozhi::M
         .and_then(|p| p.parse::<u16>().ok())
         .filter(|p| *p > 0)
         .unwrap_or(1883);
+
+    // 从 endpoint 取 host 作为下发地址：设备能连上 broker 的地址，
+    // 就一定也能用它发 UDP。容器部署下 local_ip() 只会拿到容器 IP，不可用。
+    let advertise_ip = endpoint
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim().to_string())
+        .filter(|host| !host.is_empty());
 
     haimen_xiaozhi::MqttUdpConfig {
         broker: haimen_xiaozhi::mqtt_broker::MqttBrokerConfig {
@@ -503,5 +512,6 @@ fn build_mqtt_udp_config(x: &haimen_xiaozhi::XiaozhiConfig) -> haimen_xiaozhi::M
         downlink_topic_template: x.mqtt.downlink_topic_template.clone(),
         prebuffer_count: 5,
         frame_duration_ms: 60,
+        advertise_ip,
     }
 }

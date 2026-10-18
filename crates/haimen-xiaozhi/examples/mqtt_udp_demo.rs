@@ -49,6 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         downlink_topic_template: "haimen/xz/{mac}/down".to_owned(),
         prebuffer_count: 5,
         frame_duration_ms: 60,
+        // 演示服务跑在同一网段，回退到自动探测即可
+        advertise_ip: std::env::var("ADVERTISE_IP").ok(),
     };
 
     let strategy: Arc<dyn ResponseStrategy> = Arc::new(EchoStrategy);
