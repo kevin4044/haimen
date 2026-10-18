@@ -12,6 +12,7 @@ use crate::gateway::provider::AgentProvider;
 use haimen_claude_code::ClaudeAgent;
 use haimen_codex::{CodexAgent, DEFAULT_SANDBOX};
 use haimen_hermes::HermesAgent;
+use haimen_openai::OpenAIAgent;
 use haimen_openclaw::{DEFAULT_AGENT_ID, OpenClawAgent};
 
 /// Agent 提供商的展示信息（供 Web API / 前端渲染）
@@ -172,6 +173,35 @@ fn builtin() -> AgentRegistry {
             )))
         })
         .expect("内置 Agent hermes 注册失败");
+    registry
+        .register("openai", "OpenAI 兼容", |config| {
+            let p = config.providers.get("openai");
+            let base_url = p
+                .and_then(|p| p.get("base_url"))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "openai provider 需要在 [gateway.providers.openai] 配置 base_url".to_string()
+                })?;
+            let model = p
+                .and_then(|p| p.get("model"))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "openai provider 需要在 [gateway.providers.openai] 配置 model".to_string()
+                })?;
+            let api_key = p
+                .and_then(|p| p.get("api_key"))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Ok(Box::new(OpenAIAgent::new(
+                base_url,
+                api_key,
+                model,
+                config.agent_timeout_secs,
+            )))
+        })
+        .expect("内置 Agent openai 注册失败");
     registry
 }
 
