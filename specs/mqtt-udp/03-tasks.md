@@ -341,10 +341,194 @@ cargo test -- --test-threads=1
 
 ### T3 — `mqtt.rs` + `udp_audio.rs`：I/O 层
 
-（待 T2 完成后细化）
+### 目标
 
-- `mqtt.rs`：rumqttc 封装，连接/订阅/发布 + 事件流（`mpsc`）
-- `udp_audio.rs`：单 UDP socket 多设备复用，按源地址分流，收发队列，序列号管理
+新增两个文件，只做 I/O，不含业务状态机：
+- `mqtt.rs`：rumqttc 客户端封装 —— 连接/发布/事件流
+- `udp_audio.rs`：单个 UDP socket 服务多设备 —— 收发/分流/序列号
+
+### A. `mqtt.rs`
+
+```rust
+/// MQTT 客户端配置
+#[derive(Debug, Clone)]
+pub struct MqttClientConfig {
+    pub host: String,
+    pub port: u16,              // 明文必须 1883（8883 固件会强制 TLS）
+    pub client_id: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub keep_alive_secs: u64,   // 小智默认 240
+    pub request_channel_cap: usize, // 建议 32..64，不要 0
+}
+
+/// 一条收到的 MQTT 消息
+#[derive(Debug, Clone)]
+pub struct MqttIncoming {
+    pub topic: String,
+    pub payload: Vec<u8>,
+}
+
+/// 客户端句柄（clone 廉价，内部 Arc）
+#[derive(Clone)]
+pub struct MqttClientHandle { /* ... */ }
+
+impl MqttClientHandle {
+    /// 启动：内部 spawn EventLoop task 持续 poll（★ 必须，否则连接不建立、
+    /// publish().await 会在 cap 满后永久挂起）
+    pub async fn start(cfg: MqttClientConfig) -> Result<Self, MqttClientError>;
+
+    /// 发布。QoS0 即可（设备用 QoS0）。
+    /// ★ 禁止在音频循环里 await 这个 —— 用 try_publish 或专用网络 task
+    pub async fn publish(&self, topic: &str, payload: Vec<u8>) -> Result<(), MqttClientError>;
+
+    /// 取上行消息
+    pub fn incoming(&self) -> tokio::sync::mpsc::Receiver<MqttIncoming>;
+
+    /// 当前是否已连接
+    pub fn is_connected(&self) -> bool;
+
+    /// 优雅关闭
+    pub async fn shutdown(self);
+}
+
+#[derive(Debug)]
+pub enum MqttClientError {
+    Connect(String),
+    NotConnected,
+    Io(std::io::Error),
+}
+```
+
+**实现要点（来自实测验证过的库指南 specs/mqtt-udp/库用法指南.md）**：
+1. `AsyncClient::new(options, cap)` 返回 `(AsyncClient, EventLoop)`，cap 建议 32..64
+2. **EventLoop 必须独占放进独立 tokio task 持续 `poll().await`**，否则：
+   连接不建立；cap 满后 `publish().await` 永久挂起
+3. rumqttc 0.24 的 builder 是 `set_keep_alive` / `set_credentials` / `set_clean_session`，
+   返回 `&mut Self`，不能把链式结果直接传给按值接收 `MqttOptions` 的 `AsyncClient::new`
+4. `publish().await` 只代表请求进入 EventLoop channel，**不代表出网**；
+   M2' 用 QoS0，不追踪 ack
+5. 每次 `ConnAck` 后重新标记已连接；`poll()` 出错自动重连，**不要**用 `select!` 取消 `poll()`
+6. 优雅关闭：`disconnect()` 后等 `Outgoing::Disconnect`
+
+### B. `udp_audio.rs`
+
+```rust
+/// UDP 音频通道配置
+#[derive(Debug, Clone)]
+pub struct UdpAudioConfig {
+    /// 监听地址，如 "0.0.0.0:8888"
+    pub bind_addr: String,
+}
+
+/// 一个会话的收发上下文
+pub struct UdpSession {
+    /// 对端地址（收到首个上行包后才确定）
+    pub peer: std::net::SocketAddr,
+    /// 会话 ID（= 我们下发的 nonce[4..8)）
+    pub session_id: u32,
+}
+
+/// 收到的音频包（已解密）
+#[derive(Debug, Clone)]
+pub struct UdpIncomingAudio {
+    pub peer: std::net::SocketAddr,
+    pub session_id: u32,
+    pub sequence: u32,
+    pub timestamp: u32,
+    /// 已解密的 Opus 载荷
+    pub payload: Vec<u8>,
+}
+
+/// 句柄
+#[derive(Clone)]
+pub struct UdpAudioHandle { /* ... */ }
+
+impl UdpAudioHandle {
+    pub async fn start(cfg: UdpAudioConfig) -> Result<Self, UdpAudioError>;
+
+    /// 实际监听端口（bind_addr 端口为 0 时可取到系统分配的端口）
+    pub fn local_addr(&self) -> std::net::SocketAddr;
+
+    /// 注册一个会话（下发 hello 后调用）
+    /// 内部记录 session_id → UdpCrypto，之后该 session 的包用对应 key 解密
+    pub async fn register_session(&self, session_id: u32, crypto: UdpCrypto);
+
+    /// 注销会话（goodbye / 超时）
+    pub async fn unregister_session(&self, session_id: u32);
+
+    /// 取解密后的上行音频
+    pub fn incoming(&self) -> tokio::sync::mpsc::Receiver<UdpIncomingAudio>;
+
+    /// 向指定会话发一个音频帧（内部构造 header + AES 加密）
+    /// ★ timestamp 必须非 0（规避与上行共用 key 的 IV 复用）
+    /// ★ sequence 由内部维护，首次调用必须 >= 1 且严格递增
+    pub async fn send_audio(
+        &self,
+        session_id: u32,
+        timestamp: u32,
+        payload: &[u8],
+    ) -> Result<(), UdpAudioError>;
+
+    pub async fn shutdown(self);
+}
+
+#[derive(Debug)]
+pub enum UdpAudioError {
+    Io(std::io::Error),
+    UnknownSession(u32),
+    Proto(UdpProtoError),
+    SendFailed(String),
+}
+```
+
+**实现要点**：
+1. **单 socket 服务多设备**：`Arc<tokio::net::UdpSocket>`，`recv_from`/`send_to` 都只借 `&self`
+2. **会话识别靠 `session_id`（= nonce[4..8)）**，不要只靠源地址（NAT/重连会变）
+3. 收到未知 session 的包 → 丢弃并 `debug!` 日志（可能是过期的旧会话）
+4. 发送必须用**同一个 socket、同一个本地 IP**，目标地址取该 session 记录的 `peer`
+5. **sequence 严格递增，首包 >= 1**；设备每次 hello 会把 `remote_sequence_` 清零 →
+   `register_session` 时要重置我们的发送 sequence
+6. **timestamp 必须非 0**（上下行共用 key，非 0 可保证 IV 不碰撞）
+7. 单包总长 <= 1500：payload 超过 ~1484 字节要报错
+8. 解密失败 → 丢弃 + `warn!`（不要 panic）
+
+### 测试（至少 10 个）
+
+**`mqtt.rs`**：
+1. 配置校验：port 8883 时给出警告或拒绝（明文场景）
+2. 未连接时 publish 返回 `NotConnected` 而不是挂起
+
+**`udp_audio.rs`（用 `127.0.0.1:0` 回环，不需要真设备）**：
+3. 启动后 `local_addr()` 端口非 0
+4. `register_session` 后用另一个 socket 发一个合法包 → `incoming()` 能收到，payload 正确
+5. 未知 session 的包被丢弃（`incoming()` 收不到）
+6. `unregister_session` 后再发包 → 丢弃
+7. `send_audio` 后对端能收到合法包（用 `UdpCrypto::open` 验证可解）
+8. `send_audio` 的 sequence 从 1 开始严格递增
+9. `send_audio` 的 timestamp 非 0
+10. 超长 payload 返回错误
+11. 解密失败（篡改载荷）→ 丢弃不 panic
+
+### 硬性约束
+
+- **只改/新增**：`crates/haimen-xiaozhi/src/mqtt.rs`、`crates/haimen-xiaozhi/src/udp_audio.rs`、
+  `crates/haimen-xiaozhi/src/lib.rs`（加 pub mod）
+- **不改** T1/T2 的文件（`protocol_udp.rs` / `mqtt_broker.rs`），除非发现它们有 bug
+  （真有 bug 就在注释里说明并最小修改）
+- **不改** `ws.rs` / `protocol.rs` / `strategy.rs` / `types.rs` / `ota.rs`
+- **不加新依赖**（`rumqttc` / `tokio` / `aes` / `ctr` 都已引入）
+- 库代码禁止 `unwrap()` / `expect()` / `panic!()`；错误手写 `Display` + `Error`
+- 注释用中文，关键处说明「为什么」
+
+### 自检
+
+```bash
+cargo fmt --all && cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+cargo test --workspace -- --test-threads=1
+```
+
 
 ---
 

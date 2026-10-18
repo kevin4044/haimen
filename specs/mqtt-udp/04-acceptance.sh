@@ -73,11 +73,21 @@ case "$TASK" in
     MODULE="mqtt_broker"
     MIN_TESTS=8
     ;;
+  T3)
+    TARGET="crates/haimen-xiaozhi/src/mqtt.rs"
+    EXTRA_TARGETS=("crates/haimen-xiaozhi/src/udp_audio.rs")
+    MODULES=("mqtt" "udp_audio")
+    MIN_TESTS=10
+    ;;
   *)
-    fail "未知任务 $TASK（已实现 T1 / T2）"
+    fail "未知任务 $TASK（已实现 T1 / T2 / T3）"
     echo; echo "验收失败：$FAILURES 项"; exit 1
     ;;
 esac
+
+# T1/T2 单模块；T3 双模块
+if [ -z "${MODULES+x}" ]; then MODULES=("$MODULE"); fi
+if [ -z "${EXTRA_TARGETS+x}" ]; then EXTRA_TARGETS=(); fi
 
 is_allowed() {
     local path="$1" f p
@@ -111,6 +121,14 @@ if [ ! -f "$TARGET" ]; then
     echo; echo "验收失败：$FAILURES 项"; exit 1
 fi
 pass "目标文件存在"
+
+for extra in ${EXTRA_TARGETS+"${EXTRA_TARGETS[@]}"}; do
+    if [ -f "$extra" ]; then
+        pass "附加文件存在: $extra"
+    else
+        fail "缺少附加文件: $extra"
+    fi
+done
 
 # ─────────────────────────────────────────────
 # 3. 公开 API 形状（T1 专用）
@@ -192,6 +210,52 @@ if [ "$TASK" = "T2" ]; then
     fi
 fi
 
+if [ "$TASK" = "T3" ]; then
+    for sym in \
+        "struct MqttClientConfig" \
+        "struct MqttIncoming" \
+        "struct MqttClientHandle" \
+        "enum MqttClientError" \
+        "async fn publish" \
+        "fn incoming" \
+        "struct UdpAudioConfig" \
+        "struct UdpIncomingAudio" \
+        "struct UdpAudioHandle" \
+        "enum UdpAudioError" \
+        "async fn register_session" \
+        "async fn unregister_session" \
+        "async fn send_audio"
+    do
+        if grep -q -- "$sym" crates/haimen-xiaozhi/src/mqtt.rs crates/haimen-xiaozhi/src/udp_audio.rs 2>/dev/null; then
+            pass "存在 $sym"
+        else
+            fail "缺少 $sym"
+        fi
+    done
+
+    # EventLoop 必须在独立 task 里 poll（否则连接不建立）
+    if grep -qE "eventloop|EventLoop" crates/haimen-xiaozhi/src/mqtt.rs 2>/dev/null && \
+       grep -qE "tokio::spawn" crates/haimen-xiaozhi/src/mqtt.rs 2>/dev/null; then
+        pass "EventLoop 在独立 tokio task 中驱动"
+    else
+        fail "缺少 EventLoop 独立 task 驱动（否则连接不会建立）"
+    fi
+
+    # UDP 必须是共享 Arc<UdpSocket> 单 socket 多设备
+    if grep -qE "Arc<.*UdpSocket|Arc<tokio::net::UdpSocket" crates/haimen-xiaozhi/src/udp_audio.rs 2>/dev/null; then
+        pass "使用 Arc<UdpSocket> 单 socket 多设备"
+    else
+        fail "缺少 Arc<UdpSocket>（单 socket 服务多设备）"
+    fi
+
+    # timestamp 非 0 的规避逻辑必须有体现
+    if grep -qE "timestamp" crates/haimen-xiaozhi/src/udp_audio.rs 2>/dev/null; then
+        pass "UDP 发送带 timestamp"
+    else
+        fail "UDP 发送缺少 timestamp 参数"
+    fi
+fi
+
 # ─────────────────────────────────────────────
 # 4. 禁止事项
 # ─────────────────────────────────────────────
@@ -210,6 +274,18 @@ if [ -n "$TEST_MARKER" ]; then
 else
     info "未找到 mod tests，跳过 unwrap 分区检查"
 fi
+for extra in ${EXTRA_TARGETS+"${EXTRA_TARGETS[@]}"}; do
+    m=$(grep -n "mod tests" "$extra" 2>/dev/null | head -1 | cut -d: -f1)
+    if [ -n "$m" ]; then
+        c=$(head -n $((m - 1)) "$extra" 2>/dev/null | grep -c -E "\.unwrap\(\)|\.expect\(|panic!\(")
+        c=${c:-0}
+        if [ "$c" -eq 0 ]; then
+            pass "库代码无 unwrap/expect/panic: $extra"
+        else
+            fail "$extra 库代码出现 ${c} 处 unwrap/expect/panic"
+        fi
+    fi
+done
 
 # 不能新增依赖
 if grep -q "thiserror" crates/haimen-xiaozhi/Cargo.toml 2>/dev/null; then
@@ -245,6 +321,10 @@ fi
 # ─────────────────────────────────────────────
 TEST_COUNT=$(grep -c "#\[test\]" "$TARGET" 2>/dev/null)
 TEST_COUNT=${TEST_COUNT:-0}
+for extra in ${EXTRA_TARGETS+"${EXTRA_TARGETS[@]}"}; do
+    n=$(grep -c "#\[test\]" "$extra" 2>/dev/null)
+    TEST_COUNT=$((TEST_COUNT + ${n:-0}))
+done
 if [ "${TEST_COUNT:-0}" -ge "$MIN_TESTS" ]; then
     pass "测试数量 ${TEST_COUNT} >= ${MIN_TESTS}"
 else
@@ -276,12 +356,16 @@ if $DEV test >/tmp/acc_mqtt_test.log 2>&1; then
     pass "cargo test"
     grep -E 'test result:' /tmp/acc_mqtt_test.log | tail -4 | sed 's/^/     /'
     # 确认 protocol_udp 的测试真的跑了
-    MODULE_TESTED=$(grep -cE "${MODULE}::tests::" /tmp/acc_mqtt_test.log)
-    MODULE_TESTED=${MODULE_TESTED:-0}
+    MODULE_TESTED=0
+    for m in "${MODULES[@]}"; do
+        n=$(grep -cE "${m}::tests::" /tmp/acc_mqtt_test.log)
+        n=${n:-0}
+        MODULE_TESTED=$((MODULE_TESTED + n))
+    done
     if [ "$MODULE_TESTED" -ge "$TEST_COUNT" ]; then
-        pass "${MODULE} 的测试确实执行了（${MODULE_TESTED} 个 >= 文件内 ${TEST_COUNT} 个）"
+        pass "模块测试确实执行了（${MODULES[*]} 共 ${MODULE_TESTED} 个 >= 文件内 ${TEST_COUNT} 个）"
     else
-        fail "${MODULE} 的测试未执行或不足（执行 ${MODULE_TESTED} 个 < 文件内 ${TEST_COUNT} 个）"
+        fail "模块测试未执行或不足（执行 ${MODULE_TESTED} 个 < 文件内 ${TEST_COUNT} 个）"
     fi
 else
     fail "cargo test 失败"
