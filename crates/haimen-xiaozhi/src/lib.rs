@@ -1,5 +1,6 @@
 mod ota;
 mod protocol;
+pub mod protocol_udp;
 pub mod strategy;
 pub mod types;
 mod ws;

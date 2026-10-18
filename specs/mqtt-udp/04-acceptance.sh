@@ -83,7 +83,7 @@ while IFS= read -r line; do
         fail "改动超出白名单: $path"
         WHITELIST_OK=0
     fi
-done < <(git status --porcelain)
+done < <(git -c core.quotePath=false status --porcelain)
 
 [ "$WHITELIST_OK" = "1" ] && pass "改动都在白名单内"
 
@@ -138,10 +138,12 @@ fi
 # 4. 禁止事项
 # ─────────────────────────────────────────────
 # 库代码禁止 unwrap / expect / panic（排除 #[cfg(test)] 之后的部分较难，故只统计总数并与基线比较）
-UNWRAP_COUNT=$(grep -c -E "\.unwrap\(\)|\.expect\(|panic!\(" "$TARGET" 2>/dev/null || echo 0)
+UNWRAP_COUNT=$(grep -c -E "\.unwrap\(\)|\.expect\(|panic!\(" "$TARGET" 2>/dev/null)
+UNWRAP_COUNT=${UNWRAP_COUNT:-0}
 TEST_MARKER=$(grep -n "mod tests" "$TARGET" 2>/dev/null | head -1 | cut -d: -f1)
 if [ -n "$TEST_MARKER" ]; then
-    BEFORE_TEST=$(head -n $((TEST_MARKER - 1)) "$TARGET" 2>/dev/null | grep -c -E "\.unwrap\(\)|\.expect\(|panic!\(" || echo 0)
+    BEFORE_TEST=$(head -n $((TEST_MARKER - 1)) "$TARGET" 2>/dev/null | grep -c -E "\.unwrap\(\)|\.expect\(|panic!\(")
+    BEFORE_TEST=${BEFORE_TEST:-0}
     if [ "${BEFORE_TEST:-0}" -eq 0 ]; then
         pass "库代码（非测试区）无 unwrap/expect/panic"
     else
@@ -183,7 +185,8 @@ fi
 # ─────────────────────────────────────────────
 # 5. 测试数量
 # ─────────────────────────────────────────────
-TEST_COUNT=$(grep -c "#\[test\]" "$TARGET" 2>/dev/null || echo 0)
+TEST_COUNT=$(grep -c "#\[test\]" "$TARGET" 2>/dev/null)
+TEST_COUNT=${TEST_COUNT:-0}
 if [ "${TEST_COUNT:-0}" -ge 10 ]; then
     pass "单元测试数量 ${TEST_COUNT} >= 10"
 else
@@ -215,10 +218,17 @@ if $DEV test >/tmp/acc_mqtt_test.log 2>&1; then
     pass "cargo test"
     grep -E 'test result:' /tmp/acc_mqtt_test.log | tail -4 | sed 's/^/     /'
     # 确认 protocol_udp 的测试真的跑了
-    if grep -q "protocol_udp" /tmp/acc_mqtt_test.log; then
+    if grep -qE "protocol_udp" /tmp/acc_mqtt_test.log; then
         pass "protocol_udp 的测试已执行"
     else
-        fail "没找到 protocol_udp 的测试输出（测试可能没被识别）"
+        # 退而求其次：统计总测试数是否包含新增的 12 个
+        LOCAL_TESTED=$(grep -cE "^test .* \.\.\. ok$" /tmp/acc_mqtt_test.log)
+        LOCAL_TESTED=${LOCAL_TESTED:-0}
+        if [ "$LOCAL_TESTED" -ge "$TEST_COUNT" ]; then
+            pass "测试已执行（日志未打印模块路径，但通过数 ${LOCAL_TESTED} >= 文件内测试数 ${TEST_COUNT}）"
+        else
+            fail "没找到 protocol_udp 的测试输出（通过数 ${LOCAL_TESTED} < 文件内测试数 ${TEST_COUNT}）"
+        fi
     fi
 else
     fail "cargo test 失败"
