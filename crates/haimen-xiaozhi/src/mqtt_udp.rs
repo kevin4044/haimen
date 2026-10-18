@@ -381,6 +381,94 @@ async fn run_loop(
 /// 拿不到全局注册表；而传输层的 `incoming()` 天然能收到所有客户端的 PUBLISH。
 const CONTROL_TOPIC_PREFIX: &str = "haimen/ctl/";
 
+/// 解析 `__say_audio` 命令里的音频帧（hex 编码，避免引入 base64 依赖）。
+///
+/// 期望格式：
+/// {"type":"__say_audio","frames_hex":["3c1a...", "..."]}
+fn parse_say_frames(value: &serde_json::Value) -> Result<Vec<Vec<u8>>, String> {
+    let arr = value
+        .get("frames_hex")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "缺少 frames_hex 数组".to_string())?;
+    if arr.is_empty() {
+        return Err("frames_hex 为空".to_string());
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let hex = item
+            .as_str()
+            .ok_or_else(|| format!("第 {i} 帧不是字符串"))?;
+        let bytes = decode_hex(hex).ok_or_else(|| format!("第 {i} 帧 hex 非法"))?;
+        out.push(bytes);
+    }
+    Ok(out)
+}
+
+/// 主动播报：用预编码的 Opus 帧走一遍 tts 会话。
+///
+/// 为什么不用 notify：设备固件是 2.2.6，`notify` 是较新固件才有的能力
+/// （实测 stt / alert 都正常，说明下行链路没问题，唯独 notify 完全无反应）。
+///
+/// 走 tts 会话的约束：
+/// - 设备必须先唤醒过、UDP socket 还没销毁（断网 / 重启 / 120 秒超时会销毁）
+/// - `tts stop` 后，非手动模式下设备会自动进入 Listening —— 这就是「主动开启对话」
+async fn say_raw_frames(shared: &Arc<Shared>, client_id: &str, frames: Vec<Vec<u8>>) {
+    let udp_id = {
+        let tables = shared.tables.lock().await;
+        tables
+            .sessions
+            .get(client_id)
+            .and_then(|s| s.udp_session_id)
+    };
+    let Some(udp_id) = udp_id else {
+        tracing::warn!(
+            %client_id,
+            "主动播报失败：没有 UDP 会话（设备需先唤醒过一次）"
+        );
+        return;
+    };
+
+    let step = frame_step_ms(&shared.cfg) as u64;
+    let prebuffer = shared.cfg.prebuffer_count.max(1);
+    tracing::warn!(
+        %client_id,
+        frames = frames.len(),
+        step_ms = step,
+        prebuffer,
+        "主动播报：开始"
+    );
+
+    if !publish_tts(shared, client_id, TtsState::Start, None).await {
+        return;
+    }
+
+    // 前 prebuffer 帧连发填满设备 jitter buffer，之后按 step 实时发送。
+    // 设备解码队列只有 20 包（1.2 秒），发太快会静默丢包。
+    let mut ts: u32 = 1;
+    for (i, frame) in frames.iter().enumerate() {
+        if frame.len() > MAX_DOWNLINK_PAYLOAD {
+            tracing::warn!(len = frame.len(), "帧超过 1500 字节，跳过");
+            continue;
+        }
+        if let Err(err) = shared.udp.send_audio(udp_id, ts, frame).await {
+            tracing::warn!(%err, "主动播报发送失败，中止");
+            return;
+        }
+        ts = ts.saturating_add(step as u32);
+        if i + 1 >= prebuffer {
+            tokio::time::sleep(Duration::from_millis(step)).await;
+        }
+    }
+
+    // 给最后几帧留播放时间再发 stop，避免掐掉尾巴。
+    tokio::time::sleep(Duration::from_millis(step * 3)).await;
+    let _ = publish_tts(shared, client_id, TtsState::Stop, None).await;
+    tracing::warn!(
+        %client_id,
+        "主动播报：已发送 tts stop，非手动模式下设备会自动进入聆听"
+    );
+}
+
 async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
     // ── 控制面转发：haimen/ctl/<target_client_id> → 直接推给该设备 ──
     if let Some(target) = msg.topic.strip_prefix(CONTROL_TOPIC_PREFIX) {
@@ -389,6 +477,17 @@ async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
             tracing::warn!(topic = %msg.topic, "控制主题缺少目标 client_id，丢弃");
             return;
         }
+        // 本地命令：主动播报（不走转发，由传输层自己按 tts 会话下发音频）
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+            if value.get("type").and_then(|v| v.as_str()) == Some("__say_audio") {
+                match parse_say_frames(&value) {
+                    Ok(frames) => say_raw_frames(shared, target, frames).await,
+                    Err(err) => tracing::warn!(target, %err, "主动播报命令非法，丢弃"),
+                }
+                return;
+            }
+        }
+
         let payload_len = msg.payload.len();
         let result = shared
             .broker
@@ -1279,6 +1378,27 @@ fn random_session_id(used: &HashMap<u32, String>) -> u32 {
         id = id.wrapping_add(1);
     }
     if id == 0 { 1 } else { id }
+}
+
+/// 解析 hex 字符串为字节。长度奇数或含非 hex 字符返回 `None`。
+///
+/// `encode_hex` 的逆操作；用于控制面 `__say_audio` 命令传预编码 Opus 帧
+/// （用 hex 而不是 base64，避免为此引入新依赖）。
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
