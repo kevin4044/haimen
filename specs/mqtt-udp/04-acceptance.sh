@@ -61,6 +61,7 @@ ALLOWED_FILES=(
     "crates/haimen-xiaozhi/src/lib.rs"
     "crates/haimen-xiaozhi/src/types.rs"
     "crates/haimen-xiaozhi/src/ota.rs"
+    "src/config/settings.rs"
     "src/settings.rs"
 )
 ALLOWED_PREFIXES=("specs/mqtt-udp/" "scripts/")
@@ -91,7 +92,7 @@ case "$TASK" in
     TARGET="crates/haimen-xiaozhi/src/types.rs"
     EXTRA_TARGETS=(
         "crates/haimen-xiaozhi/src/ota.rs"
-        "src/settings.rs"
+        "src/config/settings.rs"
     )
     MODULES=("ota" "settings" "types")
     MIN_TESTS=10
@@ -338,7 +339,7 @@ if [ "$TASK" = "T5" ]; then
         "struct XiaozhiConfig" \
         "enum XiaozhiProtocol"
     do
-        if grep -rq -- "$sym" crates/haimen-xiaozhi/src/types.rs src/settings.rs 2>/dev/null; then
+        if grep -rq -- "$sym" crates/haimen-xiaozhi/src/types.rs src/config/settings.rs src/settings.rs 2>/dev/null; then
             pass "存在 $sym"
         else
             fail "缺少 $sym"
@@ -360,14 +361,14 @@ if [ "$TASK" = "T5" ]; then
     fi
 
     # endpoint 必须补端口（8883 是 TLS 端口，明文必须 1883）
-    if grep -qE "1883" crates/haimen-xiaozhi/src/ota.rs src/settings.rs 2>/dev/null; then
+    if grep -qE "1883" crates/haimen-xiaozhi/src/ota.rs src/config/settings.rs 2>/dev/null; then
         pass "endpoint 处理了 1883 端口"
     else
         fail "缺少 endpoint 端口补全（不带端口固件默认 8883 → 强制 TLS 失败）"
     fi
 
     # protocol 开关
-    if grep -qE "XiaozhiProtocol" src/settings.rs 2>/dev/null; then
+    if grep -qE "XiaozhiProtocol|xiaozhi" src/config/settings.rs 2>/dev/null; then
         pass "配置里有 protocol 开关"
     else
         fail "设置里缺少 protocol 开关"
@@ -417,14 +418,25 @@ else
     echo "$CARGO_DIFF" | sed 's/^/     /'
 fi
 
-# 不能碰 ws.rs / protocol.rs / strategy.rs / types.rs
-for f in crates/haimen-xiaozhi/src/ws.rs crates/haimen-xiaozhi/src/protocol.rs \
-         crates/haimen-xiaozhi/src/strategy.rs crates/haimen-xiaozhi/src/types.rs; do
+# 永不允许改的文件（任何任务）
+for f in crates/haimen-xiaozhi/src/ws.rs \
+         crates/haimen-xiaozhi/src/protocol.rs \
+         crates/haimen-xiaozhi/src/strategy.rs; do
     if git status --porcelain | grep -q " $f$"; then
         fail "不应改动 $f"
     fi
 done
-pass "未触碰 ws.rs / protocol.rs / strategy.rs / types.rs"
+pass "未触碰 ws.rs / protocol.rs / strategy.rs"
+
+# types.rs / ota.rs 只有 T5 允许改
+if [ "$TASK" != "T5" ]; then
+    for f in crates/haimen-xiaozhi/src/types.rs crates/haimen-xiaozhi/src/ota.rs; do
+        if git status --porcelain | grep -q " $f$"; then
+            fail "不应改动 $f（仅 T5 允许）"
+        fi
+    done
+    pass "未触碰 types.rs / ota.rs（非 T5）"
+fi
 
 # 模块已导出
 LIB="crates/haimen-xiaozhi/src/lib.rs"

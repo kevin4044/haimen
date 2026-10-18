@@ -165,6 +165,8 @@ const fn default_emoji() -> bool {
 #[derive(Debug, Deserialize)]
 pub struct OtaRequest {
     pub version: u32,
+    /// 设备 MAC。缺省为空时，OTA 再尝试 `Device-Id` 请求头。
+    #[serde(default)]
     pub mac_address: String,
     pub uuid: String,
     #[serde(default)]
@@ -184,11 +186,128 @@ pub struct OtaRequest {
 /// OTA 响应
 #[derive(Debug, Serialize)]
 pub struct OtaResponse {
-    pub websocket: WebsocketInfo,
+    /// 只有 protocol = websocket 时下发
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket: Option<WebsocketInfo>,
+    /// 只有 protocol = mqtt 时下发。
+    /// 固件看到 mqtt 对象就选 MqttProtocol，没有回退到 websocket。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mqtt: Option<MqttInfo>,
     pub server_time: ServerTime,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub firmware: Option<FirmwareInfo>,
     pub audio_params: AudioParams,
+}
+
+/// 下发给设备的 MQTT 接入参数。
+#[derive(Debug, Serialize, Clone)]
+pub struct MqttInfo {
+    /// 必须带端口，如 "192.168.110.35:1883"。
+    /// 不带端口时固件默认 8883，会强制 TLS，明文 broker 会连不上。
+    pub endpoint: String,
+    /// `GID_<型号>@@@<mac下划线>@@@<mac下划线>`
+    pub client_id: String,
+    pub username: String,
+    pub password: String,
+    /// 心跳秒数，默认 240。
+    pub keepalive: u32,
+    /// 设备上行主题。
+    pub publish_topic: String,
+    /// 下行主题模板。设备忽略 topic，仅供约定。
+    pub subscribe_topic: String,
+}
+
+/// 小智设备走哪条传输。默认 websocket，避免 M2' 把现网设备切到 MQTT。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum XiaozhiProtocol {
+    #[default]
+    Websocket,
+    Mqtt,
+}
+
+/// 小智传输配置。`protocol = "mqtt"` 时 OTA 才下发 `mqtt` 段。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct XiaozhiConfig {
+    /// `"websocket"`（默认）或 `"mqtt"`。非法取值反序列化失败，不回退默认。
+    #[serde(default)]
+    pub protocol: XiaozhiProtocol,
+    #[serde(default)]
+    pub mqtt: XiaozhiMqttConfig,
+    #[serde(default)]
+    pub udp: XiaozhiUdpConfig,
+}
+
+impl Default for XiaozhiConfig {
+    fn default() -> Self {
+        Self {
+            protocol: XiaozhiProtocol::Websocket,
+            mqtt: XiaozhiMqttConfig::default(),
+            udp: XiaozhiUdpConfig::default(),
+        }
+    }
+}
+
+/// MQTT broker 与主题模板。`{mac}` 会换成下划线形式的 MAC。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct XiaozhiMqttConfig {
+    /// 形如 `192.168.110.35:1883`。缺端口时 OTA 会补 `:1883`。
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_keepalive")]
+    pub keepalive: u32,
+    #[serde(default = "default_publish_topic")]
+    pub publish_topic_template: String,
+    #[serde(default = "default_downlink_topic")]
+    pub downlink_topic_template: String,
+}
+
+const fn default_keepalive() -> u32 {
+    240
+}
+
+fn default_publish_topic() -> String {
+    "haimen/xz/{mac}/up".to_string()
+}
+
+fn default_downlink_topic() -> String {
+    "haimen/xz/{mac}/down".to_string()
+}
+
+impl Default for XiaozhiMqttConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            username: String::new(),
+            password: String::new(),
+            keepalive: default_keepalive(),
+            publish_topic_template: default_publish_topic(),
+            downlink_topic_template: default_downlink_topic(),
+        }
+    }
+}
+
+/// UDP 音频监听地址。M2' 只入库，不在启动流程里 bind。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct XiaozhiUdpConfig {
+    #[serde(default = "default_udp_bind")]
+    pub bind_addr: String,
+}
+
+fn default_udp_bind() -> String {
+    "0.0.0.0:8888".to_string()
+}
+
+impl Default for XiaozhiUdpConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_udp_bind(),
+        }
+    }
 }
 
 /// WebSocket 连接信息

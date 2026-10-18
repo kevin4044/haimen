@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+include!("../settings.rs");
+
 const PROJECT_DIR: &str = ".haimen";
 const SETTINGS_FILE: &str = "settings.toml";
 
@@ -857,6 +859,9 @@ pub struct AppConfig {
     /// Agent 调用日志配置
     #[serde(default)]
     pub agent_log: AgentLogConfig,
+    /// 小智设备传输（默认 websocket；mqtt 时 OTA 下发 mqtt 段）
+    #[serde(default)]
+    pub xiaozhi: XiaozhiConfig,
 }
 
 fn default_log_level() -> String {
@@ -875,6 +880,7 @@ impl Default for AppConfig {
             tts: TtsConfig::default(),
             github: None,
             agent_log: AgentLogConfig::default(),
+            xiaozhi: XiaozhiConfig::default(),
         }
     }
 }
@@ -1150,6 +1156,7 @@ enabled = true
             },
             github: None,
             agent_log: AgentLogConfig::default(),
+            xiaozhi: XiaozhiConfig::default(),
         };
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: AppConfig = toml::from_str(&toml_str).unwrap();
@@ -1781,5 +1788,45 @@ app_key = "old-key"
             assert!(cfg.agent_log.enabled);
             assert_eq!(cfg.agent_log.retention_days, 30);
         });
+    }
+
+    #[test]
+    fn test_xiaozhi_minimal_mqtt_protocol_uses_defaults() {
+        // 只有 protocol 时，其余字段走 Default，不要求把 mqtt/udp 表写全。
+        let cfg: AppConfig = toml::from_str("[xiaozhi]\nprotocol = \"mqtt\"\n").unwrap();
+        assert_eq!(cfg.xiaozhi.protocol, XiaozhiProtocol::Mqtt);
+        assert_eq!(cfg.xiaozhi.mqtt.keepalive, 240);
+        assert_eq!(
+            cfg.xiaozhi.mqtt.publish_topic_template,
+            "haimen/xz/{mac}/up"
+        );
+        assert_eq!(
+            cfg.xiaozhi.mqtt.downlink_topic_template,
+            "haimen/xz/{mac}/down"
+        );
+        assert_eq!(cfg.xiaozhi.mqtt.endpoint, "");
+        assert_eq!(cfg.xiaozhi.mqtt.username, "");
+        assert_eq!(cfg.xiaozhi.mqtt.password, "");
+        assert_eq!(cfg.xiaozhi.udp.bind_addr, "0.0.0.0:8888");
+        assert_eq!(cfg.log_level, "info");
+    }
+
+    #[test]
+    fn test_xiaozhi_protocol_rejects_unknown_value() {
+        // 非法 protocol 反序列化失败，不静默退回 websocket。
+        let err = toml::from_str::<XiaozhiConfig>("protocol = \"foo\"");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_xiaozhi_protocol_defaults_to_websocket() {
+        assert_eq!(
+            XiaozhiConfig::default().protocol,
+            XiaozhiProtocol::Websocket
+        );
+        assert_eq!(
+            AppConfig::default().xiaozhi.protocol,
+            XiaozhiProtocol::Websocket
+        );
     }
 }
