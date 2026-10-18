@@ -23,14 +23,7 @@ http://192.168.50.33:8642/p/<profile>/v1/chat/completions
 - 支持多轮上下文
 - 不破坏任何现有 provider
 
-## 3. 非目标
-
-- 不改前端 UI 的提供商下拉框（需要 pnpm 构建，本阶段不做；用 settings.toml 配置）
-- 不改 `src/config/settings.rs`（`providers` 已是 `HashMap<String, HashMap<String,String>>`，字段自由）
-- 不实现 tools/function calling（由服务端 agent 自行处理）
-- 不实现 thinking / tool_use 事件上报（`AgentEventStream` 可为空流）
-
-## 4. 接口契约
+## 3. 接口契约
 
 已有 trait，定义在 `crates/haimen-core/src/provider.rs`：
 
@@ -64,6 +57,13 @@ pub trait AgentProvider: Send + Sync {
 - `session_id == None` 表示新会话；返回值第二项是**新的 session_id**
 - `process_stream` 返回的 `TextStream` 每 `Item` 是一段**文本增量**（不是整句）
 - `check_available` 在启动/切换时调用，返回 `Err` 会终止 chat_loop
+
+## 4. 非目标
+
+- 不改前端 UI 的提供商下拉框（需要 pnpm 构建，本阶段不做；用 settings.toml 配置）
+- 不改 `src/config/settings.rs`（`providers` 已是 `HashMap<String, HashMap<String,String>>`，字段自由）
+- 不实现 tools/function calling（由服务端 agent 自行处理）
+- 不实现 thinking / tool_use 事件上报（`AgentEventStream` 可为空流）
 
 ## 5. 新增 crate 结构
 

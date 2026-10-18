@@ -5,7 +5,7 @@
 
 ---
 
-## T1 — 新增 `haimen-openai` crate，实现 OpenAI 兼容 provider 并注册
+### T1 — 新增 `haimen-openai` crate，实现 OpenAI 兼容 provider 并注册
 
 ### 目标
 
