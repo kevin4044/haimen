@@ -75,8 +75,8 @@ run_clippy() {
 }
 
 run_test() {
-    step "cargo test -- --test-threads=1"
-    if in_dev cargo test -- --test-threads=1 2>&1 | filter_noise; then
+    step "cargo test --workspace -- --test-threads=1"
+    if in_dev cargo test --workspace -- --test-threads=1 2>&1 | filter_noise; then
         echo "✅ test 通过"
     else
         echo "❌ test 失败"

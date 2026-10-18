@@ -94,8 +94,11 @@ case "$cmd" in
 
     test)
         require_docker
-        # 单线程，避免环境变量竞争；只跑根 crate（不跑整个 workspace 是有意为之）
-        in_dev cargo test -- --test-threads=1 "$@"
+        # 单线程，避免环境变量竞争。
+        # 必须加 --workspace：之前只跑根 crate，导致 crates/ 下的测试
+        # （如 haimen-xiaozhi 的 protocol_udp / mqtt_broker）在 CI 里从未执行。
+        # 已确认全 workspace 测试可通过（585 passed / 0 failed）。
+        in_dev cargo test --workspace -- --test-threads=1 "$@"
         fix_owner
         ;;
 

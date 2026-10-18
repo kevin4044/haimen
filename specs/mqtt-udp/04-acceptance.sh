@@ -48,22 +48,30 @@ fi
 declare -a ALLOWED_FILES=()
 declare -a ALLOWED_PREFIXES=()
 
+# 白名单采用【全部任务文件的并集 + specs/ + scripts/】。
+# 原因：多个任务在同一工作区增量推进，当验收 T1 时 T2 的产物可能已经存在，
+# 不应因此判 T1 失败。白名单的真正目的是拦住 Cursor 乱改无关源码
+# （ws.rs / protocol.rs / strategy.rs / types.rs / ota.rs 有单独的硬性检查）。
+ALLOWED_FILES=(
+    "crates/haimen-xiaozhi/src/protocol_udp.rs"
+    "crates/haimen-xiaozhi/src/mqtt_broker.rs"
+    "crates/haimen-xiaozhi/src/mqtt.rs"
+    "crates/haimen-xiaozhi/src/udp_audio.rs"
+    "crates/haimen-xiaozhi/src/mqtt_udp.rs"
+    "crates/haimen-xiaozhi/src/lib.rs"
+)
+ALLOWED_PREFIXES=("specs/mqtt-udp/" "scripts/")
+
 case "$TASK" in
   T1)
-    ALLOWED_FILES=(
-        "crates/haimen-xiaozhi/src/protocol_udp.rs"
-        "crates/haimen-xiaozhi/src/lib.rs"
-    )
-    ALLOWED_PREFIXES=("specs/mqtt-udp/")
     TARGET="crates/haimen-xiaozhi/src/protocol_udp.rs"
+    MODULE="protocol_udp"
+    MIN_TESTS=10
     ;;
   T2)
-    ALLOWED_FILES=(
-        "crates/haimen-xiaozhi/src/mqtt_broker.rs"
-        "crates/haimen-xiaozhi/src/lib.rs"
-    )
-    ALLOWED_PREFIXES=("specs/mqtt-udp/")
     TARGET="crates/haimen-xiaozhi/src/mqtt_broker.rs"
+    MODULE="mqtt_broker"
+    MIN_TESTS=8
     ;;
   *)
     fail "未知任务 $TASK（已实现 T1 / T2）"
@@ -237,7 +245,6 @@ fi
 # ─────────────────────────────────────────────
 TEST_COUNT=$(grep -c "#\[test\]" "$TARGET" 2>/dev/null)
 TEST_COUNT=${TEST_COUNT:-0}
-if [ "$TASK" = "T2" ]; then MIN_TESTS=8; else MIN_TESTS=10; fi
 if [ "${TEST_COUNT:-0}" -ge "$MIN_TESTS" ]; then
     pass "测试数量 ${TEST_COUNT} >= ${MIN_TESTS}"
 else
@@ -269,17 +276,12 @@ if $DEV test >/tmp/acc_mqtt_test.log 2>&1; then
     pass "cargo test"
     grep -E 'test result:' /tmp/acc_mqtt_test.log | tail -4 | sed 's/^/     /'
     # 确认 protocol_udp 的测试真的跑了
-    if grep -qE "protocol_udp" /tmp/acc_mqtt_test.log; then
-        pass "protocol_udp 的测试已执行"
+    MODULE_TESTED=$(grep -cE "${MODULE}::tests::" /tmp/acc_mqtt_test.log)
+    MODULE_TESTED=${MODULE_TESTED:-0}
+    if [ "$MODULE_TESTED" -ge "$TEST_COUNT" ]; then
+        pass "${MODULE} 的测试确实执行了（${MODULE_TESTED} 个 >= 文件内 ${TEST_COUNT} 个）"
     else
-        # 退而求其次：统计总测试数是否包含新增的 12 个
-        LOCAL_TESTED=$(grep -cE "^test .* \.\.\. ok$" /tmp/acc_mqtt_test.log)
-        LOCAL_TESTED=${LOCAL_TESTED:-0}
-        if [ "$LOCAL_TESTED" -ge "$TEST_COUNT" ]; then
-            pass "测试已执行（日志未打印模块路径，但通过数 ${LOCAL_TESTED} >= 文件内测试数 ${TEST_COUNT}）"
-        else
-            fail "没找到 protocol_udp 的测试输出（通过数 ${LOCAL_TESTED} < 文件内测试数 ${TEST_COUNT}）"
-        fi
+        fail "${MODULE} 的测试未执行或不足（执行 ${MODULE_TESTED} 个 < 文件内 ${TEST_COUNT} 个）"
     fi
 else
     fail "cargo test 失败"
