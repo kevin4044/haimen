@@ -737,23 +737,21 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
                 sample_rate: 16000,
                 bits: 16,
                 channel: 1,
-                // 服务端 VAD 判停窗口：静音超过这么久就判定用户说完了。
-                // 云端复刻版用 200ms，这里默认 400ms（更保守），可通过配置覆盖：
-                //   [asr.providers.doubao]
-                //   end_window_size = "400"
-                // 注意：这是【服务端】判停；本地能量 VAD（MAX_SILENCE_FRAMES）是兜底，
-                // 两者取先触发者。
+                // 服务端 VAD 判停窗口。这是我们唯一的"权威判停"手段，
+                // 不能短：中文口语停顿 400ms 很常见，窗口太短会在用户话没说完时判停，
+                // 导致豆包返回空结果 + code=45000081「等包超时」。
+                // 真正的延迟优化来自本地能量 VAD（MAX_SILENCE_FRAMES），见下方说明。
                 end_window_size: Some(
                     cfg.get_credential("end_window_size")
                         .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(400),
+                        .unwrap_or(1500),
                 ),
-                // 至少累积这么多音频后才允许判停，避免"嗯"之类极短音频误判。
-                // 原值 1000ms 对"开灯"这类短指令是浪费，降到 200ms。
+                // 至少累积这么多音频后才允许判停。200ms 太激进（大约只有 3 帧），
+                // 环境噪音抖动就可能触发误判；500ms 是折中值。
                 force_to_speech_time: Some(
                     cfg.get_credential("force_to_speech_time")
                         .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(200),
+                        .unwrap_or(500),
                 ),
                 ..Default::default()
             })))
@@ -1254,7 +1252,9 @@ impl AsrLlmTtsStrategy {
                     }
                 }
 
-                tracing::info!(
+                // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+                // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+                tracing::warn!(
                     "🎤 [ASR 完成] 共收到 {} 个结果块，完整文本长度: {}",
                     chunk_count,
                     full_text.len(),
@@ -1293,7 +1293,9 @@ impl AsrLlmTtsStrategy {
             .map_err(|e| format!("锁获取失败: {}", e))?;
         *guard = Some(state);
 
-        tracing::info!("流式 ASR: 管道已就绪（惰性初始化）");
+        // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+        // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+        tracing::warn!("流式 ASR: 管道已就绪（惰性初始化）");
 
         Ok(())
     }
@@ -1484,7 +1486,9 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
     /// 通过 `init_asr_pipeline` 惰性初始化。这样可以避免在用户尚未说话时
     /// 建立 ASR 连接导致服务端对空音频返回误判的 VAD 端点。
     async fn on_recording_start(&self, session_id: &str) -> Result<(), String> {
-        tracing::info!(
+        // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+        // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+        tracing::warn!(
             session_id = %session_id,
             "流式 ASR: 清空管道状态（惰性初始化）",
         );
@@ -1527,7 +1531,9 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             .map_err(|e| format!("锁获取失败: {}", e))?
             .is_none();
         if needs_init {
-            tracing::info!("流式 ASR: 第一帧音频到达，惰性初始化管道");
+            // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+            // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+            tracing::warn!("流式 ASR: 第一帧音频到达，惰性初始化管道");
             self.init_asr_pipeline().await?;
         }
 
@@ -1542,15 +1548,6 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 .ok_or_else(|| "流式 ASR 未启动".to_string())?;
 
             state.frame_count += 1;
-            // 每 50 帧（~3s）打印一次接收诊断日志
-            if state.frame_count - state.last_log_frame >= 50 {
-                state.last_log_frame = state.frame_count;
-                tracing::info!(
-                    "流式 ASR: 已接收 {} 帧 ({:.0}s 音频)",
-                    state.frame_count,
-                    state.frame_count as f64 * 60.0 / 1000.0,
-                );
-            }
 
             let mut pcm_buf = vec![0i16; state.frame_samples];
             let decoded_samples = state
@@ -1566,6 +1563,24 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
             // ── 本地 PCM 能量检测 ──
             let rms = compute_pcm_rms(&pcm_bytes);
+
+            // 临时诊断（找到合适阈值后可删除）：
+            // 用 warn 级绕开 info 被过滤的问题，每 50 帧（约 3 秒）打印一次实测能量，
+            // 用于判断 SILENCE_RMS_THRESHOLD 对当前麦克风是否过高。
+            if state.frame_count - state.last_log_frame >= 50 {
+                state.last_log_frame = state.frame_count;
+                tracing::warn!(
+                    "ASR 诊断: 第 {} 帧, RMS={:.0}, 阈值={:.0}, speech_detected={}, 已识别文字={}, 静音帧计数={}, 无语音帧={}",
+                    state.frame_count,
+                    rms,
+                    SILENCE_RMS_THRESHOLD,
+                    state.speech_detected,
+                    self.asr_received_text.load(Ordering::Acquire),
+                    state.silence_count,
+                    state.no_speech_frames,
+                );
+            }
+
             if rms >= SILENCE_RMS_THRESHOLD {
                 state.speech_detected = true;
                 state.silence_count = 0;
@@ -1588,7 +1603,9 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 // 关闭 ASR 流：替换 sender，令 ASR 后台任务感知流结束
                 let (new_tx, _) = mpsc::channel::<Vec<u8>>(1);
                 let _ = std::mem::replace(&mut state.pcm_tx, new_tx);
-                tracing::info!(
+                // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+                // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+                tracing::warn!(
                     "无语音超时: 录音开始后 {} 帧 ({}ms) 无有效语音，触发告别并关闭连接",
                     state.no_speech_frames,
                     state.no_speech_frames * 60,
