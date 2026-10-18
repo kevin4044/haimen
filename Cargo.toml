@@ -92,6 +92,13 @@ uuid = { version = "1", features = ["v4"] }
 # Opus 音频编码
 opus2 = { version = "0.4", features = ["bundled"] }
 
+# MQTT 客户端（小智设备的 MQTT 传输层，见 specs/mqtt-udp/实现方案.md）
+rumqttc = "0.24"
+
+# AES-CTR 对称加密（小智 UDP 音频通道的载荷加密）
+aes = "0.8"
+ctr = "0.9"
+
 # 可执行文件路径解析（Windows 下按 PATHEXT 命中 npm 的 .cmd/.bat shim）
 which = "8"
 

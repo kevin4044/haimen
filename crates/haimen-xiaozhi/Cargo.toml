@@ -17,6 +17,12 @@ futures-util = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+local-ip-address = { workspace = true }
+opus2 = { workspace = true }
+# MQTT + UDP 传输层（见 specs/mqtt-udp/实现方案.md）
+rumqttc = { workspace = true }
+aes = { workspace = true }
+ctr = { workspace = true }
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"
