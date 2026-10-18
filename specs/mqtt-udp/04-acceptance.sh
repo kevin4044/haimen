@@ -79,8 +79,13 @@ case "$TASK" in
     MODULES=("mqtt" "udp_audio")
     MIN_TESTS=10
     ;;
+  T4)
+    TARGET="crates/haimen-xiaozhi/src/mqtt_udp.rs"
+    MODULES=("mqtt_udp")
+    MIN_TESTS=12
+    ;;
   *)
-    fail "未知任务 $TASK（已实现 T1 / T2 / T3）"
+    fail "未知任务 $TASK（已实现 T1 / T2 / T3 / T4）"
     echo; echo "验收失败：$FAILURES 项"; exit 1
     ;;
 esac
@@ -253,6 +258,63 @@ if [ "$TASK" = "T3" ]; then
         pass "UDP 发送带 timestamp"
     else
         fail "UDP 发送缺少 timestamp 参数"
+    fi
+fi
+
+if [ "$TASK" = "T4" ]; then
+    for sym in \
+        "struct MqttUdpConfig" \
+        "struct MqttUdpTransport" \
+        "enum MqttUdpError" \
+        "async fn start" \
+        "async fn shutdown" \
+        "struct DeviceSession" \
+        "SessionState" \
+        "ResponseStrategy"
+    do
+        if grep -q -- "$sym" "$TARGET" 2>/dev/null; then
+            pass "存在 $sym"
+        else
+            fail "缺少 $sym"
+        fi
+    done
+
+    # 帧节奏三要素
+    if grep -qiE "prebuffer" "$TARGET" 2>/dev/null; then
+        pass "存在预缓冲逻辑"
+    else
+        fail "缺少预缓冲（prebuffer）逻辑"
+    fi
+    if grep -qE "next_send_at" "$TARGET" 2>/dev/null; then
+        pass "存在 next_send_at 累加时钟"
+    else
+        fail "缺少 next_send_at 累加时钟（不能每帧 now + 60ms）"
+    fi
+    if grep -qE "snap_send_clock|wait_until_send_slot" "$TARGET" 2>/dev/null; then
+        pass "存在发送时钟对齐/快进逻辑"
+    else
+        fail "缺少 wait_until_send_slot 或 snap_send_clock"
+    fi
+
+    # UDP server 必须是局域网 IP
+    if grep -qE "local_ip" "$TARGET" 2>/dev/null; then
+        pass "使用 local_ip_address 获取局域网 IP"
+    else
+        fail "缺少局域网 IP 探测（udp.server 不能是 0.0.0.0）"
+    fi
+
+    # 必须先 tts start 再发音频
+    if grep -qiE "\"tts\"|TtsState" "$TARGET" 2>/dev/null; then
+        pass "存在 tts 状态消息发送逻辑"
+    else
+        fail "缺少 tts start/stop 消息发送"
+    fi
+
+    # 标注节奏逻辑来源
+    if grep -qE "ws\.rs" "$TARGET" 2>/dev/null; then
+        pass "节奏逻辑标注了 ws.rs 来源"
+    else
+        info "建议在注释里标注节奏逻辑源自 ws.rs（便于后续同步）"
     fi
 fi
 

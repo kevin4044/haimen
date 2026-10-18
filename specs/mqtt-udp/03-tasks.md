@@ -532,13 +532,228 @@ cargo test --workspace -- --test-threads=1
 
 ---
 
-### T4 — `mqtt_udp.rs`：传输层
+### T4 — `mqtt_udp.rs`：传输层（核心）
 
-（待 T3 完成后细化）
+### 架构澄清（重要）
 
-- 会话状态机（`AwaitingHello / Ready / Recording / Playing`）
-- hello 握手、UDP 建链、对接 `strategy.rs`
-- 帧节奏（复制 `ws.rs` 的 `next_send_at` / `wait_until_send_slot` / `snap_send_clock`，顶部注释标注来源）
+haimen **自己托管 MQTT broker**（T2 已实现），所以设备链路**不走 rumqttc 客户端**：
+
+```
+设备 ──MQTT──▶ haimen 内置 broker ──incoming()──▶ MqttUdpTransport
+                      ▲                              │
+                      └────── publish_to() ──────────┘
+                                                     ▼
+                                              UdpAudioHandle（T3）
+                                                     │
+                                                     ▼
+                                              ResponseStrategy（现有）
+```
+
+- `mqtt.rs`（T3 的 rumqttc 客户端）在 M2' 的**设备链路里用不到**，
+  它是为「连外部 broker」场景准备的，M2' 不接线。
+- T4 直接用 `MqttBrokerHandle` 的 `incoming()` / `publish_to()`。
+
+### 目标
+
+新增 `crates/haimen-xiaozhi/src/mqtt_udp.rs`，实现完整传输层：
+MQTT 控制消息 + UDP 音频，驱动现有的 `ResponseStrategy` 产出语音回复。
+
+### 公开 API
+
+```rust
+#[derive(Debug, Clone)]
+pub struct MqttUdpConfig {
+    pub broker: MqttBrokerConfig,
+    pub udp: UdpAudioConfig,
+    /// 设备上行主题模板，`{mac}` 替换为带冒号的 MAC（如 84:c7:bb:59:93:64）
+    pub publish_topic_template: String,
+    /// 服务器下行主题模板（设备忽略 topic，仅供可读性/日志）
+    pub downlink_topic_template: String,
+    /// 预缓冲帧数，默认 5（与 ws.rs 一致）
+    pub prebuffer_count: usize,
+    /// 帧时长毫秒，默认 60
+    pub frame_duration_ms: u32,
+}
+
+pub struct MqttUdpTransport { /* ... */ }
+
+impl MqttUdpTransport {
+    /// 启动：绑 broker + UDP，内部 spawn 主循环
+    pub async fn start(
+        cfg: MqttUdpConfig,
+        strategy: Arc<dyn ResponseStrategy>,
+    ) -> Result<Self, MqttUdpError>;
+
+    /// 日志/诊断用的运行信息
+    pub fn broker_addr(&self) -> String;
+    pub fn udp_addr(&self) -> std::net::SocketAddr;
+
+    /// 当前在线设备数
+    pub async fn online_device_count(&self) -> usize;
+
+    pub async fn shutdown(self);
+}
+
+#[derive(Debug)]
+pub enum MqttUdpError {
+    Broker(MqttBrokerError),
+    Udp(UdpAudioError),
+    Proto(UdpProtoError),
+}
+```
+
+### 会话状态
+
+直接复用 `types.rs` 的 `SessionState`（4 态）：
+```
+AwaitingHello → Ready → Recording → Playing
+                          ↑____________|
+```
+
+每个连接（按 `client_id` 区分）维护一份会话：
+```rust
+struct DeviceSession {
+    client_id: String,
+    device_id: String,        // 从 client_id 的 @@@ 分段里取 MAC
+    state: SessionState,
+    /// UDP 会话 ID（= 下发 nonce 的 [4..8)）
+    udp_session_id: Option<u32>,
+    /// 录音阶段缓冲的音频帧（给 strategy 用）
+    audio_buffer: Vec<AudioFrame>,
+    /// 发送侧帧节奏
+    next_send_at: Option<Instant>,
+    /// 下行 timestamp 基数（★ 必须非 0，规避 IV 复用）
+    downlink_ts: u32,
+}
+```
+
+### 完整流程（按此实现）
+
+**① 设备连上 broker**
+- `MqttBrokerHandle` 内部已有连接；我们通过 `incoming()` 收消息
+- 首次收到某 `client_id` 的消息时创建会话，状态 `AwaitingHello`
+
+**② 收到 `{"type":"hello","transport":"udp",...}`**
+1. 解析设备上报的 `audio_params`（上行 16000/mono/60，容错：缺失用默认）
+2. 调 `strategy.hello_audio_params(&client_params)` 拿到**下行**参数
+   （`AsrLlmTtsStrategy` 会返回 24000Hz）
+3. 生成会话 ID（u32 随机）与 16 字节 key（随机）
+4. 构造 nonce 模板：`01 00 00 00 | session_id(4B BE) | 00 00 00 00 | 00 00 00 00`
+5. `udp.register_session(session_id, UdpCrypto::new(key, nonce))`
+6. 通过 `broker.publish_to(client_id, downlink_topic, hello_json)` 回 hello：
+   ```json
+   {"type":"hello","transport":"udp","session_id":"<uuid或session_id>",
+    "audio_params":{"format":"opus","sample_rate":24000,"channels":1,"frame_duration":60},
+    "udp":{"server":"<局域网IP>","port":<udp端口>,
+           "key":"<32 hex>","nonce":"<32 hex>"}}
+   ```
+   ⚠️ `server` 必须是**局域网 IP**，用 `local_ip_address::local_ip()`，不能是 0.0.0.0/127.0.0.1
+7. 状态 → `Ready`
+
+**★ 硬性要求**：必须先收到设备 hello 才能回（提前发会被设备清掉事件位；且会重置 key/seq）。
+设备只等 **10 秒**，超时就失败，且**没有任何 ACK**。
+
+**③ 收到 `{"type":"listen","state":"start",...}`**
+- 状态 → `Recording`
+- 清空 `audio_buffer`
+- 调 `strategy.on_recording_start(session_id)`
+
+**④ 收到 UDP 上行音频（`udp.incoming()`）**
+- 从 `session_id` 找到会话
+- 状态必须是 `Recording`，否则丢弃 + debug 日志
+- 构造 `AudioFrame { timestamp, data }` 追加到 `audio_buffer`
+- 调 `strategy.on_audio_frame(frame)`（`AsrLlmTtsStrategy` 在这里喂 ASR）
+
+**⑤ 判定"用户说完了"**
+两种来源，取先到者（与 ws.rs 语义一致，但这里更简单）：
+- 收到 `{"type":"listen","state":"stop"}`（设备主动）
+- 或收到 `{"type":"abort"}`
+
+→ 状态 → `Playing`，然后：
+```rust
+// 优先用流式接口；strategy 的 is_streaming_capable() 为 true 时走 stream
+let events_rx = strategy.generate_response_stream(audio_buffer.clone(), &session_id, frame_tx).await;
+```
+`frame_tx` 是 `mpsc::Sender<PlaybackEvent>`，策略在其中投递：
+- `PlaybackEvent::Stt(text)` → 发 `{"type":"stt","text":...}`
+- `PlaybackEvent::LlmSentence(text)` → 发 `{"type":"tts","state":"sentence_start","text":...}`
+- `PlaybackEvent::Audio(frame)` → **加密后经 UDP 发出**
+- `PlaybackEvent::TtsState(...)` → 发对应的 tts 状态消息
+
+⚠️ **发送顺序必须是**：`tts start` → 若干 `sentence_start` + 音频帧 → `tts stop`。
+设备要求 **先收到 `tts start` 才会播放音频**，否则丢弃。
+
+**⑥ 帧节奏（从 ws.rs 复制，顶部注释标注来源）**
+
+```
+① PREBUFFER_COUNT = 5：收到第一帧音频前先连发 5 帧（300ms）填满设备 jitter buffer
+② next_send_at 累加 60ms：next_send_at += 60ms（不是 now + 60ms，否则逐帧变慢）
+③ wait_until_send_slot：绝对时刻对齐
+④ snap_send_clock：断档（队列空超过 1 帧）后把时钟快进到 now，避免补偿式连发
+```
+
+**UDP 特有约束**：
+- 必须按 **~60ms/包实时**发送。设备解码队列只有 20 包（1.2s），发太快会**静默丢包**
+- 单包总长 <= 1500 字节
+- 下行 timestamp **从 1 开始按 60 递增**（非 0，规避 IV 复用）
+- 下行 sequence 从 1 开始严格递增，`hello` 时重置
+
+**⑦ 结束**
+- 收到 `{"type":"goodbye"}` 或 `{"type":"abort"}` 或长时间无消息：
+  - `udp.unregister_session(session_id)`
+  - 状态 → `Ready`（不要直接断 MQTT，设备会继续复用连接）
+- MQTT 断连（broker 侧感知）→ 清理整个会话
+
+**⑧ 会话超时**
+- 设备没有 no-speech 自动回 Idle，**必须服务器驱动**
+- `Ready` 状态超过 `no_speech_timeout_ms`（默认 10000）无 listen → 不做特殊处理（M2' 简化）
+- `Recording` 超过 30 秒 → 强制 `generate_response`
+
+### 必须做的防御
+
+1. **未知 `session_id` 的 UDP 包** → 丢弃（可能是旧会话残留）
+2. **`Recording` 之外收到音频** → 丢弃
+3. **设备没发 hello 就先发 listen** → 忽略 + warn
+4. **`publish_to` 返回 false（设备掉线）** → 清理会话
+5. **JSON 解析失败** → warn + 丢弃，不要 panic
+6. **同 `client_id` 重复 hello** → 视为重连：注销旧 UDP 会话，重新生成 key/nonce
+
+### 测试（至少 12 个）
+
+用 `127.0.0.1:0` 起 broker + UDP，自己写一个极简设备客户端（可复用 T2 测试里的辅助代码）：
+
+1. 完整 hello 握手：设备发 hello → 收到合规 hello 响应（key/nonce 均 16 字节、port 合法）
+2. hello 响应的 `udp.server` 不是 0.0.0.0 / 127.0.0.1
+3. hello 响应的 nonce[0] == 0x01
+4. 未发 hello 就发 listen → 被忽略
+5. listen start 后状态变 Recording，`on_recording_start` 被调用（用 mock strategy）
+6. 发 UDP 音频帧 → `on_audio_frame` 被调用，帧内容正确
+7. listen stop → 触发 `generate_response`，收到 `tts start`
+8. 音频帧按预缓冲数量先连发（前 N 帧间隔 << 60ms）
+9. 后续帧间隔约 60ms（断言 40..90ms 容差）
+10. 下行 sequence 从 1 严格递增
+11. 下行 timestamp 非 0 且按 60 递增
+12. goodbye 后 UDP 会话被注销，后续该 session 的包被丢弃
+13. 重复 hello 会重新生成 key/nonce
+
+### 硬性约束
+
+- **只改/新增**：`crates/haimen-xiaozhi/src/mqtt_udp.rs`、`crates/haimen-xiaozhi/src/lib.rs`
+- 可以**读**但**不改** `ws.rs`（只复制节奏逻辑，顶部注释标注 `源自 ws.rs:xxx`）
+- **不改** T1/T2/T3 的文件（除非发现 bug，需注释说明并最小修改）
+- **不改** `protocol.rs` / `strategy.rs` / `types.rs` / `ota.rs`
+- **不加新依赖**
+- 库代码禁止 `unwrap()` / `expect()` / `panic!()`；错误手写 `Display` + `Error`
+- 注释用中文，关键处说明「为什么」
+
+### 自检
+
+```bash
+cargo fmt --all && cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+cargo test --workspace -- --test-threads=1
+```
+
 
 ---
 
