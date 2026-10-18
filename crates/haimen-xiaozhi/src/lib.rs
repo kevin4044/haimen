@@ -1,9 +1,11 @@
+pub mod mqtt;
 pub mod mqtt_broker;
 mod ota;
 mod protocol;
 pub mod protocol_udp;
 pub mod strategy;
 pub mod types;
+pub mod udp_audio;
 mod ws;
 
 pub use protocol::*;
