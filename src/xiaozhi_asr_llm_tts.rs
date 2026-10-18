@@ -548,15 +548,19 @@ pub struct AsrLlmTtsStrategy {
 
 /// PCM16 mono 静音 RMS 阈值（低于此值视为静音）
 ///
-/// 经验值：PCM16 满幅 32768，正常语音 RMS ≈ 3000~15000，
-/// 环境底噪 RMS ≈ 100~800，阈值 1500 可区分底噪和轻声说话。
-/// 1500 在空调/风扇噪音下容易误判"还在说话"导致空等，提到 2000。
-const SILENCE_RMS_THRESHOLD: f64 = 2000.0;
+/// 真机实测（设备 84:c7:bb:59:93:64）：
+/// - 用户说话时 RMS ≈ 4000~15000
+/// - 环境静音时 RMS ≈ 1600~2200
+///
+/// 阈值 2000 会把环境噪音（实测 2019、2120）误判为"还在说话"，导致
+/// `silence_count` 始终归零、本地能量 VAD 永远不触发，只能干等服务端
+/// 1500ms 判停。取 3000 才能在实测数据上正确区分人声与环境噪音。
+const SILENCE_RMS_THRESHOLD: f64 = 3000.0;
 
 /// 连续静音帧数阈值（60ms/帧），触发本地 VAD。
-/// 40 帧 = 2400ms 太长（小智云端用 Silero VAD 只要 1000ms）。
-/// 降到 20 帧 = 1200ms，作为服务端 VAD 的兜底。
-const MAX_SILENCE_FRAMES: u64 = 20;
+/// 15 帧 = 900ms，对齐小智云端判停量级（其 Silero VAD 为 1000ms）。
+/// 注意：这条路径只有 `SILENCE_RMS_THRESHOLD` 能正确区分人声与噪音时才生效。
+const MAX_SILENCE_FRAMES: u64 = 15;
 
 /// 无语音超时帧数阈值：按 60ms/帧向上取整，保证实际时长 ≥ 配置值
 fn no_speech_threshold_frames(timeout_ms: u64) -> u64 {
@@ -749,14 +753,19 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
                 sample_rate: 16000,
                 bits: 16,
                 channel: 1,
-                // 服务端 VAD 判停窗口。这是我们唯一的"权威判停"手段，
-                // 不能短：中文口语停顿 400ms 很常见，窗口太短会在用户话没说完时判停，
-                // 导致豆包返回空结果 + code=45000081「等包超时」。
-                // 真正的延迟优化来自本地能量 VAD（MAX_SILENCE_FRAMES），见下方说明。
+                // 服务端 VAD 判停窗口：静音超过这么久就判定用户说完了。
+                //
+                // 权衡：窗口越短判停越快，但太短会在用户话没说完（中文口语停顿
+                // 常达 400-600ms）时误判。1500ms 太保守（实测 ASR 阶段最长耗 4.1s），
+                // 400ms 又太激进（曾经导致豆包返回空结果 + code=45000081「等包超时」）。
+                // 800ms 是折中值。
+                //
+                // 之所以现在敢降：ASR 任务结束处已有 last_nonempty_text 兜底 ——
+                // 即使服务端来不及发 is_final，也能用最后一次累积的中间结果作为完整转写。
                 end_window_size: Some(
                     cfg.get_credential("end_window_size")
                         .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(1500),
+                        .unwrap_or(800),
                 ),
                 // 至少累积这么多音频后才允许判停。200ms 太激进（大约只有 3 帧），
                 // 环境噪音抖动就可能触发误判；500ms 是折中值。
