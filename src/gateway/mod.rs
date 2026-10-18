@@ -163,6 +163,10 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
     // 构建共享 Agent 句柄（所有消费路径共用，支持 Web API 运行时热切换）
     let shared_agent = build_shared_agent(&config, None)?;
 
+    // 小智 MQTT+UDP 传输层句柄。必须活到本函数结束，否则 broker/UDP 会被回收，
+    // 设备连上来立刻断。（内部主循环持 Arc，但显式持有更直观、也便于将来优雅关闭。）
+    let mut xiaozhi_mqtt_transport: Option<haimen_xiaozhi::MqttUdpTransport> = None;
+
     // 启动 HTTP 服务器（xiaozhi + GitHub Webhook + Web 控制台）
     let http_handle = if config.http.enabled {
         let http_cancel = cancel.clone();
@@ -190,6 +194,39 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
             shared_asr_config.clone(),
             shared_tts_config.clone(),
         );
+
+        // ★ MQTT 模式下启动 MQTT+UDP 传输层（内置 broker + UDP 音频）。
+        // 必须在 HTTP 服务启动【之前】完成 —— 设备拉 OTA 拿到 broker 地址后
+        // 会立刻连接，此时 broker 必须已在监听。
+        if config.xiaozhi.protocol == haimen_xiaozhi::XiaozhiProtocol::Mqtt {
+            match xiaozhi_strategy.clone() {
+                Some(strategy) => {
+                    let mqtt_cfg = build_mqtt_udp_config(&config.xiaozhi);
+                    match haimen_xiaozhi::MqttUdpTransport::start(mqtt_cfg, strategy).await {
+                        Ok(t) => {
+                            tracing::info!(
+                                broker = %t.broker_addr(),
+                                udp = %t.udp_addr(),
+                                "小智 MQTT+UDP 传输层已启动"
+                            );
+                            xiaozhi_mqtt_transport = Some(t);
+                        }
+                        Err(e) => {
+                            // 这里失败等于设备连不上，必须显式告警
+                            tracing::error!(
+                                error = %e,
+                                "小智 MQTT+UDP 传输层启动失败 —— protocol=mqtt 时设备将无法连接"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        "protocol=mqtt 但 xiaozhi 语音策略未构建（缺少 ASR/TTS 配置？），跳过 MQTT 传输层"
+                    );
+                }
+            }
+        }
 
         tracing::info!(
             "HTTP 服务器启动于 {}:{}{}",
@@ -316,6 +353,12 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
             let _ = handle.await;
         }
 
+        // 优雅关闭 MQTT+UDP 传输层（protocol=websocket 时为 None）
+        if let Some(t) = xiaozhi_mqtt_transport.take() {
+            t.shutdown().await;
+            tracing::info!("小智 MQTT+UDP 传输层已关闭");
+        }
+
         tracing::info!("所有服务已停止");
         result
     } else {
@@ -325,6 +368,12 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
 
         if let Some(handle) = http_handle {
             let _ = handle.await;
+        }
+
+        // 优雅关闭 MQTT+UDP 传输层（protocol=websocket 时为 None）
+        if let Some(t) = xiaozhi_mqtt_transport.take() {
+            t.shutdown().await;
+            tracing::info!("小智 MQTT+UDP 传输层已关闭");
         }
 
         Ok(())
@@ -425,4 +474,34 @@ pub async fn start_echo() -> Result<(), String> {
     }
 
     Err("所有消息流意外结束".to_string())
+}
+
+/// 由 `[xiaozhi]` 配置构造 MQTT+UDP 传输层配置。
+///
+/// 关键约束：内置 broker 的**监听端口必须等于 OTA 下发的 endpoint 端口**。
+/// 设备从 OTA 拿到 `endpoint` 后直接连，端口对不上就是连不上。
+/// OTA 侧用的是 `xiaozhi.mqtt.endpoint` 里写的端口（缺端口会补 1883），
+/// 这里按同一规则解析，保证两边一致。
+fn build_mqtt_udp_config(x: &haimen_xiaozhi::XiaozhiConfig) -> haimen_xiaozhi::MqttUdpConfig {
+    let endpoint = x.mqtt.endpoint.trim();
+    let port = endpoint
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(1883);
+
+    haimen_xiaozhi::MqttUdpConfig {
+        broker: haimen_xiaozhi::mqtt_broker::MqttBrokerConfig {
+            bind_addr: format!("0.0.0.0:{port}"),
+            max_packet_size: 256 * 1024,
+        },
+        udp: haimen_xiaozhi::udp_audio::UdpAudioConfig {
+            bind_addr: x.udp.bind_addr.clone(),
+        },
+        publish_topic_template: x.mqtt.publish_topic_template.clone(),
+        downlink_topic_template: x.mqtt.downlink_topic_template.clone(),
+        prebuffer_count: 5,
+        frame_duration_ms: 60,
+    }
 }
