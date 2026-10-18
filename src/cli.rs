@@ -489,6 +489,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 serve_config,
                 webhook_state,
                 Some(xiaozhi_strategy),
+                settings.xiaozhi.clone(),
                 shared_asr_config,
                 shared_tts_config,
                 serve_agent,

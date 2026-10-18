@@ -844,9 +844,9 @@ pub async fn handle_ota(
 - `subscribe_topic` = 同上 `/down`
 - `keepalive` = 240
 
-### C. `settings.rs`：新增配置段
+### C. `src/config/settings.rs`：新增配置段
 
-`AppConfig` 在 `src/settings.rs:831-860`。新增：
+`AppConfig` 在 `src/config/settings.rs`（约 831-860 行）。新增：
 
 ```rust
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -944,7 +944,7 @@ bind_addr = "0.0.0.0:8888"
 ### 硬性约束
 
 - **只改/新增**：`crates/haimen-xiaozhi/src/types.rs`、`crates/haimen-xiaozhi/src/ota.rs`、
-  `crates/haimen-xiaozhi/src/lib.rs`、`src/settings.rs`
+  `crates/haimen-xiaozhi/src/lib.rs`、`src/config/settings.rs`
 - **不改** `ws.rs` / `strategy.rs` / `protocol.rs` / `protocol_udp.rs` / `mqtt*.rs` / `udp_audio.rs`
 - **不改** 根 crate 的启动流程（M2' 不接线上）
 - **不加新依赖**

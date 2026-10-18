@@ -34,7 +34,10 @@ pub async fn handle_ota(
 }
 
 /// 安装 OTA 使用的配置。默认是 websocket，不会把设备切到 MQTT。
-pub(crate) fn set_xiaozhi_ota_config(cfg: XiaozhiConfig) {
+///
+/// 必须在 HTTP 服务启动**之前**调用，否则第一台设备的 OTA 会拿到默认
+/// （websocket）配置。根 crate 在 `cli.rs` 里用 `AppConfig.xiaozhi` 调用它。
+pub fn set_xiaozhi_ota_config(cfg: XiaozhiConfig) {
     match ota_config_slot().lock() {
         Ok(mut guard) => *guard = cfg,
         Err(poisoned) => {

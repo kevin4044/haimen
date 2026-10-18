@@ -203,11 +203,14 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
         );
 
         let http_shared_agent = shared_agent.clone();
+        // 小智传输配置：决定 OTA 下发 websocket 还是 mqtt 段
+        let xiaozhi_config = config.xiaozhi.clone();
         let handle = tokio::spawn(async move {
             let result = crate::web::start(
                 serve_config,
                 webhook_state,
                 xiaozhi_strategy,
+                xiaozhi_config,
                 shared_asr_config,
                 shared_tts_config,
                 http_shared_agent,
