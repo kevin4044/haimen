@@ -59,6 +59,9 @@ ALLOWED_FILES=(
     "crates/haimen-xiaozhi/src/udp_audio.rs"
     "crates/haimen-xiaozhi/src/mqtt_udp.rs"
     "crates/haimen-xiaozhi/src/lib.rs"
+    "crates/haimen-xiaozhi/src/types.rs"
+    "crates/haimen-xiaozhi/src/ota.rs"
+    "src/settings.rs"
 )
 ALLOWED_PREFIXES=("specs/mqtt-udp/" "scripts/")
 
@@ -84,8 +87,17 @@ case "$TASK" in
     MODULES=("mqtt_udp")
     MIN_TESTS=12
     ;;
+  T5)
+    TARGET="crates/haimen-xiaozhi/src/types.rs"
+    EXTRA_TARGETS=(
+        "crates/haimen-xiaozhi/src/ota.rs"
+        "src/settings.rs"
+    )
+    MODULES=("ota" "settings" "types")
+    MIN_TESTS=10
+    ;;
   *)
-    fail "未知任务 $TASK（已实现 T1 / T2 / T3 / T4）"
+    fail "未知任务 $TASK（已实现 T1 / T2 / T3 / T4 / T5）"
     echo; echo "验收失败：$FAILURES 项"; exit 1
     ;;
 esac
@@ -318,6 +330,50 @@ if [ "$TASK" = "T4" ]; then
     fi
 fi
 
+if [ "$TASK" = "T5" ]; then
+    for sym in \
+        "struct MqttInfo" \
+        "mqtt: Option<MqttInfo>" \
+        "websocket: Option<WebsocketInfo>" \
+        "struct XiaozhiConfig" \
+        "enum XiaozhiProtocol"
+    do
+        if grep -rq -- "$sym" crates/haimen-xiaozhi/src/types.rs src/settings.rs 2>/dev/null; then
+            pass "存在 $sym"
+        else
+            fail "缺少 $sym"
+        fi
+    done
+
+    # handle_ota 必须读请求体（Json(body) 而不是 Json(_body)）
+    if grep -qE "Json\(_body\)|Json\(_\)" crates/haimen-xiaozhi/src/ota.rs 2>/dev/null; then
+        fail "handle_ota 仍丢弃请求体（Json(_body)）—— 拿不到 mac_address"
+    else
+        pass "handle_ota 已读取请求体"
+    fi
+
+    # client_id 的 GID_@@@ 格式
+    if grep -qE "GID_|@@@" crates/haimen-xiaozhi/src/ota.rs 2>/dev/null; then
+        pass "生成 client_id 的 GID_@@@ 格式"
+    else
+        fail "缺少 client_id 的 GID_xxx@@@mac@@@mac 格式"
+    fi
+
+    # endpoint 必须补端口（8883 是 TLS 端口，明文必须 1883）
+    if grep -qE "1883" crates/haimen-xiaozhi/src/ota.rs src/settings.rs 2>/dev/null; then
+        pass "endpoint 处理了 1883 端口"
+    else
+        fail "缺少 endpoint 端口补全（不带端口固件默认 8883 → 强制 TLS 失败）"
+    fi
+
+    # protocol 开关
+    if grep -qE "XiaozhiProtocol" src/settings.rs 2>/dev/null; then
+        pass "配置里有 protocol 开关"
+    else
+        fail "设置里缺少 protocol 开关"
+    fi
+fi
+
 # ─────────────────────────────────────────────
 # 4. 禁止事项
 # ─────────────────────────────────────────────
@@ -381,10 +437,11 @@ fi
 # ─────────────────────────────────────────────
 # 5. 测试数量
 # ─────────────────────────────────────────────
-TEST_COUNT=$(grep -c "#\[test\]" "$TARGET" 2>/dev/null)
+# 测试数量：同时统计 #[test] 与 #[tokio::test]
+TEST_COUNT=$(grep -cE '#\[(tokio::)?test\]' "$TARGET" 2>/dev/null)
 TEST_COUNT=${TEST_COUNT:-0}
 for extra in ${EXTRA_TARGETS+"${EXTRA_TARGETS[@]}"}; do
-    n=$(grep -c "#\[test\]" "$extra" 2>/dev/null)
+    n=$(grep -cE '#\[(tokio::)?test\]' "$extra" 2>/dev/null)
     TEST_COUNT=$((TEST_COUNT + ${n:-0}))
 done
 if [ "${TEST_COUNT:-0}" -ge "$MIN_TESTS" ]; then

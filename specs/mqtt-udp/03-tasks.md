@@ -759,12 +759,206 @@ cargo test --workspace -- --test-threads=1
 
 ### T5 — OTA 改造 + 配置
 
-（待 T4 完成后细化）
+### 目标
 
-- `types.rs`：`OtaResponse.mqtt: Option<MqttInfo>`，`websocket` 改 `Option`
-- `ota.rs`：`Json(_body)` → `Json(body)`，用 `body.mac_address` 生成 client_id / subscribe_topic
-- `settings.rs`：新增 `[xiaozhi]` / `[xiaozhi.mqtt]` / `[xiaozhi.udp]`
-- `lib.rs`：按配置挂载 MQTT 入口
+让 OTA 响应能按配置下发 `mqtt` 段，从而（在 M3'）把设备切到 MQTT 模式。
+**M2' 阶段默认仍下发 websocket，不切设备。**
+
+### A. `types.rs`：OTA 响应结构
+
+当前（`types.rs:184-192`）：
+```rust
+pub struct OtaResponse {
+    pub websocket: WebsocketInfo,
+    pub server_time: ServerTime,
+    #[serde(skip_serializing_if = "Option::is_none")] pub firmware: Option<FirmwareInfo>,
+    pub audio_params: AudioParams,
+}
+```
+
+改为：
+```rust
+pub struct OtaResponse {
+    /// 只有 protocol = websocket 时下发
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket: Option<WebsocketInfo>,
+    /// 只有 protocol = mqtt 时下发
+    /// ★ 存在即让设备切 MQTT —— 固件见 mqtt 对象就选 MqttProtocol，无 fallback
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mqtt: Option<MqttInfo>,
+    pub server_time: ServerTime,
+    #[serde(skip_serializing_if = "Option::is_none")] pub firmware: Option<FirmwareInfo>,
+    pub audio_params: AudioParams,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct MqttInfo {
+    /// 必须带端口，如 "192.168.110.35:1883"
+    /// ⚠️ 不带端口时固件默认 8883，会强制 TLS 导致连不上
+    pub endpoint: String,
+    /// GID_<型号>@@@<mac下划线>@@@<mac下划线>
+    pub client_id: String,
+    pub username: String,
+    pub password: String,
+    pub keepalive: u32,        // 240
+    pub publish_topic: String, // 设备上行主题
+    pub subscribe_topic: String, // 下行模板（设备忽略 topic，仅供约定）
+}
+```
+
+⚠️ `websocket` 变 `Option` 会影响现有调用方，需同步修 `ota.rs`。
+
+### B. `ota.rs`：必须读请求体拿 MAC
+
+现在 `ota.rs:17` 附近是 `Json(_body)` —— **请求体被丢弃了**。
+MQTT 的 `client_id` 需要 `body.mac_address`（`types.rs:168`），必须改成 `Json(body)`。
+
+漏了会拿到全 `unknown` 的 client_id → 多设备撞 client_id 互踢。
+
+改造逻辑：
+```rust
+pub async fn handle_ota(
+    State(state): State<Arc<AppState>>,   // 或现有签名
+    headers: HeaderMap,
+    Json(body): Json<OtaRequest>,         // ← 改这里
+) -> impl IntoResponse {
+    let protocol = state.config.xiaozhi.protocol;  // "websocket" | "mqtt"
+
+    // 设备 MAC：优先 body.mac_address，其次 Device-Id header
+    let mac = extract_mac(&body, &headers);
+
+    let (websocket, mqtt) = match protocol {
+        XiaozhiProtocol::Websocket => (Some(build_ws_info()), None),
+        XiaozhiProtocol::Mqtt => (None, Some(build_mqtt_info(&state.config.xiaozhi, &mac))),
+    };
+    ...
+}
+```
+
+`build_mqtt_info` 要点：
+- `endpoint` = 配置的 `xiaozhi.mqtt.endpoint`（**必须含端口**，配置里若缺端口要补 `:1883` 并 warn）
+- `client_id` = `GID_{group}@@@{mac_safe}@@@{mac_safe}`
+  - `mac_safe` = MAC 的 `:` 换 `_`
+  - `group` 可固定 `haimen`（或取 `body.board.type` 下划线化）
+- `publish_topic` = 配置模板替换 `{mac}` → 例如 `haimen/xz/84_c7_bb_59_93_64/up`
+- `subscribe_topic` = 同上 `/down`
+- `keepalive` = 240
+
+### C. `settings.rs`：新增配置段
+
+`AppConfig` 在 `src/settings.rs:831-860`。新增：
+
+```rust
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct XiaozhiConfig {
+    /// "websocket"（默认）或 "mqtt"
+    #[serde(default)]
+    pub protocol: XiaozhiProtocol,
+    #[serde(default)]
+    pub mqtt: XiaozhiMqttConfig,
+    #[serde(default)]
+    pub udp: XiaozhiUdpConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum XiaozhiProtocol {
+    #[default]
+    Websocket,
+    Mqtt,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct XiaozhiMqttConfig {
+    pub endpoint: String,            // "192.168.110.35:1883"
+    pub username: String,
+    pub password: String,
+    #[serde(default = "default_keepalive")]
+    pub keepalive: u32,              // 240
+    #[serde(default = "default_publish_topic")]
+    pub publish_topic_template: String,   // "haimen/xz/{mac}/up"
+    #[serde(default = "default_downlink_topic")]
+    pub downlink_topic_template: String,  // "haimen/xz/{mac}/down"
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct XiaozhiUdpConfig {
+    #[serde(default = "default_udp_bind")]
+    pub bind_addr: String,           // "0.0.0.0:8888"
+}
+```
+
+对应 `settings.toml`：
+```toml
+[xiaozhi]
+protocol = "websocket"
+
+[xiaozhi.mqtt]
+endpoint = "192.168.110.35:1883"
+username = "haimen"
+password = "haimen"
+keepalive = 240
+publish_topic_template = "haimen/xz/{mac}/up"
+downlink_topic_template = "haimen/xz/{mac}/down"
+
+[xiaozhi.udp]
+bind_addr = "0.0.0.0:8888"
+```
+
+### D. `lib.rs`：按配置挂载 MQTT 入口
+
+`crates/haimen-xiaozhi/src/lib.rs:33-39` 的 `add_routes` 无条件挂 `/xiaozhi/ota/` 和 `/xiaozhi/ws`。
+
+要求：
+- `/xiaozhi/ota/` **始终**挂载（两种协议都要 OTA）
+- `/xiaozhi/ws` **始终**挂载（回退时设备还会用）
+- 新增：MQTT 传输层的启动逻辑由一个**构造函数**暴露，供根 crate 在
+  `protocol == "mqtt"` 时启动：
+  ```rust
+  /// 当配置为 mqtt 时，由根 crate 调用以启动 MQTT+UDP 传输层。
+  /// websocket 模式下不需要调用。
+  pub async fn start_mqtt_transport(
+      cfg: MqttUdpConfig,
+      strategy: Arc<dyn ResponseStrategy>,
+  ) -> Result<MqttUdpTransport, MqttUdpError>;
+  ```
+- **不要在 M2' 就把它接进根 crate 的启动流程**（那会让现有 WS 部署多开一个 1883 端口）。
+  M2' 只要求：结构就位 + OTA 能按配置下发段 + 单元测试覆盖。
+
+### E. 测试（至少 10 个）
+
+**`ota.rs`**
+1. `protocol = websocket` → 响应含 `websocket`，不含 `mqtt`
+2. `protocol = mqtt` → 响应含 `mqtt`，不含 `websocket`
+3. mqtt 段的 `endpoint` 含端口（配置缺端口时自动补 `:1883`）
+4. mqtt 段的 `client_id` = `GID_xxx@@@84_c7_bb_59_93_64@@@84_c7_bb_59_93_64`
+5. `publish_topic` / `subscribe_topic` 里的 `{mac}` 被正确替换
+6. 请求体没有 mac_address 时，从 `Device-Id` header 取
+7. 两者都没有时不 panic，用退化值并在日志里 warn
+
+**`settings.rs`**
+8. 反序列化最小配置（只有 `[xiaozhi] protocol = "mqtt"`）能成功，其余字段用默认
+9. `protocol` 非法值（如 "foo"）时反序列化失败或退回默认（二选一，需明确并测试）
+10. 默认配置下 `protocol == websocket`
+
+### 硬性约束
+
+- **只改/新增**：`crates/haimen-xiaozhi/src/types.rs`、`crates/haimen-xiaozhi/src/ota.rs`、
+  `crates/haimen-xiaozhi/src/lib.rs`、`src/settings.rs`
+- **不改** `ws.rs` / `strategy.rs` / `protocol.rs` / `protocol_udp.rs` / `mqtt*.rs` / `udp_audio.rs`
+- **不改** 根 crate 的启动流程（M2' 不接线上）
+- **不加新依赖**
+- 库代码禁止 `unwrap()` / `expect()` / `panic!()`
+- 注释用中文
+
+### 自检
+
+```bash
+cargo fmt --all && cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+cargo test --workspace -- --test-threads=1
+```
+
 
 ---
 

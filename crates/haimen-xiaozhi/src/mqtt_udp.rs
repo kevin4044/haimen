@@ -1,0 +1,1925 @@
+//! MQTT + UDP 传输层。
+//!
+//! 设备连的是 haimen 自己托管的 broker，不是 `mqtt.rs` 里的 rumqttc 客户端。
+//! 控制面走 [`MqttBrokerHandle::incoming`] / [`publish_to`]，音频走 [`UdpAudioHandle`]。
+//! 帧节奏从 `ws.rs` 复制（见各函数注释里的行号），不抽公共层。
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+use serde_json::json;
+use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
+
+use crate::mqtt_broker::{
+    BrokerIncoming, BrokerOutgoing, MqttBrokerConfig, MqttBrokerError, MqttBrokerHandle,
+};
+use crate::protocol_udp::{UdpCrypto, UdpProtoError};
+use crate::strategy::ResponseStrategy;
+use crate::types::{AudioFrame, AudioParams, PlaybackEvent, ServerMessage, SessionState, TtsState};
+use crate::udp_audio::{UdpAudioConfig, UdpAudioError, UdpAudioHandle};
+
+/// 16 字节头之外的载荷上限。再大整包就会超过 1500，设备会静默丢掉。
+const MAX_DOWNLINK_PAYLOAD: usize = 1484;
+
+/// 录音超过这个时间还没收到 listen stop，由服务器收口。设备自己不会回 Idle。
+const RECORDING_LIMIT: Duration = Duration::from_secs(30);
+
+/// 握手之后长时间没有任何控制消息或音频，就丢掉 UDP 密钥。
+/// 取 MQTT keepalive 常用的 240 秒；Ready 上的 10 秒无语音超时按 M2' 不做处理。
+const IDLE_LIMIT: Duration = Duration::from_secs(240);
+
+/// 上行 hello 没带采样率时用 16 kHz。这是设备麦克风的参数，不是下行 TTS 的 24 kHz。
+const fn default_uplink_rate() -> u32 {
+    16_000
+}
+
+fn default_opus() -> String {
+    "opus".to_owned()
+}
+
+const fn default_channels() -> u8 {
+    1
+}
+
+const fn default_frame_ms() -> u32 {
+    60
+}
+
+/// 传输层配置。`prebuffer_count` / `frame_duration_ms` 的默认值见 [`Default`]。
+#[derive(Debug, Clone)]
+pub struct MqttUdpConfig {
+    pub broker: MqttBrokerConfig,
+    pub udp: UdpAudioConfig,
+    /// 设备上行主题模板，`{mac}` 替换为带冒号的 MAC（如 84:c7:bb:59:93:64）。
+    pub publish_topic_template: String,
+    /// 服务器下行主题模板。设备不看 topic，只用于日志和抓包。
+    pub downlink_topic_template: String,
+    /// 预缓冲帧数，默认 5（与 ws.rs 一致）。
+    pub prebuffer_count: usize,
+    /// 帧时长毫秒，默认 60。
+    pub frame_duration_ms: u32,
+}
+
+impl Default for MqttUdpConfig {
+    fn default() -> Self {
+        Self {
+            broker: MqttBrokerConfig::default(),
+            udp: UdpAudioConfig {
+                bind_addr: "0.0.0.0:0".to_owned(),
+            },
+            publish_topic_template: "device-server".to_owned(),
+            downlink_topic_template: "devices/p2p/{mac}".to_owned(),
+            prebuffer_count: 5,
+            frame_duration_ms: 60,
+        }
+    }
+}
+
+/// 传输层启动失败。运行期的单包错误打日志后丢弃，不从这里返回。
+#[derive(Debug)]
+pub enum MqttUdpError {
+    Broker(MqttBrokerError),
+    Udp(UdpAudioError),
+    Proto(UdpProtoError),
+}
+
+impl fmt::Display for MqttUdpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Broker(err) => write!(f, "MQTT broker 错误: {err}"),
+            Self::Udp(err) => write!(f, "UDP 音频通道错误: {err}"),
+            Self::Proto(err) => write!(f, "UDP 协议错误: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for MqttUdpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Broker(err) => Some(err),
+            Self::Udp(err) => Some(err),
+            Self::Proto(err) => Some(err),
+        }
+    }
+}
+
+impl From<MqttBrokerError> for MqttUdpError {
+    fn from(err: MqttBrokerError) -> Self {
+        Self::Broker(err)
+    }
+}
+
+impl From<UdpAudioError> for MqttUdpError {
+    fn from(err: UdpAudioError) -> Self {
+        Self::Udp(err)
+    }
+}
+
+impl From<UdpProtoError> for MqttUdpError {
+    fn from(err: UdpProtoError) -> Self {
+        Self::Proto(err)
+    }
+}
+
+/// 一台设备的会话。按 MQTT `client_id` 区分，UDP 会话只是它的音频密钥。
+struct DeviceSession {
+    client_id: String,
+    /// 从 `client_id` 的 `@@@` 分段里取出、并规范成冒号形式的 MAC。
+    device_id: String,
+    /// 下发给设备的协议会话号（UUID 文本），和 UDP 的 u32 会话号不是同一个。
+    protocol_session_id: String,
+    state: SessionState,
+    /// UDP 会话 ID，等于下发 nonce 的 `[4..8)`。
+    udp_session_id: Option<u32>,
+    /// 录音阶段缓冲的音频帧，交给 strategy。
+    audio_buffer: Vec<AudioFrame>,
+    /// 发送侧帧节奏。`None` 表示还没离开预缓冲连发。
+    next_send_at: Option<Instant>,
+    /// 下行 timestamp。必须从 1 起跳，上下行共用 key 时 0 会和上行首包撞 IV。
+    downlink_ts: u32,
+    recording_deadline: Option<TokioInstant>,
+    last_activity: Instant,
+    /// 每开一轮回放加一。旧回放任务靠它知道自己已经被替换。
+    playback_gen: u64,
+    cancel_tx: Option<watch::Sender<bool>>,
+}
+
+impl DeviceSession {
+    fn new(client_id: &str) -> Self {
+        Self {
+            client_id: client_id.to_owned(),
+            device_id: mac_from_client_id(client_id),
+            protocol_session_id: String::new(),
+            state: SessionState::AwaitingHello,
+            udp_session_id: None,
+            audio_buffer: Vec::new(),
+            next_send_at: None,
+            downlink_ts: 1,
+            recording_deadline: None,
+            last_activity: Instant::now(),
+            playback_gen: 0,
+            cancel_tx: None,
+        }
+    }
+}
+
+struct Tables {
+    sessions: HashMap<String, DeviceSession>,
+    /// `udp session_id` → `client_id`。未知 id 的包在 UDP 层就会被丢掉，这里再挡一层。
+    udp_index: HashMap<u32, String>,
+}
+
+struct Shared {
+    broker: MqttBrokerHandle,
+    udp: UdpAudioHandle,
+    strategy: Arc<dyn ResponseStrategy>,
+    cfg: MqttUdpConfig,
+    tables: Mutex<Tables>,
+    playbacks: Mutex<Vec<JoinHandle<()>>>,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+struct PlaybackJob {
+    client_id: String,
+    protocol_session_id: String,
+    generation: u64,
+    buffer: Vec<AudioFrame>,
+    cancel: watch::Receiver<bool>,
+}
+
+/// 生成任务跟回放任务绑在一起。回放提前结束时把还在跑的合成停掉。
+struct AbortJoin(Option<JoinHandle<()>>);
+
+impl Drop for AbortJoin {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// MQTT 控制面 + UDP 音频。`start` 之后主循环在后台跑。
+pub struct MqttUdpTransport {
+    broker_addr: String,
+    udp_addr: std::net::SocketAddr,
+    shared: Arc<Shared>,
+    shutdown_tx: watch::Sender<bool>,
+    task: JoinHandle<()>,
+    udp: UdpAudioHandle,
+}
+
+impl MqttUdpTransport {
+    /// 绑定 broker 和 UDP，并 spawn 主循环。
+    pub async fn start(
+        cfg: MqttUdpConfig,
+        strategy: Arc<dyn ResponseStrategy>,
+    ) -> Result<Self, MqttUdpError> {
+        let broker = MqttBrokerHandle::start(cfg.broker.clone()).await?;
+        let udp = UdpAudioHandle::start(cfg.udp.clone()).await?;
+        let broker_addr = broker.local_addr().to_string();
+        let udp_addr = udp.local_addr();
+        // incoming 只能取一次，必须在别的任务碰句柄之前拿走。
+        let mqtt_rx = broker.incoming();
+        let udp_rx = udp.incoming();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shared = Arc::new(Shared {
+            broker,
+            udp: udp.clone(),
+            strategy,
+            cfg,
+            tables: Mutex::new(Tables {
+                sessions: HashMap::new(),
+                udp_index: HashMap::new(),
+            }),
+            playbacks: Mutex::new(Vec::new()),
+            shutdown_tx: shutdown_tx.clone(),
+        });
+        let task_shared = Arc::clone(&shared);
+        let task = tokio::spawn(async move {
+            run_loop(task_shared, mqtt_rx, udp_rx, shutdown_rx).await;
+        });
+        Ok(Self {
+            broker_addr,
+            udp_addr,
+            shared,
+            shutdown_tx,
+            task,
+            udp,
+        })
+    }
+
+    /// broker 实际监听地址。端口写 0 时用它拿内核分配的端口。
+    pub fn broker_addr(&self) -> String {
+        self.broker_addr.clone()
+    }
+
+    /// UDP 实际监听地址。
+    pub fn udp_addr(&self) -> std::net::SocketAddr {
+        self.udp_addr
+    }
+
+    /// 当前还有会话记录的设备数（含刚连上、还在等 hello 的）。
+    pub async fn online_device_count(&self) -> usize {
+        self.shared.tables.lock().await.sessions.len()
+    }
+
+    /// 停主循环和 UDP 收包。broker 的 accept 任务没有公开的停止接口，进程退出时一起结束。
+    pub async fn shutdown(self) {
+        let Self {
+            shutdown_tx,
+            task,
+            udp,
+            ..
+        } = self;
+        let _ = shutdown_tx.send(true);
+        if tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("MQTT/UDP 传输主循环没有在 3 秒内退出");
+        }
+        udp.shutdown().await;
+    }
+}
+
+async fn run_loop(
+    shared: Arc<Shared>,
+    mut mqtt_rx: mpsc::Receiver<BrokerIncoming>,
+    mut udp_rx: mpsc::Receiver<crate::udp_audio::UdpIncomingAudio>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let next_deadline = {
+            let tables = shared.tables.lock().await;
+            tables
+                .sessions
+                .values()
+                .filter(|session| session.state == SessionState::Recording)
+                .filter_map(|session| session.recording_deadline)
+                .min()
+        };
+        tokio::select! {
+          biased;
+          changed = shutdown_rx.changed() => {
+            if changed.is_err() || *shutdown_rx.borrow() {
+              break;
+            }
+          }
+          msg = mqtt_rx.recv() => {
+            match msg {
+              Some(msg) => handle_mqtt(&shared, msg).await,
+              None => break,
+            }
+          }
+          audio = udp_rx.recv() => {
+            match audio {
+              Some(audio) => handle_udp(&shared, audio).await,
+              None => break,
+            }
+          }
+          _ = async {
+            if let Some(deadline) = next_deadline {
+              tokio::time::sleep_until(deadline).await;
+            } else {
+              std::future::pending::<()>().await;
+            }
+          } => {
+            expire_recordings(&shared).await;
+          }
+          _ = tick.tick() => {
+            prune_sessions(&shared).await;
+          }
+        }
+    }
+    stop_playbacks(&shared).await;
+}
+
+async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
+    {
+        let mut tables = shared.tables.lock().await;
+        let session = ensure_session(&mut tables, &msg.client_id);
+        session.last_activity = Instant::now();
+    }
+    let text = match std::str::from_utf8(&msg.payload) {
+        Ok(text) => text,
+        Err(err) => {
+            tracing::warn!(client_id = %msg.client_id, %err, "MQTT 载荷不是 UTF-8，丢弃");
+            return;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(client_id = %msg.client_id, %err, "MQTT JSON 解析失败，丢弃");
+            return;
+        }
+    };
+    let kind = value
+        .get("type")
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    match kind {
+        "hello" => handle_hello(shared, &msg.client_id, value).await,
+        "listen" => handle_listen(shared, &msg.client_id, value).await,
+        "abort" => handle_abort(shared, &msg.client_id).await,
+        "goodbye" => {
+            // 不断开 MQTT。设备会在同一条连接上再发 hello。
+            let playing =
+                session_state(shared, &msg.client_id).await == Some(SessionState::Playing);
+            release_udp(shared, &msg.client_id).await;
+            if playing {
+                let _ = publish_tts(shared, &msg.client_id, TtsState::Stop, None).await;
+            }
+        }
+        other => {
+            tracing::warn!(client_id = %msg.client_id, kind = other, "忽略未知的 MQTT 消息类型");
+        }
+    }
+}
+
+async fn handle_hello(shared: &Arc<Shared>, client_id: &str, value: serde_json::Value) {
+    let hello: HelloIn = match serde_json::from_value(value) {
+        Ok(hello) => hello,
+        Err(err) => {
+            tracing::warn!(%client_id, %err, "hello 字段解析失败，丢弃");
+            return;
+        }
+    };
+    if let Some(transport) = hello.transport.as_deref() {
+        if !transport.eq_ignore_ascii_case("udp") {
+            tracing::warn!(%client_id, transport, "hello 的 transport 不是 udp，忽略");
+            return;
+        }
+    }
+    let client_params = hello
+        .audio_params
+        .map(UplinkAudio::into_params)
+        .unwrap_or_else(uplink_defaults);
+    // 下行参数由策略决定。AsrLlmTtsStrategy 会把采样率改成 24000。
+    let downlink = shared.strategy.hello_audio_params(&client_params);
+    let server = match lan_ip() {
+        Some(ip) => ip,
+        None => {
+            tracing::warn!(%client_id, "没有可用的局域网 IP，不能下发 hello");
+            return;
+        }
+    };
+
+    let key = random_bytes();
+    let udp_id = {
+        let tables = shared.tables.lock().await;
+        random_session_id(&tables.udp_index)
+    };
+    let nonce = nonce_template(udp_id);
+    let key_hex = encode_hex(&key);
+    let nonce_hex = encode_hex(&nonce);
+    let crypto = match UdpCrypto::from_hex(&key_hex, &nonce_hex) {
+        Ok(crypto) => crypto,
+        Err(err) => {
+            tracing::warn!(%client_id, %err, "构造 UDP 密钥失败");
+            return;
+        }
+    };
+    let protocol_session_id = uuid::Uuid::new_v4().to_string();
+    let port = shared.udp.local_addr().port();
+    let body = json!({
+      "type": "hello",
+      "transport": "udp",
+      "session_id": protocol_session_id,
+      "audio_params": downlink,
+      "udp": {
+        "server": server,
+        "port": port,
+        "key": key_hex,
+        "nonce": nonce_hex,
+      }
+    });
+    let body = match serde_json::to_string(&body) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%client_id, %err, "hello 序列化失败");
+            return;
+        }
+    };
+
+    // 先改会话再 register，再 publish。设备要拿到 hello 才有密钥，
+    // 在那之前不会发 UDP；主循环这期间也不会读下一条 MQTT。
+    // 重复 hello 时 previous 是旧的 UDP 会话号，必须注销，否则旧 key 还能解开包。
+    let previous = {
+        let mut tables = shared.tables.lock().await;
+        let previous = {
+            let Some(session) = tables.sessions.get_mut(client_id) else {
+                return;
+            };
+            let previous = session.udp_session_id.replace(udp_id);
+            session.protocol_session_id = protocol_session_id.clone();
+            session.state = SessionState::Ready;
+            session.audio_buffer.clear();
+            session.downlink_ts = 1;
+            session.next_send_at = None;
+            session.recording_deadline = None;
+            session.playback_gen = session.playback_gen.wrapping_add(1);
+            if let Some(tx) = session.cancel_tx.take() {
+                let _ = tx.send(true);
+            }
+            session.last_activity = Instant::now();
+            previous
+        };
+        if let Some(prev) = previous {
+            tables.udp_index.remove(&prev);
+        }
+        tables.udp_index.insert(udp_id, client_id.to_owned());
+        previous
+    };
+    if let Some(prev) = previous {
+        shared.udp.unregister_session(prev).await;
+    }
+    shared.udp.register_session(udp_id, crypto).await;
+    if !publish_body(shared, client_id, &body).await {
+        return;
+    }
+    tracing::info!(%client_id, %protocol_session_id, %server, port, "UDP hello 已下发");
+}
+
+async fn handle_listen(shared: &Arc<Shared>, client_id: &str, value: serde_json::Value) {
+    let listen: ListenIn = match serde_json::from_value(value) {
+        Ok(listen) => listen,
+        Err(err) => {
+            tracing::warn!(%client_id, %err, "listen 字段解析失败，丢弃");
+            return;
+        }
+    };
+    match listen.state.as_str() {
+        "start" => enter_recording(shared, client_id).await,
+        "stop" => {
+            let recording = session_state(shared, client_id).await == Some(SessionState::Recording);
+            if recording {
+                start_playback(shared, client_id).await;
+            } else {
+                tracing::debug!(%client_id, "不在录音中，忽略 listen stop");
+            }
+        }
+        "detect" => {
+            tracing::debug!(%client_id, "忽略 listen detect");
+        }
+        other => {
+            tracing::warn!(%client_id, state = other, "忽略未知的 listen state");
+        }
+    }
+}
+
+async fn enter_recording(shared: &Arc<Shared>, client_id: &str) {
+    let session_id = {
+        let mut tables = shared.tables.lock().await;
+        let Some(session) = tables.sessions.get_mut(client_id) else {
+            return;
+        };
+        // 设备没发 hello 就先发 listen 时，状态还停在 AwaitingHello。
+        // 这时回任何下行都会被设备清掉事件位，所以直接丢掉。
+        if session.state == SessionState::AwaitingHello || session.protocol_session_id.is_empty() {
+            tracing::warn!(%client_id, "还没收到 hello 就收到 listen，忽略");
+            return;
+        }
+        if session.state == SessionState::Playing {
+            session.playback_gen = session.playback_gen.wrapping_add(1);
+            if let Some(tx) = &session.cancel_tx {
+                let _ = tx.send(true);
+            }
+        }
+        session.audio_buffer.clear();
+        session.state = SessionState::Recording;
+        session.recording_deadline = Some(TokioInstant::now() + RECORDING_LIMIT);
+        session.next_send_at = None;
+        session.last_activity = Instant::now();
+        tracing::debug!(client_id = %session.client_id, "进入录音");
+        session.protocol_session_id.clone()
+    };
+    if let Err(err) = shared.strategy.on_recording_start(&session_id).await {
+        tracing::warn!(%client_id, %err, "on_recording_start 失败，继续收录音");
+    }
+}
+
+async fn handle_abort(shared: &Arc<Shared>, client_id: &str) {
+    let state = session_state(shared, client_id).await;
+    match state {
+        Some(SessionState::Recording) => {
+            // 录音中的 abort 和 listen stop 一样，表示这句说完了，要生成回复。
+            // 这里不能注销 UDP：回复的音频还得用这把 key 发出去。
+            start_playback(shared, client_id).await;
+        }
+        Some(SessionState::AwaitingHello) | None => {
+            tracing::warn!(%client_id, "还没 hello 就收到 abort，忽略");
+        }
+        Some(SessionState::Playing) | Some(SessionState::Ready) => {
+            // 播放中或空闲时的 abort 只结束这一轮，MQTT 连接留给设备复用。
+            release_udp(shared, client_id).await;
+            if state == Some(SessionState::Playing) {
+                let _ = publish_tts(shared, client_id, TtsState::Stop, None).await;
+            }
+        }
+    }
+}
+
+async fn handle_udp(shared: &Arc<Shared>, audio: crate::udp_audio::UdpIncomingAudio) {
+    let frame = AudioFrame {
+        timestamp: audio.timestamp,
+        data: audio.payload,
+    };
+    let forward = {
+        let mut tables = shared.tables.lock().await;
+        let Some(client_id) = tables.udp_index.get(&audio.session_id).cloned() else {
+            // 旧会话残留，或者 hello 已经轮换过 key。
+            tracing::debug!(
+                session_id = audio.session_id,
+                "丢弃未知 session 的 UDP 音频"
+            );
+            return;
+        };
+        let Some(session) = tables.sessions.get_mut(&client_id) else {
+            tracing::debug!(
+                session_id = audio.session_id,
+                "UDP 会话没有对应的设备，丢弃"
+            );
+            return;
+        };
+        if session.state != SessionState::Recording {
+            tracing::debug!(
+              %client_id,
+              state = ?session.state,
+              "不在录音中，丢弃 UDP 音频"
+            );
+            return;
+        }
+        session.last_activity = Instant::now();
+        session.audio_buffer.push(frame.clone());
+        true
+    };
+    if forward {
+        if let Err(err) = shared.strategy.on_audio_frame(&frame).await {
+            tracing::warn!(%err, "on_audio_frame 失败，帧已留在缓冲里");
+        }
+    }
+}
+
+async fn expire_recordings(shared: &Arc<Shared>) {
+    let now = TokioInstant::now();
+    let due: Vec<String> = {
+        let tables = shared.tables.lock().await;
+        tables
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.state == SessionState::Recording
+                    && session
+                        .recording_deadline
+                        .is_some_and(|deadline| deadline <= now)
+            })
+            .map(|(client_id, _)| client_id.clone())
+            .collect()
+    };
+    for client_id in due {
+        tracing::info!(%client_id, "录音超过 30 秒，强制生成回复");
+        start_playback(shared, &client_id).await;
+    }
+}
+
+async fn prune_sessions(shared: &Shared) {
+    let online: HashSet<String> = shared
+        .broker
+        .connected_clients()
+        .await
+        .into_iter()
+        .collect();
+    let mut gone = Vec::new();
+    let mut idle = Vec::new();
+    {
+        let tables = shared.tables.lock().await;
+        for (client_id, session) in &tables.sessions {
+            if !online.contains(client_id) {
+                gone.push(client_id.clone());
+                continue;
+            }
+            let quiet = session.last_activity.elapsed() > IDLE_LIMIT;
+            let busy =
+                session.state == SessionState::Recording || session.state == SessionState::Playing;
+            if quiet && !busy && session.udp_session_id.is_some() {
+                idle.push(client_id.clone());
+            }
+        }
+    }
+    for client_id in gone {
+        tracing::info!(%client_id, "MQTT 连接已断开，清理会话");
+        drop_client(shared, &client_id).await;
+    }
+    for client_id in idle {
+        tracing::info!(%client_id, "长时间没有消息，注销 UDP 会话");
+        release_udp(shared, &client_id).await;
+    }
+}
+
+async fn start_playback(shared: &Arc<Shared>, client_id: &str) {
+    let job = {
+        let mut tables = shared.tables.lock().await;
+        let Some(session) = tables.sessions.get_mut(client_id) else {
+            return;
+        };
+        if session.state != SessionState::Recording {
+            return;
+        }
+        session.state = SessionState::Playing;
+        session.recording_deadline = None;
+        session.playback_gen = session.playback_gen.wrapping_add(1);
+        if let Some(old) = session.cancel_tx.take() {
+            let _ = old.send(true);
+        }
+        let (tx, rx) = watch::channel(false);
+        session.cancel_tx = Some(tx);
+        session.last_activity = Instant::now();
+        PlaybackJob {
+            client_id: client_id.to_owned(),
+            protocol_session_id: session.protocol_session_id.clone(),
+            generation: session.playback_gen,
+            buffer: std::mem::take(&mut session.audio_buffer),
+            cancel: rx,
+        }
+    };
+    let task_shared = Arc::clone(shared);
+    let handle = tokio::spawn(async move {
+        run_playback(task_shared, job).await;
+    });
+    let mut playbacks = shared.playbacks.lock().await;
+    playbacks.retain(|item| !item.is_finished());
+    playbacks.push(handle);
+}
+
+async fn run_playback(shared: Arc<Shared>, job: PlaybackJob) {
+    let mut tts_started = false;
+    drive_playback(&shared, &job, &mut tts_started).await;
+    if tts_started && !cancelled(&job.cancel, &shared) {
+        // 设备要求 start → 句子/音频 → stop。stop 放在所有帧之后。
+        let _ = publish_tts(&shared, &job.client_id, TtsState::Stop, None).await;
+        finish_ready(&shared, &job).await;
+    }
+}
+
+async fn drive_playback(shared: &Arc<Shared>, job: &PlaybackJob, tts_started: &mut bool) {
+    let (frame_tx, mut frame_rx) = mpsc::channel::<PlaybackEvent>(32);
+    let strategy = Arc::clone(&shared.strategy);
+    let session_id = job.protocol_session_id.clone();
+    let buffer = job.buffer.clone();
+    // 任务单里的 is_streaming_capable 对应 trait 的 supports_streaming_playback。
+    // 默认的 generate_response_stream 会再调用 generate_response，两条路径都从这里进。
+    let generate = tokio::spawn(async move {
+        if let Err(err) = strategy
+            .generate_response_stream(buffer, &session_id, frame_tx)
+            .await
+        {
+            tracing::warn!(%err, %session_id, "生成语音回复失败");
+        }
+    });
+    let _abort_gen = AbortJoin(Some(generate));
+
+    let frame = frame_duration(shared);
+    let want = shared.cfg.prebuffer_count;
+    let mut prebuffer = Vec::new();
+    let mut sentences = Vec::new();
+
+    // 源自 ws.rs:723。文本不占预缓冲名额：stt 马上发，句子先攒着，等 tts start 之后再发。
+    while prebuffer.len() < want {
+        if cancelled(&job.cancel, shared) {
+            return;
+        }
+        match frame_rx.recv().await {
+            Some(PlaybackEvent::Stt(text)) => {
+                if !publish_stt(shared, &job.client_id, &text).await {
+                    return;
+                }
+            }
+            Some(PlaybackEvent::LlmSentence(text)) => sentences.push(text),
+            Some(PlaybackEvent::Audio(audio)) => prebuffer.push(audio),
+            None => break,
+        }
+    }
+    if cancelled(&job.cancel, shared) {
+        return;
+    }
+
+    // 先 tts start，设备才肯播后面的 UDP。提前发的音频会被丢掉。
+    if !publish_tts(shared, &job.client_id, TtsState::Start, None).await {
+        return;
+    }
+    *tts_started = true;
+    for sentence in sentences {
+        if !publish_tts(
+            shared,
+            &job.client_id,
+            TtsState::SentenceStart,
+            Some(sentence),
+        )
+        .await
+        {
+            return;
+        }
+    }
+
+    // 源自 ws.rs:831。前 N 帧连发，把设备 300ms 的 jitter buffer 填上。
+    for audio in prebuffer {
+        if cancelled(&job.cancel, shared) {
+            return;
+        }
+        if !send_downlink_frame(shared, job, &audio.data).await {
+            return;
+        }
+    }
+
+    // 源自 ws.rs:847。时钟从连发结束的这一刻起算，而不是从第一帧起算。
+    {
+        let mut tables = shared.tables.lock().await;
+        if let Some(session) = tables.sessions.get_mut(&job.client_id) {
+            if session.playback_gen == job.generation {
+                session.next_send_at = Some(Instant::now() + frame);
+            }
+        }
+    }
+
+    while let Some(event) = frame_rx.recv().await {
+        if cancelled(&job.cancel, shared) {
+            return;
+        }
+        match event {
+            PlaybackEvent::Stt(text) => {
+                if !publish_stt(shared, &job.client_id, &text).await {
+                    return;
+                }
+            }
+            PlaybackEvent::LlmSentence(text) => {
+                if !publish_tts(shared, &job.client_id, TtsState::SentenceStart, Some(text)).await {
+                    return;
+                }
+            }
+            PlaybackEvent::Audio(audio) => {
+                let mut next = {
+                    let tables = shared.tables.lock().await;
+                    let Some(session) = tables.sessions.get(&job.client_id) else {
+                        return;
+                    };
+                    if session.playback_gen != job.generation {
+                        return;
+                    }
+                    session.next_send_at.unwrap_or_else(Instant::now)
+                };
+                let mut cancel = job.cancel.clone();
+                if !wait_until_send_slot(&mut next, frame, &mut cancel).await {
+                    return;
+                }
+                if !send_downlink_frame(shared, job, &audio.data).await {
+                    return;
+                }
+                // 源自 ws.rs:903。累加帧长，而不是改成 now + 帧长，否则每帧都把发送耗时叠进去。
+                next += frame;
+                let mut tables = shared.tables.lock().await;
+                if let Some(session) = tables.sessions.get_mut(&job.client_id) {
+                    if session.playback_gen == job.generation {
+                        session.next_send_at = Some(next);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_downlink_frame(shared: &Shared, job: &PlaybackJob, payload: &[u8]) -> bool {
+    if payload.len() > MAX_DOWNLINK_PAYLOAD {
+        tracing::warn!(
+          client_id = %job.client_id,
+          len = payload.len(),
+          "下行帧超过 1500 字节，丢弃该帧"
+        );
+        return true;
+    }
+    let step = frame_step_ms(&shared.cfg);
+    let (udp_id, timestamp) = {
+        let mut tables = shared.tables.lock().await;
+        let Some(session) = tables.sessions.get_mut(&job.client_id) else {
+            return false;
+        };
+        if session.playback_gen != job.generation || session.state != SessionState::Playing {
+            return false;
+        }
+        let Some(udp_id) = session.udp_session_id else {
+            tracing::warn!(client_id = %job.client_id, "没有 UDP 会话，无法下发音频");
+            return false;
+        };
+        let timestamp = alloc_downlink_ts(session, step);
+        (udp_id, timestamp)
+    };
+    match shared.udp.send_audio(udp_id, timestamp, payload).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(client_id = %job.client_id, %err, "下行音频发送失败");
+            false
+        }
+    }
+}
+
+/// 下行 timestamp 从 1 开始，之后每次加一帧时长。0 会和上行第一包复用 CTR 的 IV。
+fn alloc_downlink_ts(session: &mut DeviceSession, step: u32) -> u32 {
+    let timestamp = if session.downlink_ts == 0 {
+        1
+    } else {
+        session.downlink_ts
+    };
+    let next = timestamp.saturating_add(step.max(1));
+    session.downlink_ts = if next == 0 { 1 } else { next };
+    timestamp
+}
+
+async fn finish_ready(shared: &Shared, job: &PlaybackJob) {
+    let mut tables = shared.tables.lock().await;
+    let Some(session) = tables.sessions.get_mut(&job.client_id) else {
+        return;
+    };
+    if session.playback_gen != job.generation {
+        return;
+    }
+    if session.state == SessionState::Playing {
+        session.state = SessionState::Ready;
+    }
+    session.recording_deadline = None;
+    session.last_activity = Instant::now();
+}
+
+/// 注销 UDP 密钥并回到 Ready，但不把 MQTT 会话删掉。
+async fn release_udp(shared: &Shared, client_id: &str) {
+    let udp_id = {
+        let mut tables = shared.tables.lock().await;
+        let Some(session) = tables.sessions.get_mut(client_id) else {
+            return;
+        };
+        session.playback_gen = session.playback_gen.wrapping_add(1);
+        if let Some(tx) = &session.cancel_tx {
+            let _ = tx.send(true);
+        }
+        session.state = SessionState::Ready;
+        session.audio_buffer.clear();
+        session.recording_deadline = None;
+        session.next_send_at = None;
+        session.last_activity = Instant::now();
+        let udp_id = session.udp_session_id.take();
+        if let Some(id) = udp_id {
+            tables.udp_index.remove(&id);
+        }
+        udp_id
+    };
+    if let Some(id) = udp_id {
+        shared.udp.unregister_session(id).await;
+    }
+}
+
+/// `publish_to` 返回 false 时设备已经不在 broker 上，整份会话都清掉。
+async fn drop_client(shared: &Shared, client_id: &str) {
+    let udp_id = {
+        let mut tables = shared.tables.lock().await;
+        let Some(session) = tables.sessions.remove(client_id) else {
+            return;
+        };
+        if let Some(tx) = session.cancel_tx {
+            let _ = tx.send(true);
+        }
+        if let Some(id) = session.udp_session_id {
+            tables.udp_index.remove(&id);
+            Some(id)
+        } else {
+            None
+        }
+    };
+    if let Some(id) = udp_id {
+        shared.udp.unregister_session(id).await;
+    }
+}
+
+async fn stop_playbacks(shared: &Shared) {
+    {
+        let tables = shared.tables.lock().await;
+        for session in tables.sessions.values() {
+            if let Some(tx) = &session.cancel_tx {
+                let _ = tx.send(true);
+            }
+        }
+    }
+    let handles = {
+        let mut playbacks = shared.playbacks.lock().await;
+        std::mem::take(&mut *playbacks)
+    };
+    for mut handle in handles {
+        if tokio::time::timeout(Duration::from_millis(200), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+async fn session_state(shared: &Shared, client_id: &str) -> Option<SessionState> {
+    shared
+        .tables
+        .lock()
+        .await
+        .sessions
+        .get(client_id)
+        .map(|session| session.state)
+}
+
+fn ensure_session<'a>(tables: &'a mut Tables, client_id: &str) -> &'a mut DeviceSession {
+    tables
+        .sessions
+        .entry(client_id.to_owned())
+        .or_insert_with(|| DeviceSession::new(client_id))
+}
+
+fn cancelled(cancel: &watch::Receiver<bool>, shared: &Shared) -> bool {
+    *cancel.borrow() || *shared.shutdown_tx.borrow()
+}
+
+async fn publish_stt(shared: &Shared, client_id: &str, text: &str) -> bool {
+    let session_id = match protocol_session_id(shared, client_id).await {
+        Some(session_id) => session_id,
+        None => return false,
+    };
+    let body = match serde_json::to_string(&ServerMessage::Stt {
+        session_id,
+        text: text.to_owned(),
+    }) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "stt 消息序列化失败");
+            return false;
+        }
+    };
+    publish_body(shared, client_id, &body).await
+}
+
+async fn publish_tts(
+    shared: &Shared,
+    client_id: &str,
+    state: TtsState,
+    text: Option<String>,
+) -> bool {
+    let session_id = match protocol_session_id(shared, client_id).await {
+        Some(session_id) => session_id,
+        None => return false,
+    };
+    let body = match serde_json::to_string(&ServerMessage::Tts {
+        session_id,
+        state,
+        text,
+    }) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "tts 消息序列化失败");
+            return false;
+        }
+    };
+    publish_body(shared, client_id, &body).await
+}
+
+async fn protocol_session_id(shared: &Shared, client_id: &str) -> Option<String> {
+    shared
+        .tables
+        .lock()
+        .await
+        .sessions
+        .get(client_id)
+        .map(|session| session.protocol_session_id.clone())
+}
+
+async fn publish_body(shared: &Shared, client_id: &str, body: &str) -> bool {
+    let topic = {
+        let tables = shared.tables.lock().await;
+        let Some(session) = tables.sessions.get(client_id) else {
+            return false;
+        };
+        shared
+            .cfg
+            .downlink_topic_template
+            .replace("{mac}", &session.device_id)
+    };
+    match shared
+        .broker
+        .publish_to(BrokerOutgoing {
+            client_id: client_id.to_owned(),
+            topic,
+            payload: body.as_bytes().to_vec(),
+        })
+        .await
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(%client_id, "设备已掉线，清理会话");
+            drop_client(shared, client_id).await;
+            false
+        }
+        Err(err) => {
+            tracing::warn!(%client_id, %err, "下发 MQTT 失败");
+            false
+        }
+    }
+}
+
+fn frame_step_ms(cfg: &MqttUdpConfig) -> u32 {
+    if cfg.frame_duration_ms == 0 {
+        60
+    } else {
+        cfg.frame_duration_ms
+    }
+}
+
+fn frame_duration(shared: &Shared) -> Duration {
+    Duration::from_millis(u64::from(frame_step_ms(&shared.cfg)))
+}
+
+/// 源自 ws.rs:1104。断档超过一帧就把时钟快进到现在，避免积压帧被一次补发完。
+fn snap_send_clock(next_send_at: &mut Instant, now: Instant, frame: Duration) {
+    if *next_send_at + frame < now {
+        *next_send_at = now;
+    }
+}
+
+/// 源自 ws.rs:1121。
+///
+/// ws 版在等待时还读 WebSocket，用来接 abort。这里没有那条 socket，
+/// 取消信号改走 `watch`。对齐方式不变：等的是绝对时刻，不是重新 sleep 一帧。
+async fn wait_until_send_slot(
+    next_send_at: &mut Instant,
+    frame: Duration,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    loop {
+        if *cancel.borrow() {
+            return false;
+        }
+        let now = Instant::now();
+        snap_send_clock(next_send_at, now, frame);
+        let wait = next_send_at.saturating_duration_since(now);
+        if wait.is_zero() {
+            return true;
+        }
+        tokio::select! {
+          _ = tokio::time::sleep(wait) => return true,
+          changed = cancel.changed() => {
+            if changed.is_err() || *cancel.borrow() {
+              return false;
+            }
+          }
+        }
+    }
+}
+
+fn mac_from_client_id(client_id: &str) -> String {
+    let mut parts = client_id.split("@@@").filter(|part| !part.is_empty());
+    let _group = parts.next();
+    let mac = match parts.next() {
+        Some(mac) => mac,
+        None => client_id,
+    };
+    colon_mac(mac)
+}
+
+fn colon_mac(raw: &str) -> String {
+    let mac = raw.trim().to_ascii_lowercase();
+    if mac.contains(':') {
+        return mac;
+    }
+    if mac.contains('_') {
+        return mac.replace('_', ":");
+    }
+    if mac.len() == 12 && mac.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let mut out = String::with_capacity(17);
+        for (idx, chunk) in mac.as_bytes().chunks(2).enumerate() {
+            if idx > 0 {
+                out.push(':');
+            }
+            out.push_str(&String::from_utf8_lossy(chunk));
+        }
+        return out;
+    }
+    mac
+}
+
+fn nonce_template(session_id: u32) -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    // 设备靠首字节 0x01 识别这是音频通道。session id 放在 [4..8)，大端。
+    nonce[0] = 0x01;
+    nonce[4..8].copy_from_slice(&session_id.to_be_bytes());
+    nonce
+}
+
+fn random_bytes() -> [u8; 16] {
+    *uuid::Uuid::new_v4().as_bytes()
+}
+
+fn random_session_id(used: &HashMap<u32, String>) -> u32 {
+    for _ in 0..8 {
+        let bytes = random_bytes();
+        let id = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if id != 0 && !used.contains_key(&id) {
+            return id;
+        }
+    }
+    let mut id = 1u32;
+    while id != 0 && used.contains_key(&id) {
+        id = id.wrapping_add(1);
+    }
+    if id == 0 { 1 } else { id }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
+/// `server` 必须是局域网地址。0.0.0.0 / 127.0.0.1 设备都访问不到。
+fn lan_ip() -> Option<String> {
+    match local_ip_address::local_ip() {
+        Ok(ip) if usable_v4(&ip) => return Some(ip.to_string()),
+        Ok(ip) => tracing::warn!(%ip, "local_ip 不是可用的局域网地址，改为扫描网卡"),
+        Err(err) => tracing::warn!(%err, "local_ip 失败，改为扫描网卡"),
+    }
+    let listed = local_ip_address::list_afinet_netifas().ok()?;
+    for (_name, ip) in listed {
+        if usable_v4(&ip) {
+            return Some(ip.to_string());
+        }
+    }
+    None
+}
+
+fn usable_v4(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_broadcast(),
+        IpAddr::V6(_) => false,
+    }
+}
+
+fn uplink_defaults() -> AudioParams {
+    AudioParams {
+        format: default_opus(),
+        sample_rate: default_uplink_rate(),
+        channels: default_channels(),
+        frame_duration: default_frame_ms(),
+    }
+}
+
+#[derive(Deserialize)]
+struct HelloIn {
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    audio_params: Option<UplinkAudio>,
+}
+
+#[derive(Deserialize)]
+struct UplinkAudio {
+    #[serde(default = "default_opus")]
+    format: String,
+    #[serde(default = "default_uplink_rate")]
+    sample_rate: u32,
+    #[serde(default = "default_channels")]
+    channels: u8,
+    #[serde(default = "default_frame_ms")]
+    frame_duration: u32,
+}
+
+impl UplinkAudio {
+    fn into_params(self) -> AudioParams {
+        AudioParams {
+            format: self.format,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            frame_duration: self.frame_duration,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ListenIn {
+    state: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpStream, UdpSocket};
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::mqtt_broker::MqttBrokerConfig;
+    use crate::protocol_udp::{UdpAudioHeader, UdpCrypto};
+    use crate::udp_audio::UdpAudioConfig;
+
+    const CLIENT_ID: &str = "GID_haimen@@@84:c7:bb:59:93:64@@@84:c7:bb:59:93:64";
+
+    struct MockInner {
+        recording_starts: Vec<String>,
+        audio_frames: Vec<AudioFrame>,
+        generate_calls: usize,
+        playback: Vec<AudioFrame>,
+    }
+
+    struct MockStrategy {
+        inner: StdMutex<MockInner>,
+    }
+
+    impl MockStrategy {
+        fn new(playback: Vec<AudioFrame>) -> Self {
+            Self {
+                inner: StdMutex::new(MockInner {
+                    recording_starts: Vec::new(),
+                    audio_frames: Vec::new(),
+                    generate_calls: 0,
+                    playback,
+                }),
+            }
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, MockInner> {
+            self.inner.lock().unwrap_or_else(|err| err.into_inner())
+        }
+    }
+
+    #[async_trait]
+    impl ResponseStrategy for MockStrategy {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn hello_audio_params(&self, _client_params: &AudioParams) -> AudioParams {
+            AudioParams {
+                format: "opus".to_owned(),
+                sample_rate: 24_000,
+                channels: 1,
+                frame_duration: 60,
+            }
+        }
+
+        async fn generate_response(
+            &self,
+            _audio_buffer: Vec<AudioFrame>,
+            _session_id: &str,
+        ) -> Result<Vec<AudioFrame>, String> {
+            let mut inner = self.lock();
+            inner.generate_calls += 1;
+            Ok(inner.playback.clone())
+        }
+
+        async fn on_recording_start(&self, session_id: &str) -> Result<(), String> {
+            self.lock().recording_starts.push(session_id.to_owned());
+            Ok(())
+        }
+
+        async fn on_audio_frame(&self, frame: &AudioFrame) -> Result<(), String> {
+            self.lock().audio_frames.push(frame.clone());
+            Ok(())
+        }
+    }
+
+    struct DeviceLink {
+        writer: tokio::net::tcp::OwnedWriteHalf,
+        rx: mpsc::Receiver<Vec<u8>>,
+        reader: JoinHandle<()>,
+    }
+
+    impl DeviceLink {
+        async fn connect(addr: SocketAddr) -> Self {
+            let mut stream = TcpStream::connect(addr).await.expect("连接 broker");
+            stream.set_nodelay(true).expect("TCP_NODELAY");
+            stream
+                .write_all(&mqtt_connect(CLIENT_ID))
+                .await
+                .expect("写 CONNECT");
+            let (mut reader, writer) = stream.into_split();
+            let connack = read_mqtt_packet(&mut reader)
+                .await
+                .expect("读 CONNACK")
+                .expect("broker 关闭");
+            assert_eq!(connack.0 >> 4, 2, "CONNACK");
+            let (tx, rx) = mpsc::channel(32);
+            let reader = tokio::spawn(async move {
+                loop {
+                    match read_mqtt_packet(&mut reader).await {
+                        Ok(Some((header, body))) if header >> 4 == 3 => {
+                            if let Some(payload) = publish_payload(&body) {
+                                if tx.send(payload).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            });
+            Self { writer, rx, reader }
+        }
+
+        async fn publish(&mut self, topic: &str, payload: &[u8]) {
+            self.writer
+                .write_all(&mqtt_publish(topic, payload))
+                .await
+                .expect("写 PUBLISH");
+        }
+
+        async fn wait_type(&mut self, kind: &str, timeout: Duration) -> serde_json::Value {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                assert!(!left.is_zero(), "等待 {kind} 超时");
+                let payload = tokio::time::timeout(left, self.rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("等待 {kind} 超时"))
+                    .unwrap_or_else(|| panic!("下行通道关闭，还没等到 {kind}"));
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                    if value.get("type").and_then(|item| item.as_str()) == Some(kind) {
+                        return value;
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for DeviceLink {
+        fn drop(&mut self) {
+            self.reader.abort();
+        }
+    }
+
+    struct Env {
+        transport: MqttUdpTransport,
+        link: DeviceLink,
+        mock: Arc<MockStrategy>,
+        udp: UdpSocket,
+    }
+
+    impl Env {
+        async fn boot(playback: Vec<AudioFrame>) -> Self {
+            let mock = Arc::new(MockStrategy::new(playback));
+            let cfg = MqttUdpConfig {
+                broker: MqttBrokerConfig {
+                    bind_addr: "127.0.0.1:0".to_owned(),
+                    ..MqttBrokerConfig::default()
+                },
+                udp: UdpAudioConfig {
+                    bind_addr: "127.0.0.1:0".to_owned(),
+                },
+                publish_topic_template: "device-server".to_owned(),
+                downlink_topic_template: "devices/p2p/{mac}".to_owned(),
+                prebuffer_count: 5,
+                frame_duration_ms: 60,
+            };
+            let transport = MqttUdpTransport::start(cfg, mock.clone())
+                .await
+                .expect("启动传输层");
+            let addr: SocketAddr = transport.broker_addr().parse().expect("broker 地址");
+            let link = DeviceLink::connect(addr).await;
+            let udp = UdpSocket::bind("127.0.0.1:0").await.expect("绑定设备 UDP");
+            Self {
+                transport,
+                link,
+                mock,
+                udp,
+            }
+        }
+
+        async fn hello(&mut self) -> serde_json::Value {
+            let payload = br#"{"type":"hello","transport":"udp","audio_params":{"format":"opus","sample_rate":16000,"channels":1,"frame_duration":60}}"#;
+            self.link.publish("device-server", payload).await;
+            self.link.wait_type("hello", Duration::from_secs(2)).await
+        }
+
+        async fn shutdown(self) {
+            self.transport.shutdown().await;
+        }
+    }
+
+    fn decode_hex16(text: &str) -> [u8; 16] {
+        assert_eq!(text.len(), 32, "hex 长度应为 32: {text}");
+        let mut out = [0u8; 16];
+        for index in 0..16 {
+            out[index] = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).expect("hex");
+        }
+        out
+    }
+
+    fn crypto_from_hello(hello: &serde_json::Value) -> UdpCrypto {
+        let key = hello["udp"]["key"].as_str().expect("key");
+        let nonce = hello["udp"]["nonce"].as_str().expect("nonce");
+        UdpCrypto::from_hex(key, nonce).expect("crypto")
+    }
+
+    async fn send_uplink(
+        env: &Env,
+        crypto: &UdpCrypto,
+        timestamp: u32,
+        sequence: u32,
+        payload: &[u8],
+    ) {
+        let header = crypto.build_header(
+            u16::try_from(payload.len()).expect("长度"),
+            timestamp,
+            sequence,
+        );
+        let packet = crypto.seal(&header, payload).expect("加密上行");
+        env.udp
+            .send_to(&packet, env.transport.udp_addr())
+            .await
+            .expect("发送上行");
+    }
+
+    async fn wait_frames(mock: &MockStrategy, count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if mock.lock().audio_frames.len() >= count {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "音频帧没有在 2 秒内到达"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    struct DownPacket {
+        header: UdpAudioHeader,
+        payload: Vec<u8>,
+        at: Instant,
+    }
+
+    async fn collect_downlink(env: &Env, crypto: &UdpCrypto, count: usize) -> Vec<DownPacket> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut buf = [0u8; 2048];
+        while out.len() < count {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!left.is_zero(), "下行音频没收齐，只有 {}", out.len());
+            let (len, _) = tokio::time::timeout(left, env.udp.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("等下行音频超时，已有 {}", out.len()))
+                .expect("recv");
+            let at = Instant::now();
+            let (header, payload) = crypto.open(&buf[..len]).expect("解密下行");
+            out.push(DownPacket {
+                header,
+                payload,
+                at,
+            });
+        }
+        out
+    }
+
+    async fn paced_downlink() -> (Env, Vec<DownPacket>) {
+        let frames: Vec<AudioFrame> = (0..8)
+            .map(|index| AudioFrame {
+                timestamp: 0,
+                data: vec![0xA0 + index],
+            })
+            .collect();
+        let mut env = Env::boot(frames).await;
+        let hello = env.hello().await;
+        let crypto = crypto_from_hello(&hello);
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().recording_starts.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listen start 没有生效"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 1_000, 1, b"up").await;
+        wait_frames(&env.mock, 1).await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+        let packets = collect_downlink(&env, &crypto, 8).await;
+        (env, packets)
+    }
+
+    #[tokio::test]
+    async fn hello_response_has_16_byte_key_nonce_and_valid_port() {
+        let mut env = Env::boot(Vec::new()).await;
+        let hello = env.hello().await;
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["transport"], "udp");
+        assert_eq!(hello["audio_params"]["sample_rate"], 24_000);
+        let key = decode_hex16(hello["udp"]["key"].as_str().expect("key"));
+        let nonce = decode_hex16(hello["udp"]["nonce"].as_str().expect("nonce"));
+        assert_eq!(key.len(), 16);
+        assert_eq!(nonce.len(), 16);
+        let port = hello["udp"]["port"].as_u64().expect("port");
+        assert!(port > 0 && port < 65_536);
+        assert_eq!(port as u16, env.transport.udp_addr().port());
+        assert_eq!(env.transport.online_device_count().await, 1);
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hello_server_is_lan_ip() {
+        let mut env = Env::boot(Vec::new()).await;
+        let hello = env.hello().await;
+        let server = hello["udp"]["server"].as_str().expect("server");
+        let ip: IpAddr = server.parse().expect("ip");
+        assert_ne!(server, "0.0.0.0");
+        assert_ne!(server, "127.0.0.1");
+        assert!(!ip.is_loopback());
+        assert!(!ip.is_unspecified());
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hello_nonce_type_byte_is_one() {
+        let mut env = Env::boot(Vec::new()).await;
+        let hello = env.hello().await;
+        let nonce = decode_hex16(hello["udp"]["nonce"].as_str().expect("nonce"));
+        assert_eq!(nonce[0], 0x01);
+        assert_eq!(&nonce[1..4], &[0, 0, 0]);
+        assert_eq!(&nonce[8..], &[0, 0, 0, 0, 0, 0, 0, 0]);
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn listen_before_hello_is_ignored() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.link
+            .publish(
+                "device-server",
+                br#"{"type":"listen","state":"start","mode":"auto"}"#,
+            )
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if env.transport.online_device_count().await == 1 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "listen 没有被处理");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(env.mock.lock().recording_starts.is_empty());
+        let late = tokio::time::timeout(Duration::from_millis(200), env.link.rx.recv()).await;
+        assert!(late.is_err(), "没 hello 之前不应该有下行");
+        let hello = env.hello().await;
+        assert_eq!(hello["type"], "hello");
+        assert!(env.mock.lock().recording_starts.is_empty());
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn listen_start_calls_on_recording_start() {
+        let mut env = Env::boot(Vec::new()).await;
+        let hello = env.hello().await;
+        let session_id = hello["session_id"].as_str().expect("session").to_owned();
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().recording_starts.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "on_recording_start 没有被调用"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(env.mock.lock().recording_starts, vec![session_id]);
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn udp_uplink_invokes_on_audio_frame() {
+        let mut env = Env::boot(Vec::new()).await;
+        let hello = env.hello().await;
+        let crypto = crypto_from_hello(&hello);
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().recording_starts.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 12_345, 7, b"opus-frame").await;
+        wait_frames(&env.mock, 1).await;
+        let frames = env.mock.lock().audio_frames.clone();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].timestamp, 12_345);
+        assert_eq!(frames[0].data, b"opus-frame");
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn listen_stop_emits_tts_start() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.hello().await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().recording_starts.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+        let tts = env.link.wait_type("tts", Duration::from_secs(2)).await;
+        assert_eq!(tts["state"], "start");
+        assert_eq!(env.mock.lock().generate_calls, 1);
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prebuffer_frames_are_sent_back_to_back() {
+        let (env, packets) = paced_downlink().await;
+        for pair in packets.windows(2).take(4) {
+            let gap = pair[1].at.saturating_duration_since(pair[0].at);
+            assert!(
+                gap < Duration::from_millis(40),
+                "预缓冲帧间隔应远小于 60ms，实际 {gap:?}"
+            );
+        }
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn steady_frames_are_spaced_about_60ms() {
+        let (env, packets) = paced_downlink().await;
+        let gaps: Vec<Duration> = packets
+            .windows(2)
+            .skip(4)
+            .map(|pair| pair[1].at.saturating_duration_since(pair[0].at))
+            .collect();
+        assert!(!gaps.is_empty());
+        for gap in gaps {
+            assert!(
+                (Duration::from_millis(40)..Duration::from_millis(90)).contains(&gap),
+                "稳态帧间隔应约 60ms，实际 {gap:?}"
+            );
+        }
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn downlink_sequence_starts_at_one() {
+        let (env, packets) = paced_downlink().await;
+        let sequences: Vec<u32> = packets
+            .iter()
+            .map(|packet| packet.header.sequence)
+            .collect();
+        assert_eq!(sequences, (1..=8).collect::<Vec<_>>());
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn downlink_timestamp_starts_nonzero_and_steps_by_60() {
+        let (env, packets) = paced_downlink().await;
+        for (index, packet) in packets.iter().enumerate() {
+            let timestamp = packet.header.timestamp;
+            assert_ne!(timestamp, 0);
+            assert_eq!(timestamp, 1 + index as u32 * 60);
+            assert_eq!(packet.payload, vec![0xA0 + index as u8]);
+        }
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn goodbye_unregisters_udp_session() {
+        let mut env = Env::boot(Vec::new()).await;
+        let hello = env.hello().await;
+        let crypto = crypto_from_hello(&hello);
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().recording_starts.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 10, 1, b"keep").await;
+        wait_frames(&env.mock, 1).await;
+        env.link
+            .publish("device-server", br#"{"type":"goodbye"}"#)
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // goodbye 只注销 UDP，MQTT 还在。再进录音后，旧 session 的包也进不来。
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send_uplink(&env, &crypto, 11, 2, b"stale").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(env.mock.lock().audio_frames.len(), 1);
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_hello_rotates_key_and_nonce() {
+        let mut env = Env::boot(Vec::new()).await;
+        let first = env.hello().await;
+        let second = env.hello().await;
+        let key1 = first["udp"]["key"].as_str().expect("key1").to_owned();
+        let key2 = second["udp"]["key"].as_str().expect("key2").to_owned();
+        let nonce1 = first["udp"]["nonce"].as_str().expect("nonce1").to_owned();
+        let nonce2 = second["udp"]["nonce"].as_str().expect("nonce2").to_owned();
+        assert_ne!(key1, key2);
+        assert_ne!(nonce1, nonce2);
+        let old_crypto = crypto_from_hello(&first);
+        let new_crypto = crypto_from_hello(&second);
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().recording_starts.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &old_crypto, 1, 1, b"old").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            env.mock.lock().audio_frames.is_empty(),
+            "旧 key 的包应被丢弃"
+        );
+        send_uplink(&env, &new_crypto, 2, 1, b"new").await;
+        wait_frames(&env.mock, 1).await;
+        assert_eq!(env.mock.lock().audio_frames[0].data, b"new");
+        env.shutdown().await;
+    }
+
+    fn mqtt_connect(client_id: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        append_mqtt_str(&mut body, "MQTT");
+        body.push(4);
+        body.push(0x02);
+        body.extend_from_slice(&30u16.to_be_bytes());
+        append_mqtt_str(&mut body, client_id);
+        finish_packet(0x10, &body)
+    }
+
+    fn mqtt_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        append_mqtt_str(&mut body, topic);
+        body.extend_from_slice(payload);
+        finish_packet(0x30, &body)
+    }
+
+    fn append_mqtt_str(buf: &mut Vec<u8>, text: &str) {
+        let bytes = text.as_bytes();
+        let len = u16::try_from(bytes.len()).expect("字符串过长");
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+
+    fn finish_packet(first: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![first];
+        out.extend(encode_varint(body.len()));
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn encode_varint(mut value: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value % 128) as u8;
+            value /= 128;
+            if value > 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn publish_payload(body: &[u8]) -> Option<Vec<u8>> {
+        if body.len() < 2 {
+            return None;
+        }
+        let topic_len = usize::from(u16::from_be_bytes([body[0], body[1]]));
+        let payload_at = 2 + topic_len;
+        if body.len() < payload_at {
+            return None;
+        }
+        Some(body[payload_at..].to_vec())
+    }
+
+    async fn read_mqtt_packet(
+        read: &mut tokio::net::tcp::OwnedReadHalf,
+    ) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+        let mut first = [0u8; 1];
+        match read.read_exact(&mut first).await {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(err) => return Err(err),
+        }
+        let mut remaining = 0usize;
+        let mut multiplier = 1usize;
+        for _ in 0..4 {
+            let mut byte = [0u8; 1];
+            read.read_exact(&mut byte).await?;
+            remaining += usize::from(byte[0] & 0x7f) * multiplier;
+            if byte[0] & 0x80 == 0 {
+                let mut body = vec![0u8; remaining];
+                if remaining > 0 {
+                    read.read_exact(&mut body).await?;
+                }
+                return Ok(Some((first[0], body)));
+            }
+            multiplier = multiplier.saturating_mul(128);
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mqtt 变长整数过长",
+        ))
+    }
+}

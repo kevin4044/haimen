@@ -1,5 +1,6 @@
 pub mod mqtt;
 pub mod mqtt_broker;
+pub mod mqtt_udp;
 mod ota;
 mod protocol;
 pub mod protocol_udp;
