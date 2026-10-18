@@ -220,8 +220,34 @@ if [ "$OTA_CODE" = "200" ]; then
 import json
 d = json.load(open('/tmp/cd_ota.json'))
 ws = (d.get('websocket') or {}).get('url')
-print(f'  websocket.url = {ws}')
+mq = d.get('mqtt') or {}
+if mq:
+    print(f'  协议: mqtt')
+    print(f'  broker endpoint   = {mq.get("endpoint")}')
+    print(f'  publish_topic     = {mq.get("publish_topic")}')
+    print(f'  client_id         = {mq.get("client_id")}')
+else:
+    print(f'  协议: websocket')
+    print(f'  websocket.url = {ws}')
 " 2>/dev/null || cat /tmp/cd_ota.json 2>/dev/null | head -c 300
+    # mqtt 模式下额外确认 broker 端口在监听（否则设备连上了也白搭）
+    if python3 -c "
+import json, sys
+d = json.load(open('/tmp/cd_ota.json'))
+sys.exit(0 if (d.get('mqtt') or {}) else 1)
+" 2>/dev/null; then
+        MQ_EP=$(python3 -c "
+import json
+d = json.load(open('/tmp/cd_ota.json'))
+print((d.get('mqtt') or {}).get('endpoint',''))
+" 2>/dev/null)
+        MQ_HOST="${MQ_EP%%:*}"; MQ_PORT="${MQ_EP##*:}"
+        if nc -z -w 3 "$MQ_HOST" "$MQ_PORT" 2>/dev/null; then
+            echo "  ✅ MQTT broker 可达: ${MQ_HOST}:${MQ_PORT}"
+        else
+            echo "  ❌ MQTT broker 不可达: ${MQ_HOST}:${MQ_PORT} —— 设备将无法连接"
+        fi
+    fi
     echo "  ✅ OTA 正常（注意：地址必须带结尾斜杠 /xiaozhi/ota/）"
 else
     echo "  ⚠️  OTA 端点异常，设备会连不上"
