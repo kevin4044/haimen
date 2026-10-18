@@ -755,17 +755,22 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
                 channel: 1,
                 // 服务端 VAD 判停窗口：静音超过这么久就判定用户说完了。
                 //
-                // 权衡：窗口越短判停越快，但太短会在用户话没说完（中文口语停顿
-                // 常达 400-600ms）时误判。1500ms 太保守（实测 ASR 阶段最长耗 4.1s），
-                // 400ms 又太激进（曾经导致豆包返回空结果 + code=45000081「等包超时」）。
-                // 800ms 是折中值。
+                // 演变过程（每次都有真机数据支撑）：
+                //   1500ms → 太保守，实测 ASR 阶段最长耗 4.1s
+                //    400ms → 太激进，豆包返回空结果 + code=45000081「等包超时」
+                //    800ms → 可用，但用户仍反馈比小智云端慢
+                //    500ms → 当前值。对齐小智云端「说停即判」的量级。
                 //
-                // 之所以现在敢降：ASR 任务结束处已有 last_nonempty_text 兜底 ——
-                // 即使服务端来不及发 is_final，也能用最后一次累积的中间结果作为完整转写。
+                // 之所以现在敢降到 500ms：ASR 任务结束处已有 last_nonempty_text 兜底 ——
+                // 即使服务端来不及发 is_final（窗口太短导致），也能用最后一次累积的
+                // 中间结果作为完整转写，不会出现「识别结果为空」。
+                //
+                // 已知取舍：用户说话中间停顿超过 500ms 会被截断。若实测出现截断，
+                // 通过配置文件覆盖：[asr.providers.doubao] end_window_size = "800"
                 end_window_size: Some(
                     cfg.get_credential("end_window_size")
                         .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(800),
+                        .unwrap_or(500),
                 ),
                 // 至少累积这么多音频后才允许判停。200ms 太激进（大约只有 3 帧），
                 // 环境噪音抖动就可能触发误判；500ms 是折中值。
