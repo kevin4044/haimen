@@ -28,15 +28,12 @@ use std::sync::Arc;
 
 use haimen_xiaozhi::mqtt_broker::MqttBrokerConfig;
 use haimen_xiaozhi::udp_audio::UdpAudioConfig;
-use haimen_xiaozhi::{
-    EchoStrategy, MqttUdpConfig, MqttUdpTransport, ResponseStrategy,
-};
+use haimen_xiaozhi::{EchoStrategy, MqttUdpConfig, MqttUdpTransport, ResponseStrategy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 允许通过环境变量改端口，方便同时跑多份互不干扰
-    let broker_bind =
-        std::env::var("BROKER_BIND").unwrap_or_else(|_| "0.0.0.0:1883".to_owned());
+    let broker_bind = std::env::var("BROKER_BIND").unwrap_or_else(|_| "0.0.0.0:1883".to_owned());
     let udp_bind = std::env::var("UDP_BIND").unwrap_or_else(|_| "0.0.0.0:8888".to_owned());
 
     let cfg = MqttUdpConfig {
@@ -71,11 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("用模拟器测试：");
     println!(
         "  python3 scripts/xiaozhi_sim/device_sim.py --broker 127.0.0.1:{}",
-        transport
-            .broker_addr()
-            .rsplit(':')
-            .next()
-            .unwrap_or("1883")
+        transport.broker_addr().rsplit(':').next().unwrap_or("1883")
     );
     println!();
     println!("Ctrl-C 退出");
