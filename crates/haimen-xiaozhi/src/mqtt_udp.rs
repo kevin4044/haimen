@@ -344,6 +344,22 @@ async fn run_loop(
           } => {
             expire_recordings(&shared).await;
           }
+          // ★ 策略侧的「说完了」信号。
+          // AsrLlmTtsStrategy 在流式 ASR 里自己检测到语音结束（服务端 VAD 判停
+          // 或本地静音）时会 notify 这个 Notifier。ws.rs 一直靠它及时收口，
+          // 而 MQTT 传输层最初只等设备的 listen stop —— 自动模式下设备根本不会
+          // 发 stop，于是 ASR 识别完却没人触发 LLM/TTS，表现为「一直在聆听中」。
+          //
+          // 每次循环都重新取一次 Notifier：策略在每次录音开始时可能换掉内部的
+          // Arc，缓存旧 Arc 会永远收不到信号。
+          _ = async {
+            match shared.strategy.vad_completion() {
+              Some(notify) => notify.notified().await,
+              None => std::future::pending::<()>().await,
+            }
+          } => {
+            finish_recording_by_vad(&shared).await;
+          }
           _ = tick.tick() => {
             prune_sessions(&shared).await;
           }
@@ -620,6 +636,31 @@ async fn handle_udp(shared: &Arc<Shared>, audio: crate::udp_audio::UdpIncomingAu
         if let Err(err) = shared.strategy.on_audio_frame(&frame).await {
             tracing::warn!(%err, "on_audio_frame 失败，帧已留在缓冲里");
         }
+    }
+}
+
+/// 策略检测到「用户说完了」：把所有正在录音的会话推进到「生成回复」。
+///
+/// 必须存在的原因：`AsrLlmTtsStrategy` 是在流式 ASR 内部判断语音结束的，
+/// 它通过 `vad_completion()` 暴露一个 Notifier。传输层如果不监听，
+/// 就只能等设备发 `listen stop` —— 而自动模式下设备永远不发，
+/// 表现为「设备一直在聆听中，ASR 识别出了文字却没有任何回复」。
+///
+/// 注意：该 Notifier 是策略级而非会话级的，多设备同时录音时会一起收口。
+/// M2' 是单设备场景可接受；多设备需要给策略加带 session 参数的版本。
+async fn finish_recording_by_vad(shared: &Arc<Shared>) {
+    let recording: Vec<String> = {
+        let tables = shared.tables.lock().await;
+        tables
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.state == SessionState::Recording)
+            .map(|(client_id, _)| client_id.clone())
+            .collect()
+    };
+    for client_id in recording {
+        tracing::warn!(%client_id, "策略侧 VAD 检测到语音结束，立即生成回复");
+        start_playback(shared, &client_id).await;
     }
 }
 

@@ -328,6 +328,11 @@ def main() -> int:
                     help="按 60ms/帧实时发送（默认开）")
     ap.add_argument("--no-realtime", dest="realtime", action="store_false")
     ap.add_argument("--wait", type=float, default=8.0, help="发完后等待回复的秒数")
+    ap.add_argument(
+        "--no-stop",
+        action="store_true",
+        help="不发送 listen stop（模拟固件在自动模式下依赖服务端 VAD 收口）",
+    )
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -357,7 +362,10 @@ def main() -> int:
         sim.listen_start()
         time.sleep(0.2)
         sim.send_audio_frames(frames, realtime=args.realtime)
-        sim.listen_stop()
+        if args.no_stop:
+            print("  （--no-stop：不发送 listen stop，只能靠服务端 VAD 触发回复）")
+        else:
+            sim.listen_stop()
 
         print(f"  等待服务器响应（最多 {args.wait}s）…")
         rx_json = sim.drain_json(extra_wait=args.wait)
