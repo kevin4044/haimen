@@ -17,6 +17,35 @@ pub async fn handle_ota(
     headers: HeaderMap,
     Json(body): Json<OtaRequest>,
 ) -> Result<Json<OtaResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // 记录设备自报的固件与板子信息。
+    // 用于排查「某个功能设备没反应」——比如 notify 需要较新固件，
+    // 而设备自报的 version 能直接看出它跑的是哪一版。
+    // 用 warn 级：本项目的 INFO 会被日志过滤吞掉。
+    tracing::warn!(
+        app_name = body
+            .application
+            .as_ref()
+            .map(|a| a.name.as_str())
+            .unwrap_or("-"),
+        app_version = body
+            .application
+            .as_ref()
+            .map(|a| a.version.as_str())
+            .unwrap_or("-"),
+        board = body
+            .board
+            .as_ref()
+            .map(|b| b.r#type.as_str())
+            .unwrap_or("-"),
+        board_name = body
+            .board
+            .as_ref()
+            .and_then(|b| b.name.as_deref())
+            .unwrap_or("-"),
+        mac = body.mac_address.as_str(),
+        "收到 OTA 请求"
+    );
+
     // 验证 Device-Id。现有调用方仍依赖缺头时返回 400。
     let _device_id = headers
         .get("device-id")
