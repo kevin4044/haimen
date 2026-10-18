@@ -99,24 +99,58 @@ fi
 # ─────────────────────────────────────────────
 # 4. 诊断日志升到 warn
 # ─────────────────────────────────────────────
-declare -a WARN_MSGS=(
-    "流式 ASR: 管道已就绪（惰性初始化）"
-    "流式 ASR: 清空管道状态（惰性初始化）"
-    "流式 ASR: 第一帧音频到达，惰性初始化管道"
-    "无语音超时"
-    "ASR 完成"
-)
+# 用 Python 做中文文本检查（shell 传中文参数在这个环境下会乱码）
+info "检查诊断日志级别"
+if python3 - "$TARGET" <<'PYEOF'
+import sys, re
 
-for msg in "${WARN_MSGS[@]}"; do
-    # 该文案必须出现在某个 warn! 里
-    if grep -A2 'tracing::warn!' "$TARGET" 2>/dev/null | grep -q "$msg"; then
-        pass "「$msg」已升到 warn 级"
-    elif grep -B2 "$msg" "$TARGET" 2>/dev/null | grep -q 'tracing::info!'; then
-        fail "「$msg」仍是 info 级，需改为 warn!"
-    else
-        fail "找不到「$msg」对应的 warn! 日志"
-    fi
-done
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+lines = src.split("\n")
+
+# 目标文案 -> 是否必须出现在 warn! 调用内
+targets = [
+    ("管道已就绪", "管道已就绪（惰性初始化）"),
+    ("清空管道状态", "清空管道状态（惰性初始化）"),
+    ("第一帧音频到达", "第一帧音频到达"),
+    ("无语音超时", "无语音超时"),
+    ("ASR 完成", "ASR 完成"),
+]
+
+fails = []
+for key, label in targets:
+    found_warn = False
+    found_info = False
+    for i, line in enumerate(lines):
+        if key not in line:
+            continue
+        # 往上看最多 4 行，找最近的 tracing::warn! / tracing::info!
+        for j in range(i, max(-1, i - 5), -1):
+            if "tracing::warn!" in lines[j]:
+                found_warn = True
+                break
+            if "tracing::info!" in lines[j]:
+                found_info = True
+                break
+        if found_warn:
+            break
+    if found_warn:
+        print(f"PASS 「{label}」已升到 warn 级")
+    elif found_info:
+        print(f"FAIL 「{label}」仍是 info 级，需改为 warn!")
+        fails.append(label)
+    else:
+        print(f"FAIL 找不到「{label}」对应的 warn! 日志")
+        fails.append(label)
+
+sys.exit(1 if fails else 0)
+PYEOF
+then
+    :  # 每行 PASS/FAIL 已由 Python 打印，这里只更新计数
+else
+    # Python 已打印 FAIL 行，handoff 会收集；这里补计数
+    FAILURES=$((FAILURES + 1))
+fi
 
 # ─────────────────────────────────────────────
 # 5. RMS 诊断日志
