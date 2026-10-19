@@ -30,10 +30,6 @@ const MAX_DOWNLINK_PAYLOAD: usize = 1484;
 /// 录音超过这个时间还没收到 listen stop，由服务器收口。设备自己不会回 Idle。
 const RECORDING_LIMIT: Duration = Duration::from_secs(30);
 
-/// 握手之后长时间没有任何控制消息或音频，就丢掉 UDP 密钥。
-/// 取 MQTT keepalive 常用的 240 秒；Ready 上的 10 秒无语音超时按 M2' 不做处理。
-const IDLE_LIMIT: Duration = Duration::from_secs(240);
-
 /// 上行 hello 没带采样率时用 16 kHz。这是设备麦克风的参数，不是下行 TTS 的 24 kHz。
 const fn default_uplink_rate() -> u32 {
     16_000
@@ -854,19 +850,11 @@ async fn prune_sessions(shared: &Shared) {
         .into_iter()
         .collect();
     let mut gone = Vec::new();
-    let mut idle = Vec::new();
     {
         let tables = shared.tables.lock().await;
-        for (client_id, session) in &tables.sessions {
+        for client_id in tables.sessions.keys() {
             if !online.contains(client_id) {
                 gone.push(client_id.clone());
-                continue;
-            }
-            let quiet = session.last_activity.elapsed() > IDLE_LIMIT;
-            let busy =
-                session.state == SessionState::Recording || session.state == SessionState::Playing;
-            if quiet && !busy && session.udp_session_id.is_some() {
-                idle.push(client_id.clone());
             }
         }
     }
@@ -875,10 +863,6 @@ async fn prune_sessions(shared: &Shared) {
         // 说明 broker 的 connected_clients 把还在线的设备误判成断开了。
         tracing::warn!(%client_id, "MQTT 连接已断开，清理会话与 UDP 密钥");
         drop_client(shared, &client_id).await;
-    }
-    for client_id in idle {
-        tracing::info!(%client_id, "长时间没有消息，注销 UDP 会话");
-        release_udp(shared, &client_id, "idle-timeout").await;
     }
 }
 
