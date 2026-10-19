@@ -1760,11 +1760,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 //
                 // 任务不会因此泄漏：文本稳定分支会 break，且下次录音时
                 // init_asr_pipeline 会替换 streaming_state，旧任务随之退出。
-                tracing::warn!(
-                    "本地能量 VAD: 连续 {} 帧静音 ({:.1}s)，仅记录（不再关流/判停）",
-                    state.silence_count,
-                    state.silence_count as f64 * 60.0 / 1000.0,
-                );
+                // 只在刚跨过阈值那一帧打一次。否则每 60ms 一行，
+                // 一次说话停顿就能刷出几十行日志。
+                if state.silence_count == MAX_SILENCE_FRAMES {
+                    tracing::warn!(
+                        "本地能量 VAD: 连续 {} 帧静音 ({:.1}s)，仅记录（不再关流/判停）",
+                        state.silence_count,
+                        state.silence_count as f64 * 60.0 / 1000.0,
+                    );
+                }
             }
 
             (pcm_bytes, state.pcm_tx.clone())

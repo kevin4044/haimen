@@ -194,3 +194,72 @@ if conn.just_woken_up:
 2. **音频前端（VAD）和对话收口这两块，他们成熟得多**：Silero 双阈值 VAD、三层退出 + 看门狗、带告别语的收口。
 3. **他们的功能生态（管理台/多租户/知识库/声纹）对单人自用是负资产**，不要把复杂度抄过来。
 4. **最有价值的两个借鉴**：`Silero VAD`（解决 KI-003）和 `对话收口分层设计`（体验）。
+
+---
+
+# 附录：Agent 层深读结论（subagent 报告摘要）
+
+## 它的架构：薄编排 + 厚配置
+
+```
+意图识别：默认【没有】—— Intent: function_call 的 provider 恒返回 continue_chat，
+          真正路由全交给 LLM 原生 tool calling
+          （core/providers/intent/function_call/function_call.py:9-22）
+intent_llm：可选前置分类器，官方注释自认「增加处理时间」，默认关闭
+记忆：短期=会话内列表不裁剪；长期=会话末总结成一段文本（≤1800 字）覆盖写回
+知识库：RAGFlow 外挂，包装成一个普通 function tool
+声纹：voiceprint-api 外挂，与 ASR 并行，结果只进 prompt
+MCP：只做客户端（外部 server / 设备 / mcp-endpoint 三种），不实现 MCP server
+主动能力：完全没有定时/播报调度，只有超时告别、唤醒问候、来电播报
+```
+
+## 我们落后它的三件事（值得抄）
+
+### P0-1 长期记忆（唯一质变级功能）
+
+```python
+# 会话结束守护线程异步总结，下次连接注入 <memory>
+# mem_local_short.py:135-198 + connection.py:304-325
+# 隔离键只有 device_id，不按人
+```
+**它的坑我们不要复刻：**
+- 覆盖式单字段 `summaryMemory` → 总结跑偏就永久丢历史 → 我们要 append + 版本
+- 每轮同步查询阻塞主链路（`connection.py:1113-1119`）→ 我们预取/异步
+- few-shot 的 `is_temporary` 没过滤，会污染记忆；`Assistant: None` 也会写进去
+
+### P0-2 `direct_answer` 虚拟工具（省一次 LLM 往返）
+
+```python
+# connection.py:58-76
+# 把「不调工具」也包装成一次工具调用
+# → 把「调不调」的二分类变成「调哪个」的多分类
+# → response 参数流式抠出来直接送 TTS，避免「工具轮 + 文本轮」两次往返
+```
+**这是最聪明的低延迟技巧，和我们 0.9s 的目标一致。**
+
+### P1 上下文注入（减少工具调用）
+
+```
+把 时间/天气/HA 实体状态 注入 system prompt 的 <context> 段
+→ 「客厅灯开着吗」「现在几点」不调工具直接答，每轮省 300ms~1s
+（prompt_manager.py:249-312 + context_provider.py:15-64）
+```
+
+## 它踩过的坑（我们别复刻）
+
+| 坑 | 位置 | 教训 |
+|---|---|---|
+| 长期记忆同步查询阻塞主链路 | `connection.py:1113-1119` | 连接时预取 + 本地缓存 |
+| 总结覆盖式单字段 | `AgentEntity.java:76-78` | append-only + 时间戳 |
+| few-shot 污染记忆 | `mem_local_short.py:150-167` | 写记忆前过滤临时消息 |
+| 超时告别伪造 user 消息 | `receiveAudioHandle.py:133` | 主动播报走独立「系统发起」通道 |
+| 动态工具描述改全局注册表会串台 | `plugin_executor.py:116-123` | 工具描述 per-session 拷贝 |
+| 声纹健康检查同步阻塞连接初始化 | `voiceprint_provider.py:88-138` | 外部检查异步/缓存 |
+| 短期上下文无 token 预算 | `dialogue.py:94-161` | 要预算 + 滚动窗口 |
+| 工具全量下发无预筛 | `connection.py:1103-1107` | 按场景裁剪 |
+
+## 结论：我们的差异化方向
+
+> **它把主动能力做得很薄（只有超时告别/唤醒问候），我们已经领先。**
+> **下一步不该去补它的 Java/Vue 中台，而是把「主动能力 + 长期记忆」接起来
+> ——「它记得昨天你说过什么，并在合适的时候主动提起来」。**
