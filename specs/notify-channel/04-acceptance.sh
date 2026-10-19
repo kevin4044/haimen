@@ -50,7 +50,9 @@ info "环境检查通过（Docker 可用）"
 # ─────────────────────────────────────────────
 # 0b. 改动白名单
 # ─────────────────────────────────────────────
-ALLOWED_CHANGED_RE='^(crates/haimen-xiaozhi/src/(notify|say_audio|lib|types)\.rs|src/gateway/mod\.rs|src/web/mod\.rs|specs/notify-channel/)'
+# T1 只需要 say_audio + lib + web/mod；
+# T2 还要动 mqtt_udp（设备解析/下发）、types（say_token 配置）、Cargo.*（ogg 依赖）。
+ALLOWED_CHANGED_RE='^(crates/haimen-xiaozhi/src/(notify|say_audio|lib|types|mqtt_udp)\.rs|crates/haimen-xiaozhi/Cargo\.toml|Cargo\.toml|Cargo\.lock|src/gateway/mod\.rs|src/web/mod\.rs|specs/notify-channel/)'
 CHANGED="$(git -c core.quotePath=false status --porcelain | awk '{print $2}' | sed 's/^"//; s/"$//')"
 if [ -n "${CHANGED}" ]; then
     OUTSIDE="$(echo "${CHANGED}" | grep -Ev "${ALLOWED_CHANGED_RE}" || true)"

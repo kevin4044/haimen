@@ -80,6 +80,23 @@ GET /xiaozhi/say/{id}.ogg
 
 依赖 T1（用它的 `SayAudioStore`）。
 
+### 改动白名单（本任务允许改这些）
+
+```
+crates/haimen-xiaozhi/src/notify.rs        ← 新增
+crates/haimen-xiaozhi/src/say_audio.rs     ← 复用 T1 的，可能需微调
+crates/haimen-xiaozhi/src/lib.rs           ← 注册路由
+crates/haimen-xiaozhi/src/types.rs         ← say_token 配置
+crates/haimen-xiaozhi/src/mqtt_udp.rs      ← 设备解析 / 会话状态 / 下发 notify
+crates/haimen-xiaozhi/Cargo.toml           ← ogg 依赖
+Cargo.toml / Cargo.lock                    ← ogg 依赖
+src/gateway/mod.rs                         ← 传 say_token / advertise_ip
+src/web/mod.rs                             ← 注入合成器
+specs/notify-channel/
+```
+
+**新增依赖只允许 `ogg` 一个**（见下），其余一律不许加。
+
 ### 接口
 
 见 `02-design.md` §4.1 的完整请求/响应。
@@ -88,17 +105,38 @@ GET /xiaozhi/say/{id}.ogg
 
 1. **请求/响应类型**（`serde`），字段与 §4.1 一致；`text` 空或超 500 字 → 400。
 
-2. **设备解析**：
+2. **合成器注入（关键设计）**：
+   `pcm_to_opus_frames` 和 TTS 合成都在**根 crate**（`src/xiaozhi_tts.rs`、
+   `src/xiaozhi_asr_llm_tts.rs`），是 `pub(crate)`，`haimen-xiaozhi` 调不到。
+
+   **所以走「根 crate 注入」而不是「haimen-xiaozhi 自己合成」**：
+   - 在 `notify.rs` 定义 trait：
+     ```rust
+     #[async_trait]
+     pub trait SaySynthesizer: Send + Sync {
+         /// 文本 → Ogg Opus 字节（音色由实现方决定，一律用当前生效音色）
+         async fn synthesize(&self, text: &str) -> Result<Vec<u8>, String>;
+     }
+     ```
+   - 用全局槽（和 T1 的 `say_audio_store` 同一种做法）：
+     `OnceLock<Arc<dyn SaySynthesizer>>`，由 `src/web/mod.rs` 在启动时注入
+   - 根 crate 侧的实现：复用现有的 TTS 合成 + `pcm_to_opus_frames` + `ogg` 封装
+   - **音色解析在根 crate 侧完成**（`voice_override` ?? 配置 `voice`），
+     `haimen-xiaozhi` 不需要知道音色怎么来的
+
+   这样 `haimen-xiaozhi` 保持零 TTS 依赖，也不用公开根 crate 的内部函数。
+
+3. **设备解析**：
    - `device` 给了 → 按 mac 或 client_id 精确匹配；找不到 → 404 `device_offline`
    - 没给 → 如果恰好一台在线设备就用它；0 台 → 404；多台 → 409 `multiple_devices`
 
-3. **状态检查（关键）**：
+4. **状态检查（关键）**：
    - MQTT 在线（broker 有该 client_id）
    - **没有 UDP 会话**（有 = 正在录音/对话中）
    - 不在播放（`SessionState::Playing`）
    - 不满足 → 409 `device_busy`，`state` 字段给出实际状态
 
-4. **TTS 合成**：
+5. **TTS 合成**（在根 crate 侧的 `SaySynthesizer` 实现里）：
    - **只吃文本，不接受音色参数**。
    - 音色走和正常回复**同一条解析路径**：`voice_override`（CLI `--xiaozhi-tts-voice`，若有）
      否则配置里的 `[tts.providers.doubao].voice`。**不要另读一份配置**，复用策略里
@@ -107,7 +145,7 @@ GET /xiaozhi/say/{id}.ogg
    - 输出 24kHz mono PCM
    - 合成失败 → 502 `tts_failed`
 
-5. **Opus 编码 + Ogg 封装**：
+6. **Opus 编码 + Ogg 封装**（同样在根 crate 侧）：
    - 编码复用现有的 `pcm_to_opus_frames`（`src/xiaozhi_tts.rs`），24kHz / 60ms/帧
    - **容器用 `ogg` crate（0.9.2）**，不要手写 Ogg 页
      - 已核实：纯 Rust，依赖（byteorder/bytes/tokio/futures-*）全在现有依赖树里，
@@ -117,16 +155,16 @@ GET /xiaozhi/say/{id}.ogg
    - 结构：`OpusHead`（19B，声道/预跳过/采样率）→ `OpusTags`（可空）→ 数据页
    - 采样率字段填 24000（虽然 Opus 内部固定 48kHz，头部要按输出采样率声明）
 
-6. **托管**：调 T1 的 `insert()`，URL 基址取配置里的 `advertise_ip`（没有就用本机 LAN IP），
+7. **托管**：调 T1 的 `insert()`，URL 基址取配置里的 `advertise_ip`（没有就用本机 LAN IP），
    端口取 HTTP 服务端口。
 
-7. **下发 notify**：构造
+8. **下发 notify**（在 `notify.rs`，通过 mqtt_udp 暴露的能力）：构造
 ```json
 {"type":"notify","audio_url":"<url>","subtitles":[{"start_ms":0,"text":"<原文>"}]}
 ```
    走现有控制主题转发路径发给该设备。
 
-8. **配置**：`[xiaozhi] say_token`（见 §4.5）。
+9. **配置**：`[xiaozhi] say_token`（见 §4.5）。
    - 字段**必须实现**，默认空串
    - 空串 → **不校验，直接放行**（当前实际行为），启动时打一条 warn 说明"鉴权未启用"
    - 非空 → 校验 `Authorization: Bearer <token>`，不匹配 → 401
