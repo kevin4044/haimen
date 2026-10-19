@@ -3629,6 +3629,54 @@ mod tests {
         )
     }
 
+    /// 会话级状态必须按 session_key 隔离。
+    ///
+    /// 这是多设备的基础：A 设备的静音标记 / 告别标记不能影响 B。
+    /// 改这段之前它们是 self 级字段，两个设备同时说话会互相覆盖。
+    #[test]
+    fn session_state_is_isolated_per_key() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+
+        // A：置静音关闭 + 告别标记
+        strategy
+            .with_session("dev-a", |state| {
+                state.silence_closed = true;
+                state
+                    .end_of_conversation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            })
+            .expect("写 A 状态");
+        // B：只触发创建，保持默认
+        strategy
+            .with_session("dev-b", |_state| {})
+            .expect("写 B 状态");
+
+        let a_silent = strategy
+            .read_session("dev-a", |state| state.map(|s| s.silence_closed))
+            .expect("读 A")
+            .expect("A 应存在");
+        let b_silent = strategy
+            .read_session("dev-b", |state| state.map(|s| s.silence_closed))
+            .expect("读 B")
+            .expect("B 应存在");
+        assert!(a_silent, "A 的静音标记应为 true");
+        assert!(!b_silent, "B 不应受 A 影响");
+
+        // 告别标记按 key 独立，且读一次就清
+        assert!(strategy.end_of_conversation("dev-a"), "A 应读到告别标记");
+        assert!(
+            !strategy.end_of_conversation("dev-a"),
+            "告别标记是一次性信号，读一次就应清除"
+        );
+        assert!(!strategy.end_of_conversation("dev-b"), "B 不应有告别标记");
+
+        // 未创建的 key 读出来是 None，不会误报
+        let unknown = strategy
+            .read_session("dev-never-seen", |state| state.is_some())
+            .expect("读未知 key");
+        assert!(!unknown, "未知会话不应被 read_session 创建");
+    }
+
     // ─── Opus 编解码往返测试 ───────────────────────────
 
     #[test]
