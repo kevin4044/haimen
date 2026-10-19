@@ -133,3 +133,40 @@ UDP 传输抖动和固件调度延迟（照抄参考实现的公式，不要自�
 - `src/gateway/mod.rs`（若加配置字段）
 
 **不改**：`strategy.rs`、`xiaozhi_asr_llm_tts.rs`、固件相关代码。
+
+## 7. 实施结果与 A/B 验证（2026-10-19）
+
+T1 + T2 已实现并部署到 Mac mini。
+
+### 埋点实测（模拟器一轮完整对话）
+
+```
+下行播放统计  frames=167  elapsed_ms=9723  expected_ms=10020  tail_wait_ms=421
+```
+
+判读：
+
+| 观测 | 结论 |
+|---|---|
+| `expected_ms = 167 × 60 = 10020` | 计算正确 |
+| `elapsed_ms = 9723 = expected − 297` | 正好等于预缓冲 5 帧连发省下的时间（4×60=240ms + 抖动）→ **发送侧没有丢帧** |
+| `tail_wait_ms = 421` | T1 生效（420ms + 1ms 调度抖动） |
+
+**→ 发送侧一帧没丢，因此掉帧只可能发生在设备侧**，与 §3 的推断一致：
+设备解码队列里滞留的尾帧被过早的 `tts stop` 回收。
+
+### A/B 基线
+
+- **T1 之前**：发完最后一帧立刻发 `tts stop`，`tail_wait_ms = 0`
+- **T1 之后**：`tail_wait_ms ≈ 420`
+
+若后续仍听到末尾掉帧，说明根因不只在尾帧，需要查 UDP 丢包
+（`send_downlink_frame` 的失败路径）。
+
+### 实现说明
+
+`wait_tail_playback` 放在 `drive_playback` 内部而不是 `run_playback`，
+因为 `tail_wait_ms` 要量实际等待时长（在函数外就量不到）。
+`drive_playback` 返回 `bool` 表示是否已等过；中途异常退出的轮次由
+`run_playback` 补等。取消路径行为不变：被取消的轮次不发 stop，
+由 `handle_abort` 的 `Playing` 分支收口。

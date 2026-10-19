@@ -49,7 +49,7 @@ step() { echo; echo "── $* ────────────────�
 cleanup() {
     if [ "$KEEP" -eq 1 ]; then
         echo
-        echo "（--keep：保留容器 $CONTAINER，排查完记得 docker rm -f $CONTAINER）"
+        echo "（--keep：保留容器 ${CONTAINER}，排查完记得 docker rm -f ${CONTAINER}）"
         echo "   看日志: docker logs $CONTAINER"
         return
     fi
@@ -67,7 +67,7 @@ fi
 pass "Docker 可用"
 
 if [ ! -x "$PY" ]; then
-    fail "找不到 Python: $PY（可用 PY=... 覆盖）"
+    fail "找不到 Python: ${PY}（可用 PY=... 覆盖）"
     echo; echo "验收失败：$FAILURES 项"; exit 1
 fi
 if ! "$PY" -c 'import paho.mqtt' 2>/dev/null; then
@@ -77,7 +77,7 @@ fi
 pass "Python + paho-mqtt 就绪"
 
 if ! docker image inspect "$DEV_IMAGE" >/dev/null 2>&1; then
-    fail "缺少开发镜像 $DEV_IMAGE（先跑 ./scripts/dev.sh image 或 ./scripts/ci.sh）"
+    fail "缺少开发镜像 ${DEV_IMAGE}（先跑 ./scripts/dev.sh image 或 ./scripts/ci.sh）"
     echo; echo "验收失败：$FAILURES 项"; exit 1
 fi
 pass "开发镜像就绪"
@@ -153,7 +153,7 @@ step "4. 断言"
 if [ "$SIM_EXIT" -eq 0 ]; then
     pass "模拟器整体判定 PASS"
 else
-    fail "模拟器整体判定 FAIL（exit=$SIM_EXIT）"
+    fail "模拟器整体判定 FAIL（exit=${SIM_EXIT}）"
 fi
 
 # 逐项断言，便于定位

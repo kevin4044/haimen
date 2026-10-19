@@ -517,6 +517,7 @@ pub(crate) fn build_mqtt_udp_config(
         downlink_topic_template: x.mqtt.downlink_topic_template.clone(),
         prebuffer_count: 5,
         frame_duration_ms: 60,
+        tail_extra_frames: 2,
         advertise_ip,
     }
 }

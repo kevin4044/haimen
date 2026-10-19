@@ -172,9 +172,9 @@ fi
 # ─────────────────────────────────────────────
 echo
 if [ "$FAILURES" -eq 0 ]; then
-    echo "验收通过（任务 $TASK）"
+    echo "验收通过（任务 ${TASK}）"
     exit 0
 else
-    echo "验收失败：$FAILURES 项（任务 $TASK）"
+    echo "验收失败：$FAILURES 项（任务 ${TASK}）"
     exit 1
 fi
