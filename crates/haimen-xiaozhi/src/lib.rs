@@ -1,6 +1,7 @@
 pub mod mqtt;
 pub mod mqtt_broker;
 pub mod mqtt_udp;
+pub mod notify;
 mod ota;
 mod protocol;
 pub mod protocol_udp;
@@ -11,6 +12,7 @@ pub mod udp_audio;
 mod ws;
 
 pub use mqtt_udp::{MqttUdpConfig, MqttUdpError, MqttUdpTransport};
+pub use notify::SaySynthesizer;
 pub use protocol::*;
 pub use say_audio::{SayAudioStore, say_audio_store};
 pub use strategy::{EchoStrategy, ResponseStrategy};
@@ -39,9 +41,10 @@ pub fn set_xiaozhi_ota_config(cfg: XiaozhiConfig) {
 /// 向 axum Router 注入 xiaozhi 设备通信端点
 ///
 /// 路由始终挂载（MQTT 模式下设备仍可能回退到 WebSocket）：
-/// - `POST /xiaozhi/ota/`      — OTA 握手，按配置下发 websocket 或 mqtt 段
-/// - `GET  /xiaozhi/ws`        — WebSocket 升级端点
-/// - `GET  /xiaozhi/say/{id}`  — 一次性通知音频（实际 URL 带 `.ogg` 后缀，由 handler 剥掉）
+/// - `POST /xiaozhi/ota/`          — OTA 握手，按配置下发 websocket 或 mqtt 段
+/// - `GET  /xiaozhi/ws`            — WebSocket 升级端点
+/// - `GET  /xiaozhi/say/{id}`      — 一次性通知音频（实际 URL 带 `.ogg` 后缀，由 handler 剥掉）
+/// - `POST /api/v1/xiaozhi/say`    — 主动播报：文本 → Ogg Opus → 托管 → 下发 notify
 ///
 /// # 参数
 ///
@@ -62,9 +65,14 @@ pub fn add_routes<S: Clone + Send + Sync + 'static>(
                 ws::handle_ws_upgrade(ws, headers, strategy.clone())
             }),
         )
-        // 通知音频用全局槽（say_audio::say_audio_store），不污染 Router 的状态类型。
+        // 通知音频和 say 接口都用全局槽（say_audio::say_audio_store /
+        // notify 的设置槽），不污染 Router 的状态类型。
         .route(
             "/xiaozhi/say/{id}",
             axum::routing::get(say_audio::handle_say_audio),
+        )
+        .route(
+            "/api/v1/xiaozhi/say",
+            axum::routing::post(notify::handle_say),
         )
 }

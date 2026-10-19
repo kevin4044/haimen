@@ -92,6 +92,9 @@ uuid = { version = "1", features = ["v4"] }
 # Opus 音频编码
 opus2 = { version = "0.4", features = ["bundled"] }
 
+# Ogg 容器封装（小智 notify 音频：Opus 帧打包成 Ogg 供设备 HTTP 拉取）
+ogg = { version = "0.9.2", default-features = false }
+
 # MQTT 客户端（小智设备的 MQTT 传输层，见 specs/mqtt-udp/实现方案.md）
 rumqttc = "0.24"
 
@@ -143,6 +146,7 @@ haimen-hermes = { path = "crates/haimen-hermes", version = "0.2.0" }
 haimen-openai = { path = "crates/haimen-openai", version = "0.1" }
 univoice = { version = "0.1.6", features = ["opus-encoder"] }
 opus2 = { workspace = true }
+ogg = { workspace = true }
 webbrowser = { workspace = true }
 local-ip-address = { workspace = true }
 

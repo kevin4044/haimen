@@ -16,6 +16,120 @@ pub struct ServeConfig {
     pub auto_open: bool,
 }
 
+/// `POST /api/v1/xiaozhi/say` 的合成器实现（根 crate 侧）。
+///
+/// 为什么实现在根 crate 而不是 haimen-xiaozhi：合成要读共享的 TTS 配置、
+/// 走 `tts_factory`、调 Opus 编码器，这些都在根 crate。haimen-xiaozhi
+/// 只定义 `SaySynthesizer` trait 并在这里注入。
+struct XiaozhiSaySynthesizer {
+    tts_config: Arc<RwLock<TtsConfig>>,
+    voice_override: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl haimen_xiaozhi::notify::SaySynthesizer for XiaozhiSaySynthesizer {
+    async fn synthesize(&self, text: &str) -> Result<Vec<u8>, String> {
+        // 音色解析与正常回复（synthesize_status_pcm）逐行一致：
+        // clone 共享配置 → 注入 voice override → 由工厂建 provider。
+        // 在单独的块里取放 RwLock，避免 guard 跨越 .await。
+        let provider = {
+            let cfg = self.tts_config.read().map_err(|e| e.to_string())?;
+            let mut work_cfg = cfg.clone();
+            if let Some(voice) = &self.voice_override {
+                work_cfg
+                    .providers
+                    .entry(work_cfg.active_provider.clone())
+                    .or_default()
+                    .insert("voice".to_string(), voice.clone());
+            }
+            crate::tts_factory::create_tts_provider(&work_cfg)?
+        };
+        let resp = provider
+            .synthesize(univoice::tts::TtsRequest {
+                text: text.to_string(),
+                options: None,
+            })
+            .await
+            .map_err(|e| format!("TTS 合成失败: {e}"))?;
+        if resp.audio.is_empty() {
+            return Err("TTS 返回空音频".to_string());
+        }
+        // resp.audio 是 PCM16 mono 24kHz；60ms 帧与设备下行节奏一致
+        let frames = crate::xiaozhi_tts::pcm_to_opus_frames(&resp.audio, 24_000, 60)?;
+        wrap_ogg_opus(&frames)
+    }
+}
+
+/// 把裸 Opus 帧封装成 Ogg 容器字节，供设备 HTTP 拉流播放。
+///
+/// 关键决定：
+/// - OpusHead 的采样率字段按输出采样率 24000 声明（Opus 内部固定 48k，
+///   这个字段只是给解码器的重采样提示）；pre_skip=312 是 libopus 常用 lookahead。
+/// - granule 从 pre_skip 起每帧 += 2880（60ms × 48kHz，granule 恒为 48k 单位），
+///   notify.rs 就用最后一包的 granule 反算 duration_ms。
+/// - OpusHead / OpusTags 各独占一页（EndPage），末帧 EndStream ——
+///   设备固件的 Ogg 解析器按最保守的分页假设实现。
+fn wrap_ogg_opus(frames: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+
+    if frames.is_empty() {
+        return Err("没有可封装的音频帧".to_string());
+    }
+
+    // stream serial 只需在并发流间可区分。根 crate 的依赖白名单不允许
+    // 为此新增 uuid，用「时间戳低位 ^ 递增计数」拼一个足够随机的值。
+    let serial = {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(1);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        nanos ^ COUNTER.fetch_add(1, Ordering::Relaxed).rotate_left(16)
+    };
+
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = PacketWriter::new(&mut cursor);
+
+        // OpusHead，19 字节
+        let mut head = Vec::with_capacity(19);
+        head.extend_from_slice(b"OpusHead");
+        head.push(1); // version
+        head.push(1); // channels = mono
+        head.extend_from_slice(&312u16.to_le_bytes()); // pre_skip
+        head.extend_from_slice(&24_000u32.to_le_bytes()); // 输出采样率
+        head.extend_from_slice(&0i16.to_le_bytes()); // gain
+        head.push(0); // channel mapping family 0
+        writer
+            .write_packet(head, serial, PacketWriteEndInfo::EndPage, 0)
+            .map_err(|e| format!("写 OpusHead 失败: {e}"))?;
+
+        // OpusTags，16 字节（空 vendor、空注释列表）
+        let mut tags = Vec::with_capacity(16);
+        tags.extend_from_slice(b"OpusTags");
+        tags.extend_from_slice(&0u32.to_le_bytes());
+        tags.extend_from_slice(&0u32.to_le_bytes());
+        writer
+            .write_packet(tags, serial, PacketWriteEndInfo::EndPage, 0)
+            .map_err(|e| format!("写 OpusTags 失败: {e}"))?;
+
+        let mut granule: u64 = 312; // pre_skip
+        for (index, frame) in frames.iter().enumerate() {
+            granule += 2880; // 60ms × 48kHz
+            let end = if index + 1 == frames.len() {
+                PacketWriteEndInfo::EndStream
+            } else {
+                PacketWriteEndInfo::NormalPacket
+            };
+            writer
+                .write_packet(frame.clone(), serial, end, granule)
+                .map_err(|e| format!("写音频帧失败: {e}"))?;
+        }
+    }
+    Ok(cursor.into_inner())
+}
+
 /// 启动 HTTP 服务器
 ///
 /// - `config`: 服务器地址配置
@@ -40,7 +154,22 @@ pub async fn start(
 
     // 安装小智传输配置：决定 OTA 下发 websocket 还是 mqtt 段。
     // 必须在挂载路由前调用 —— handle_ota 用的是全局槽，默认 websocket。
+    let say_token = xiaozhi_config.say_token.clone(); // xiaozhi_config 随后被 move，先取
     haimen_xiaozhi::set_xiaozhi_ota_config(xiaozhi_config);
+
+    // say 接口的运行时安装：token / HTTP 端口由 web 层提供，
+    // advertise_ip 由 gateway 在 MQTT 传输层启动后另行安装。
+    haimen_xiaozhi::notify::set_say_token(say_token.clone());
+    if say_token.is_empty() {
+        tracing::warn!("[xiaozhi] say_token 为空，/api/v1/xiaozhi/say 鉴权未启用（内网自用模式）");
+    }
+    haimen_xiaozhi::notify::set_say_http_port(config.port);
+    haimen_xiaozhi::notify::set_say_synthesizer(Arc::new(XiaozhiSaySynthesizer {
+        tts_config: tts_config.clone(),
+        // `start_all` 构建策略时 override 本来就是 None，这里与之一致；
+        // `serve` 命令的 --xiaozhi-tts-voice 在 cli.rs（本任务未改），后续如需支持再传入。
+        voice_override: None,
+    }));
 
     // 构建路由
     // ASR 路由使用 asr_config 作为 axum State（独立于 TTS 配置）
@@ -264,5 +393,51 @@ fn open_browser(host: &str, port: u16) {
     match webbrowser::open(&url) {
         Ok(()) => tracing::info!(url = %url, "已自动打开浏览器"),
         Err(e) => tracing::warn!(url = %url, error = %e, "自动打开浏览器失败"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 编一段静音 PCM 走真实封装路径，再用 ogg 读端按序读回：
+    /// OpusHead → OpusTags → 数据帧，且末包 granule 正确、带流结束标记。
+    #[test]
+    fn wrap_ogg_opus_round_trips_via_reader() {
+        // 3 帧 60ms @ 24kHz 的静音 PCM16
+        let pcm = vec![0u8; 3 * 60 * 24 * 2];
+        let frames = crate::xiaozhi_tts::pcm_to_opus_frames(&pcm, 24_000, 60).expect("编码失败");
+        assert_eq!(frames.len(), 3);
+        let ogg_bytes = wrap_ogg_opus(&frames).expect("封装失败");
+
+        let mut reader = ogg::reading::PacketReader::new(std::io::Cursor::new(ogg_bytes));
+        let head = reader
+            .read_packet()
+            .expect("读 OpusHead")
+            .expect("缺 OpusHead");
+        assert_eq!(&head.data[..8], b"OpusHead");
+        assert_eq!(head.absgp_page(), 0);
+        let tags = reader
+            .read_packet()
+            .expect("读 OpusTags")
+            .expect("缺 OpusTags");
+        assert_eq!(&tags.data[..8], b"OpusTags");
+        assert_eq!(tags.absgp_page(), 0);
+
+        let mut last_granule = 0u64;
+        let mut frame_count = 0u64;
+        while let Some(packet) = reader.read_packet().expect("读数据帧") {
+            frame_count += 1;
+            assert_eq!(packet.data, frames[(frame_count - 1) as usize]);
+            last_granule = packet.absgp_page();
+        }
+        assert_eq!(frame_count, 3, "数据帧数应一致");
+        // granule 恒为 48k 单位：312 (pre_skip) + 3 × 2880 (60ms × 48kHz)
+        assert_eq!(last_granule, 312 + 3 * 2880);
+    }
+
+    #[test]
+    fn wrap_ogg_opus_rejects_empty_frames() {
+        assert!(wrap_ogg_opus(&[]).is_err());
     }
 }
