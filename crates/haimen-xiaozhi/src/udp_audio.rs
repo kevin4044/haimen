@@ -254,14 +254,41 @@ async fn recv_loop(
             };
             match entry.crypto.open(&buf[..len]) {
                 Ok((opened, payload)) => {
-                    entry.established = Some(UdpSession { peer, session_id });
-                    Some(UdpIncomingAudio {
-                        peer,
-                        session_id,
-                        sequence: opened.sequence,
-                        timestamp: opened.timestamp,
-                        payload,
-                    })
+                    // 对端只在首次成功解密时锁定，之后不再用包源覆盖。
+                    //
+                    // 原因：这条链路是 AES-CTR，没有 MAC —— 理论上任何长度
+                    // 匹配的报文都能"解密成功"（内容是垃圾）。而 session_id
+                    // （= header 里的 ssrc）在包头里是明文，嗅探到一个包就能读到。
+                    // 如果每次都拿包源覆盖 established.peer，局域网里的嗅探者
+                    // 伪造一包就能把下行音频劫持到自己那里；
+                    // 把注入的伪包丢给 ASR 也会污染识别结果。
+                    //
+                    // 会话在 hello 时由 register_session 重置，所以同一会话内
+                    // 对端地址是稳定的；真出现变化（NAT rebinding）按告警处理，
+                    // 需要重新 hello 才能恢复。
+                    let peer_matches = match &entry.established {
+                        None => {
+                            entry.established = Some(UdpSession { peer, session_id });
+                            true
+                        }
+                        Some(existing) => existing.peer == peer,
+                    };
+                    if !peer_matches {
+                        tracing::warn!(
+                            session_id,
+                            %peer,
+                            "UDP 源地址与已建立的对端不一致，丢弃该包（不覆盖对端）"
+                        );
+                        None
+                    } else {
+                        Some(UdpIncomingAudio {
+                            peer,
+                            session_id,
+                            sequence: opened.sequence,
+                            timestamp: opened.timestamp,
+                            payload,
+                        })
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(session_id, %peer, %err, "UDP 解密失败，丢弃该包");
@@ -613,6 +640,66 @@ mod tests {
                 let (header, _) = crypto.open(&buf[..len]).expect("解密下行");
                 assert_ne!(header.timestamp, 0);
                 assert_eq!(header.timestamp, 180);
+                handle.shutdown().await;
+            });
+    }
+
+    /// 已建立的对端被锁定：另一个源地址发来的合法包必须被丢弃。
+    ///
+    /// AES-CTR 没有 MAC，session_id 又是明文，所以"能解密"不等于"是设备"。
+    /// 如果每次都用包源覆盖 established.peer，局域网嗅探者伪造一包就能
+    /// 把下行音频劫持走、并把垃圾数据喂进 ASR。
+    #[test]
+    fn packet_from_different_peer_is_dropped() {
+        tokio::runtime::Runtime::new()
+            .expect("测试运行时")
+            .block_on(async move {
+                let handle = start_loopback().await;
+                let mut incoming = handle.incoming();
+                let session_id = 0x0a0b_0c0d;
+                let crypto = test_crypto(session_id);
+                handle
+                    .register_session(session_id, test_crypto(session_id))
+                    .await;
+
+                // 真正的设备端先发一包，锁定对端
+                let genuine = UdpSocket::bind("127.0.0.1:0").await.expect("设备 socket");
+                genuine
+                    .send_to(&seal(&crypto, 60, 1, b"from-device"), handle.local_addr())
+                    .await
+                    .expect("发送合法包");
+                let message = tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+                    .await
+                    .expect("应收到设备包")
+                    .expect("通道关闭");
+                assert_eq!(message.payload, b"from-device");
+
+                // 伪造者用另一个源端口发合法加密包 → 必须被丢弃
+                let attacker = UdpSocket::bind("127.0.0.1:0").await.expect("伪造 socket");
+                attacker
+                    .send_to(
+                        &seal(&crypto, 120, 2, b"from-attacker"),
+                        handle.local_addr(),
+                    )
+                    .await
+                    .expect("发送伪包");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), incoming.recv())
+                        .await
+                        .is_err(),
+                    "异源包不应进入上行通道"
+                );
+
+                // 对端没被覆盖：设备再发包仍应正常收到
+                genuine
+                    .send_to(&seal(&crypto, 180, 3, b"device-again"), handle.local_addr())
+                    .await
+                    .expect("设备再发");
+                let message = tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+                    .await
+                    .expect("设备包应仍能收到")
+                    .expect("通道关闭");
+                assert_eq!(message.payload, b"device-again");
                 handle.shutdown().await;
             });
     }
