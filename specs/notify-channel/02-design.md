@@ -96,6 +96,17 @@ voice = voice_override（CLI --xiaozhi-tts-voice，若有）
 **为什么用 409 而不是 200 + 静默**：调用方是自动化脚本和 agent，
 必须能区分"发了"和"设备不在状态、没发"。
 
+**可选扩展（待定）：排队模式。**
+加一个请求字段 `wait_secs`（如 30）：设备忙时**不立刻拒绝**，
+而是挂起请求，等设备回到 Idle 再下发，超时才返回 409。
+
+- 对 HA 门铃这类"错过了可惜"的事件价值很大（HA 侧零改动）
+- 代价：HTTP 请求占用最长 `wait_secs`，`rest_command` 的 `timeout` 要大于它
+- 需要进程内的等待队列 + 设备状态变化时唤醒
+
+**是否实现由使用方决定。** 不实现的话，HA 侧可以用 `response_variable` +
+`delay` 自己重试（见 HA 指南方案 B）。
+
 ### 4.2 haimen 内部流程
 
 ```
@@ -134,6 +145,8 @@ haimen 已有 9527 HTTP 服务，加两个路由：
 
 ### 4.4 HA 集成（不改代码，纯配置）
 
+**HA 用自带的 `rest_command` + 自动化就能直接调，不需要写自定义集成。**
+
 ```yaml
 # configuration.yaml
 rest_command:
@@ -146,12 +159,15 @@ rest_command:
 ```
 
 ```yaml
-# 自动化里
+# 自动化里（门铃为例）
 action:
   - service: rest_command.xiaozhi_say
     data:
-      message: "洗衣机洗好了，记得晾衣服喔"
+      message: "门铃响了喔，有人在门口等。"
 ```
+
+**完整接法（含门铃/洗衣机/定时/模板化内容/设备忙重试/常见问题）见
+[`HA-集成指南.md`](./HA-集成指南.md)。**
 
 ### 4.5 鉴权
 

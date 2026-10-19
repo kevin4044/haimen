@@ -141,28 +141,34 @@ GET /xiaozhi/say/{id}.ogg
 
 ---
 
-### T3 — 运维文档 + HA 配置样例
+### T3 — 校对 HA 集成指南 + 真机验证
 
-### 目标
+### 背景
 
-让用户能照着配置就把 HA 接上。
+**`specs/notify-channel/HA-集成指南.md` 已由规格作者写好**（含 rest_command、
+四种自动化示例、模板化人话、设备忙的三种处理方案、常见问题）。
+本任务是**校对 + 用真实环境验证**，不是重写。
 
 ### 要做的事
 
-1. 新增 `specs/notify-channel/HA-配置样例.md`，包含：
-   - `rest_command` 完整 yaml
-   - 一个真实自动化示例（如「洗衣机洗好」）
-   - 常见问题：设备回 409 怎么办、播报没反应怎么排查
+1. 通读 `HA-集成指南.md`，逐条核对：
+   - `rest_command` 的 yaml 语法在**当前 HA 版本**上能通过配置校验
+   - 指南里的 IP/端口和实际部署一致（`192.168.50.33:9527`）
+   - `response_variable` 那段要求 HA ≥ 2023.7 —— 确认用户的 HA 版本，
+     不满足就在文档里改成"仅方案 A"
 
-2. 更新 `specs/ops/`（或现有运维文档）一节，说明：
-   - 接口地址与鉴权
-   - 如何用 curl 手测
-   - notify 的三条硬约束（只在 Idle / 无 ACK / 先放提示音）
+2. 在真实环境跑通一次：
+   - 开发者工具 → 服务 → `rest_command.xiaozhi_say` → 设备出声
+   - 记录实际耗时（从调用到出声），写进文档
+
+3. 如果发现指南与实际不符（HA 版本差异、字段名不同），**直接改指南**，
+   在提交信息里写清改了什么、为什么。
 
 ### 完成标准
 
-- 照着文档能用 curl 打通一次真实播报（在真机或模拟器上验证）
-- 文档里的 IP/端口与本机实际一致
+- HA 配置校验通过（开发者工具 → YAML → 检查配置）
+- 真机成功播报一次，耗时写进文档
+- 文档里没有未经核实的断言
 
 ---
 
@@ -176,21 +182,38 @@ GET /xiaozhi/say/{id}.ogg
 
 ---
 
-### T5 —（暂不实现）Hermes MCP 工具
+### T5 —（用户自己配，本仓库不做）Hermes 侧接入
 
 ### 背景
 
-Hermes 当前的工具来自容器 `xiaozhi-mcp:latest` 里的 `/app/home_lights.py`。
-**这份源码不在 haimen 仓库**，容器怎么构建的也不清楚。
+**用户已确认：Hermes 侧可以配一个 skill 或单独写一个 MCP，由用户自行处理。**
+所以本仓库不实现 Hermes 集成，只保证 HTTP 接口可用。
 
-### 三个选项（需用户先定）
+### 给用户的接口信息（写进交付说明）
 
-| 选项 | 做法 | 优点 | 缺点 |
-|---|---|---|---|
-| **A** | 在 `home_lights.py` 加 `notify_xiaozhi` 工具 | 复用现有 MCP 通道，改动最小 | 需要先拿到源码与构建方式 |
-| **B** | haimen 自己起一个 MCP server（`rmcp` 已有 client 依赖，加 server feature） | 全在本仓库、可版本化 | Hermes 的 MCP 注册配置位置未确认 |
-| **C** | 用 Hermes 的 `code_execution` 工具 curl | 零改动 | 依赖该工具可用，且把网络调用塞进执行环境，脆弱 |
+```
+POST http://192.168.50.33:9527/api/v1/xiaozhi/say
+Content-Type: application/json
+{"text": "要说的话"}                 # 只接受文本，音色由 haimen 决定
 
-**推荐 A**（前提是能拿到源码），其次 B。
+→ 200 {"ok":true,"audio_url":"...","duration_ms":4200}
+→ 409 {"ok":false,"error":"device_busy","state":"listening"}
+→ 404 {"ok":false,"error":"device_offline"}
+→ 502 {"ok":false,"error":"tts_failed"}
+```
 
-**本任务在 T1..T4 完成、并确认源码位置之前不要动手。**
+**Hermes 侧只要包一层 —— 不管是 skill 里调 HTTP，还是 MCP 工具里 POST ——
+都只依赖这一个接口。** 不需要 haimen 再做别的事。
+
+### 建议（供用户参考）
+
+如果用 MCP，工具签名建议：
+```python
+@mcp.tool()
+async def notify_xiaozhi(text: str) -> str:
+    """让小智音箱播报一句话。仅设备空闲时生效。
+    用于主动提醒（门铃、定时、设备状态变化），不要用于回答用户问题。"""
+```
+
+**docstring 里写清「仅设备空闲时生效」很重要** —— 否则模型会在对话中用这个工具，
+而对话中 notify 一定被丢弃，用户会觉得「说了没反应」。
