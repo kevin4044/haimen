@@ -110,7 +110,22 @@ const TTS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 
 /// 首个可播文本块的等待上限（与批处理路径 LLM 超时口径一致）。
 /// 超过该时长（模型思考/调用工具过久）则播放超时兜底提示，避免设备静默。
-const TTS_FIRST_TEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 首个文本的超时。超过这个时间还没拿到第一段文字就走兜底文案。
+///
+/// 从 60 秒降到 20 秒：思考反馈在 15 秒就会播「我正在处理，请稍后」，
+/// 再等 45 秒对语音交互没有意义，只会让用户干等。
+const TTS_FIRST_TEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Agent「建立流式连接 + 首字节」的超时。
+///
+/// 为什么单独加：`reqwest::Client::timeout`（haimen-openai/src/agent.rs:375）
+/// 覆盖【整个请求含读完 body】，用它压时间会把长回复的流切断。
+/// 而 `process_stream` 在收到响应头之后就返回，所以在这里加超时
+/// 只约束「连上并拿到首字节」，不影响后续流式输出。
+///
+/// 值取 15 秒：正常情况 0.9 秒就返回，15 秒足够覆盖 Hermes 起 agent 的开销；
+/// 超过 15 秒基本就是上游卡死（实测过 Hermes 的 DeepSeek 流式调用挂住不返回）。
+const AGENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// 聚合文本通道容量（有界，提供背压）
 const TTS_AGG_CHANNEL_CAPACITY: usize = 16;
@@ -1917,19 +1932,47 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
                 agent_mode = true;
                 agent_start = std::time::Instant::now();
-                let (text_stream_inner, new_llm_session_id, events_rx) = match agent_snap
-                    .agent
-                    .process_stream(&user_text, current_llm_session.as_deref(), &self.work_dir)
-                    .await
+                let (text_stream_inner, new_llm_session_id, events_rx) = match tokio::time::timeout(
+                    AGENT_CONNECT_TIMEOUT,
+                    agent_snap.agent.process_stream(
+                        &user_text,
+                        current_llm_session.as_deref(),
+                        &self.work_dir,
+                    ),
+                )
+                .await
                 {
-                    Ok(ok) => ok,
-                    Err(e) => {
+                    Ok(Ok(ok)) => ok,
+                    Ok(Err(e)) => {
                         let msg = format!("AI Agent 流式处理失败: {}", e);
                         self.record_agent_log(
                             &user_text,
                             session_id,
                             None,
                             "error",
+                            Some(&msg),
+                            agent_start.elapsed(),
+                            Vec::new(),
+                        );
+                        return Err(msg);
+                    }
+                    Err(_elapsed) => {
+                        // 上游卡死。打一条固定措辞的 warn，方便用 grep 统计发生频率：
+                        //   docker logs haimen-test | grep -c "Agent 首字节超时"
+                        let msg = format!(
+                            "AI Agent 建立流式连接超时（{}秒）",
+                            AGENT_CONNECT_TIMEOUT.as_secs()
+                        );
+                        tracing::warn!(
+                            session_id = %session_id,
+                            timeout_secs = AGENT_CONNECT_TIMEOUT.as_secs(),
+                            "Agent 首字节超时：上游 LLM 未在限期内返回响应头，放弃本轮"
+                        );
+                        self.record_agent_log(
+                            &user_text,
+                            session_id,
+                            None,
+                            "timeout",
                             Some(&msg),
                             agent_start.elapsed(),
                             Vec::new(),
