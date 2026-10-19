@@ -304,10 +304,17 @@ async fn handle_connection(
                     .fold(0u8, |acc, (a, b)| acc | (a ^ b))
                     == 0
         };
-        let legacy_ok = shared
-            .legacy_password
-            .as_deref()
-            .is_some_and(|legacy| !legacy.is_empty() && matches(legacy));
+        // 迁移期旧密码只对「设备身份」放行，绝不放行管理端。
+        //
+        // 否则知道那个共享静态密码（曾经随 OTA 发给所有设备）的人，
+        // 直接用 client_id = "haimen-admin" 连上来就能发控制主题 ——
+        // 等于用旧密码换到了 HMAC 本应独占的管理权限。
+        let is_device_identity = connect.client_id.starts_with(DEVICE_CLIENT_ID_PREFIX);
+        let legacy_ok = is_device_identity
+            && shared
+                .legacy_password
+                .as_deref()
+                .is_some_and(|legacy| !legacy.is_empty() && matches(legacy));
         let ok = matches(&expected) || legacy_ok;
         if ok && legacy_ok {
             tracing::warn!(
@@ -688,6 +695,12 @@ fn encode_connack(return_code: u8) -> Vec<u8> {
 /// 设备**不允许**发控制主题：否则一台被攻陷的设备就能操纵其它设备。
 /// 这个身份由 broker 的 HMAC 校验背书，伪造需要知道 auth_key。
 pub const ADMIN_CLIENT_ID: &str = "haimen-admin";
+
+/// 设备 client_id 的前缀（OTA 下发的格式：`GID_haimen@@@<mac>@@@<mac>`）。
+///
+/// 迁移期旧密码只对这个前缀的 client_id 生效，防止有人用旧密码
+/// 冒充 [`ADMIN_CLIENT_ID`] 拿到控制面权限。
+pub const DEVICE_CLIENT_ID_PREFIX: &str = "GID_haimen@@@";
 
 /// 由 auth_key 和 client_id 派生 MQTT 密码（hex 的 HMAC-SHA256）。
 ///
@@ -1179,8 +1192,10 @@ mod tests {
         let mut stream = TcpStream::connect(handle.local_addr())
             .await
             .expect("连接 broker");
+        // 必须是设备格式的 client_id —— 迁移期旧密码只对这个前缀放行。
+        let device_id = "GID_haimen@@@dev-1@@@dev-1";
         let body = connect_body(
-            "dev-1".as_bytes(),
+            device_id.as_bytes(),
             60,
             true,
             Some(b"haimen"),
@@ -1190,7 +1205,44 @@ mod tests {
         stream.write_all(&packet).await.expect("写 CONNECT");
         let connack = read_frame(&mut stream).await;
         assert_eq!(connack.body, vec![0x00, 0x00], "迁移期应接受旧密码");
-        wait_for_client(&handle, "dev-1", true).await;
+        wait_for_client(&handle, device_id, true).await;
+    }
+
+    /// 迁移期旧密码**不能**用来冒充管理端。
+    ///
+    /// 否则知道共享静态密码（曾随 OTA 发给所有设备）的人，
+    /// 用 client_id = haimen-admin 连上来就能发控制主题，
+    /// 等于用旧密码换到了 HMAC 本该独占的管理权限。
+    #[tokio::test]
+    async fn auth_grace_rejects_admin_with_legacy_password() {
+        let handle =
+            start_broker_with_auth_and_legacy("k".to_string(), "haimen".to_string()).await;
+        let mut stream = TcpStream::connect(handle.local_addr())
+            .await
+            .expect("连接 broker");
+        let body = connect_body(
+            ADMIN_CLIENT_ID.as_bytes(),
+            60,
+            true,
+            Some(b"haimen"),
+            Some(b"haimen"),
+        );
+        let packet = finish_packet(0x10, &body);
+        stream.write_all(&packet).await.expect("写 CONNECT");
+        let connack = read_frame(&mut stream).await;
+        assert_eq!(
+            connack.body,
+            vec![0x00, 0x04],
+            "迁移期旧密码不应能连成管理端"
+        );
+        assert!(
+            !handle
+                .connected_clients()
+                .await
+                .iter()
+                .any(|id| id == ADMIN_CLIENT_ID),
+            "被拒的管理端连接不能进在线列表"
+        );
     }
 
     #[test]
