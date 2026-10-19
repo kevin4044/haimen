@@ -153,6 +153,25 @@ pub async fn start(
         .parse()
         .map_err(|e| format!("无效的监听地址: {}", e))?;
 
+    // 一次性通知音频的 TTL 兜底清理：设备不在 Idle 时 notify 被静默丢弃、
+    // 不会来拉，没人取的条目会一直占内存。30s 扫一次足够（音频 TTL 是分钟级）。
+    // 挂 cancel 令牌是为了跟 HTTP 服务一起退出，不留孤儿任务。
+    {
+        let store = haimen_xiaozhi::say_audio_store();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            // interval 第一次立即触发，跳过一次，避免启动时做无用功。
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => store.sweep(),
+                    _ = cancel.cancelled() => break,
+                }
+            }
+        });
+    }
+
     tracing::info!("Web 服务器启动于 http://{addr}");
 
     // 打印 Web UI 地址（始终可见，不受日志级别影响）
