@@ -542,7 +542,7 @@ async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
             // 不断开 MQTT。设备会在同一条连接上再发 hello。
             let playing =
                 session_state(shared, &msg.client_id).await == Some(SessionState::Playing);
-            release_udp(shared, &msg.client_id).await;
+            release_udp(shared, &msg.client_id, "goodbye").await;
             if playing {
                 let _ = publish_tts(shared, &msg.client_id, TtsState::Stop, None).await;
             }
@@ -750,7 +750,7 @@ async fn handle_abort(shared: &Arc<Shared>, client_id: &str) {
         }
         Some(SessionState::Playing) | Some(SessionState::Ready) => {
             // 播放中或空闲时的 abort 只结束这一轮，MQTT 连接留给设备复用。
-            release_udp(shared, client_id).await;
+            release_udp(shared, client_id, "abort").await;
             if state == Some(SessionState::Playing) {
                 let _ = publish_tts(shared, client_id, TtsState::Stop, None).await;
             }
@@ -871,12 +871,14 @@ async fn prune_sessions(shared: &Shared) {
         }
     }
     for client_id in gone {
-        tracing::info!(%client_id, "MQTT 连接已断开，清理会话");
+        // 整份会话都删掉（含 UDP 密钥）—— 如果这行出现得莫名其妙，
+        // 说明 broker 的 connected_clients 把还在线的设备误判成断开了。
+        tracing::warn!(%client_id, "MQTT 连接已断开，清理会话与 UDP 密钥");
         drop_client(shared, &client_id).await;
     }
     for client_id in idle {
         tracing::info!(%client_id, "长时间没有消息，注销 UDP 会话");
-        release_udp(shared, &client_id).await;
+        release_udp(shared, &client_id, "idle-timeout").await;
     }
 }
 
@@ -1113,7 +1115,12 @@ async fn finish_ready(shared: &Shared, job: &PlaybackJob) {
 }
 
 /// 注销 UDP 密钥并回到 Ready，但不把 MQTT 会话删掉。
-async fn release_udp(shared: &Shared, client_id: &str) {
+///
+/// `reason` 只用于日志：排查「主动播报时报没有 UDP 会话」时，
+/// 需要知道是谁把会话注销掉的（goodbye / abort / 空闲清理）。
+/// 本项目的 INFO 会被日志过滤，所以这里必须用 warn。
+async fn release_udp(shared: &Shared, client_id: &str, reason: &str) {
+    tracing::warn!(%client_id, reason, "注销 UDP 会话");
     let udp_id = {
         let mut tables = shared.tables.lock().await;
         let Some(session) = tables.sessions.get_mut(client_id) else {

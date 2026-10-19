@@ -335,3 +335,32 @@ esptool.py --chip esp32s3 -p <port> -b 460800 write_flash 0x0 merged-binary.bin
 2. 内置 TTS：文本 → Ogg Opus（需 Ogg 容器封装；`opus2` 只能编 Opus 包）
 3. HTTP API：`POST /api/v1/xiaozhi/notify {"text": "...", "then_listen": false}`
 4. 之后 HA 自动化可直接调用
+
+---
+
+## 待调研：官方自定义 UI / 生成 assets 固件
+
+**状态**：已知入口，暂不深究（2026-10-19 记录）
+
+用户提及官网有「自定义界面」的地方，可以生成 asset 固件。
+
+**为什么重要**：`hide_subtitle`（是否隐藏底部对话字幕）**只从 assets 的
+主题配置读取**，代码里没有任何运行时开关，也没有 MCP 工具：
+
+```cpp
+// main/assets.cc:428-433
+cJSON* hide_subtitle = cJSON_GetObjectItem(root.get(), "hide_subtitle");
+if (cJSON_IsBool(hide_subtitle)) {
+    display->SetHideSubtitle(cJSON_IsTrue(hide_subtitle));
+}
+```
+
+而 2.5.x 的默认显示风格把对话文字从「中部气泡区（保留多轮）」
+改成了「底部单行字幕」（`bottom_bar_` + `chat_message_label_`），
+且只在 `CONFIG_USE_WECHAT_MESSAGE_STYLE` 下才是气泡 UI。
+
+**如果以后要改 UI / 显示文字**，三条路径：
+1. 官方自定义 UI 生成 assets（用户提到的入口，待调研）
+2. 自己编译固件，加 `CONFIG_USE_WECHAT_MESSAGE_STYLE=y`
+   （恢复气泡 UI）或 `CONFIG_USE_MULTILINE_CHAT_MESSAGE=y`（底部多行）
+3. 用 MCP `self.assets.set_download_url` 让设备下载自定义 assets
