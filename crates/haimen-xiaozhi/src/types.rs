@@ -236,6 +236,16 @@ pub struct XiaozhiConfig {
     pub mqtt: XiaozhiMqttConfig,
     #[serde(default)]
     pub udp: XiaozhiUdpConfig,
+    /// OTA 端点是否只接受私有网络（局域网/回环）来源，默认 true。
+    ///
+    /// 为什么必须限制：`/xiaozhi/ota/` 无法真正鉴权 —— 固件没有预共享密钥，
+    /// `Device-Id` 只是自报的 MAC。而 MQTT 模式下这个端点会直接返回
+    /// `HMAC(auth_key, client_id)` 派生的连接密码。
+    /// 也就是说：谁能访问这个 HTTP 端口，谁就能给任意 MAC 铸出合法密码、
+    /// 顶掉真设备、拿到 UDP hello 的 key/nonce。HMAC 的安全性实际取决于
+    /// 这个端点的可达范围。
+    #[serde(default = "default_ota_allow_private_only")]
+    pub ota_allow_private_only: bool,
 }
 
 impl Default for XiaozhiConfig {
@@ -244,6 +254,7 @@ impl Default for XiaozhiConfig {
             protocol: XiaozhiProtocol::Websocket,
             mqtt: XiaozhiMqttConfig::default(),
             udp: XiaozhiUdpConfig::default(),
+            ota_allow_private_only: true,
         }
     }
 }
@@ -277,6 +288,10 @@ pub struct XiaozhiMqttConfig {
     pub publish_topic_template: String,
     #[serde(default = "default_downlink_topic")]
     pub downlink_topic_template: String,
+}
+
+const fn default_ota_allow_private_only() -> bool {
+    true
 }
 
 const fn default_keepalive() -> u32 {

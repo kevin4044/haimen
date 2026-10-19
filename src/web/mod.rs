@@ -179,10 +179,14 @@ pub async fn start(
     // 优雅关闭：优先等待共享取消令牌，同时也响应 SIGINT/SIGTERM
     let graceful = graceful_shutdown(cancel);
 
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(graceful)
-        .await
-        .map_err(|e| format!("服务器错误: {}", e))
+    // 必须带 connect info：OTA handler 要按对端 IP 做来源校验。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(graceful)
+    .await
+    .map_err(|e| format!("服务器错误: {}", e))
 }
 
 /// 组合信号 + CancellationToken 的优雅关闭 Future

@@ -1,8 +1,10 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::net::{IpAddr, SocketAddr};
+
 use axum::{
-    extract::Json,
+    extract::{ConnectInfo, Json},
     http::{HeaderMap, StatusCode},
 };
 use chrono::Local;
@@ -14,9 +16,24 @@ use crate::types::*;
 /// 从请求头中提取 Device-Id，按当前小智配置下发 WebSocket 或 MQTT 段，
 /// 并带上服务器时间、固件信息和音频参数。
 pub async fn handle_ota(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<OtaRequest>,
 ) -> Result<Json<OtaResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // 来源校验必须在派生密码之前：MQTT 模式下这个响应里带着设备的
+    // 连接密码，谁能访问这个端点，谁就能冒充任意设备。
+    if !ota_peer_allowed(peer.ip(), current_xiaozhi_config().ota_allow_private_only) {
+        tracing::warn!(
+          %peer,
+          "OTA 请求来自非私有网络地址，拒绝（可配置 [xiaozhi] ota_allow_private_only 关闭该限制）"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "OTA 端点仅允许私有网络访问"
+            })),
+        ));
+    }
     // 记录设备自报的固件与板子信息。
     // 用于排查「某个功能设备没反应」——比如 notify 需要较新固件，
     // 而设备自报的 version 能直接看出它跑的是哪一版。
@@ -79,6 +96,20 @@ pub fn set_xiaozhi_ota_config(cfg: XiaozhiConfig) {
 fn ota_config_slot() -> &'static Mutex<XiaozhiConfig> {
     static SLOT: OnceLock<Mutex<XiaozhiConfig>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(XiaozhiConfig::default()))
+}
+
+/// OTA 端点是否接受来自 `peer` 的请求。
+///
+/// `private_only` 为 true 时只放行回环、私有网段与链路本地地址。
+/// 这样即使 9527 端口被误暴露到公网，也无法用它铸造 MQTT 密码。
+fn ota_peer_allowed(peer: IpAddr, private_only: bool) -> bool {
+    if !private_only {
+        return true;
+    }
+    match peer {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
 }
 
 fn current_xiaozhi_config() -> XiaozhiConfig {
@@ -222,7 +253,9 @@ fn build_ws_url(headers: &HeaderMap) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::ConnectInfo;
     use axum::http::HeaderValue;
+    use std::net::SocketAddr;
 
     /// 串行化会改全局 OTA 配置的测试，避免和默认 websocket 用例交错。
     fn ota_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -241,6 +274,45 @@ mod tests {
     }
 
     /// 构建一个包含 Device-Id 头的最小请求
+    /// OTA handler 现在要求 ConnectInfo；测试里统一用回环地址。
+    /// OTA 来源策略：默认只放行私有/回环地址。
+    #[test]
+    fn ota_peer_policy_allows_private_only() {
+        use std::net::IpAddr;
+        let private: IpAddr = "192.168.1.10".parse().expect("ip");
+        let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+        let public: IpAddr = "8.8.8.8".parse().expect("ip");
+        let public_v6: IpAddr = "2001:4860:4860::8888".parse().expect("ip");
+
+        assert!(ota_peer_allowed(private, true));
+        assert!(ota_peer_allowed(loopback, true));
+        assert!(!ota_peer_allowed(public, true));
+        assert!(!ota_peer_allowed(public_v6, true));
+
+        // 关闭限制时一律放行
+        assert!(ota_peer_allowed(public, false));
+        assert!(ota_peer_allowed(public_v6, false));
+    }
+
+    /// 公网来源的 OTA 请求必须被拒 —— 否则它能拿到派生 MQTT 密码。
+    #[tokio::test]
+    async fn ota_rejects_public_peer() {
+        let _lock = ota_test_lock();
+        let peer = ConnectInfo(SocketAddr::from(([8, 8, 8, 8], 1234)));
+        let result = handle_ota(
+            peer,
+            make_headers(),
+            Json(sample_request("84:c7:bb:59:93:64")),
+        )
+        .await;
+        let (status, _) = result.expect_err("公网来源应被拒绝");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    fn test_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0)))
+    }
+
     fn make_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("device-id", HeaderValue::from_static("AA:BB:CC:DD:EE:FF"));
@@ -290,7 +362,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(headers, Json(body)).await;
+        let result = handle_ota(test_peer(), headers, Json(body)).await;
         assert!(result.is_err());
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -312,7 +384,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(headers, Json(body)).await;
+        let result = handle_ota(test_peer(), headers, Json(body)).await;
         assert!(result.is_ok());
 
         let response = result.unwrap().0;
@@ -342,7 +414,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(headers, Json(body)).await;
+        let result = handle_ota(test_peer(), headers, Json(body)).await;
         assert!(result.is_ok());
 
         let response = result.unwrap().0;
@@ -372,7 +444,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(headers, Json(body)).await;
+        let result = handle_ota(test_peer(), headers, Json(body)).await;
         assert!(result.is_ok());
 
         let response = result.unwrap().0;
@@ -398,7 +470,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(headers, Json(body)).await;
+        let result = handle_ota(test_peer(), headers, Json(body)).await;
         assert!(result.is_ok());
 
         let response = result.unwrap().0;
@@ -415,10 +487,14 @@ mod tests {
         let _restore = RestoreDefaultConfig;
         set_xiaozhi_ota_config(XiaozhiConfig::default());
 
-        let response = handle_ota(make_headers(), Json(sample_request("84:c7:bb:59:93:64")))
-            .await
-            .expect("ota")
-            .0;
+        let response = handle_ota(
+            test_peer(),
+            make_headers(),
+            Json(sample_request("84:c7:bb:59:93:64")),
+        )
+        .await
+        .expect("ota")
+        .0;
         assert!(response.websocket.is_some());
         assert!(response.mqtt.is_none());
     }
@@ -429,10 +505,14 @@ mod tests {
         let _restore = RestoreDefaultConfig;
         set_xiaozhi_ota_config(mqtt_config("192.168.110.35:1883"));
 
-        let response = handle_ota(make_headers(), Json(sample_request("84:c7:bb:59:93:64")))
-            .await
-            .expect("ota")
-            .0;
+        let response = handle_ota(
+            test_peer(),
+            make_headers(),
+            Json(sample_request("84:c7:bb:59:93:64")),
+        )
+        .await
+        .expect("ota")
+        .0;
         let mqtt = response.mqtt.expect("mqtt");
         assert!(response.websocket.is_none());
         assert_eq!(mqtt.endpoint, "192.168.110.35:1883");
