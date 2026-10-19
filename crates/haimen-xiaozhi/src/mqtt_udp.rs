@@ -211,6 +211,12 @@ impl DeviceSession {
         self.recording_deadline = None;
         self.next_send_at = None;
         self.last_activity = Instant::now();
+        // 收口计时也要重置。
+        //
+        // 打断是「这一轮结束、设备马上要接着说话」，不是「会话结束」。
+        // 不刷新的话 prune_sessions 会拿 hello 时刻的 last_speech_at 去比，
+        // 15 秒后把设备正要复用的通道 goodbye 掉。hello 有同样的处理。
+        self.last_speech_at = Instant::now();
     }
 }
 
