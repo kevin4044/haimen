@@ -76,6 +76,9 @@ class MqttLink:
     # ── 生命周期 ──────────────────────────────────────────────
 
     def connect(self, timeout: float = 10.0) -> None:
+        # 清掉上一次的失败状态：同一个 MqttLink 可能被重试多次，
+        # 残留的 _connect_error 会让这次成功的握手也抛 ConnectionRefusedError。
+        self._connect_error = None
         c = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=self.client_id,
@@ -202,6 +205,7 @@ class MqttLink:
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
         rc = getattr(reason_code, "value", reason_code)
         if rc == 0:
+            self._connect_error = None
             with self._lock:
                 topics = list(self._subscribed.items())
             for topic, qos in topics:
