@@ -163,6 +163,17 @@ impl MqttBrokerHandle {
         if cfg.max_packet_size == 0 {
             return Err(protocol("max_packet_size 必须大于 0"));
         }
+        // 启动即告知鉴权状态：不开鉴权时 broker 仍绑在 0.0.0.0，
+        // 能连到这个端口的人就能冒充任意 client_id、顶掉真设备、
+        // 并（在控制主题无 ACL 的情况下）向设备注入指令。
+        // 这条必须用 warn，否则默认配置下没人会注意到。
+        if cfg.auth_key.is_none() {
+            tracing::warn!(
+              bind_addr = %cfg.bind_addr,
+              "MQTT broker 未启用鉴权（auth_key 为空）：任何能连到该端口的客户端\
+               都可以冒充设备 client_id。仅建议在完全可信的隔离网络中这样跑。"
+            );
+        }
         let listener = TcpListener::bind(&cfg.bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_QUEUE);
