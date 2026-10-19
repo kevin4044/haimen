@@ -158,9 +158,14 @@ struct DeviceSession {
     downlink_ts: u32,
     recording_deadline: Option<TokioInstant>,
     last_activity: Instant,
-    /// 最近一次「一轮对话结束」的时刻（回复播完 / 主动播报播完）。
-    /// 不能用 last_activity 判断收口：设备在 Listening 时会不停推音频，
-    /// last_activity 永远在刷新，永远等不到超时。
+    /// 最近一次真正给设备下发音频的时刻。
+    ///
+    /// 收口超时以它为基准，而不是 last_activity 或 finish_ready：
+    /// - 设备在 Listening 时会不停推音频，`last_activity` 永远在刷新
+    /// - 环境噪音会让 VAD 反复触发「生成回复」，`finish_ready` 也一直在刷新
+    ///   （实测 ASR 返回空文本时仍会走完一轮）
+    ///
+    /// 只有真正播放了音频，才说明这一轮对话有内容。
     last_speech_at: Instant,
     /// 每开一轮回放加一。旧回放任务靠它知道自己已经被替换。
     playback_gen: u64,
@@ -476,7 +481,7 @@ async fn say_raw_frames(shared: &Arc<Shared>, client_id: &str, frames: Vec<Vec<u
         "主动播报：已发送 tts stop，非手动模式下设备会自动进入聆听"
     );
 
-    // 主动播报也算一轮对话结束：设备进 Listening 后等用户回答，
+    // 主动播报结束后重置收口计时：设备进 Listening 等用户回答，
     // 超过 IDLE_CLOSE_LIMIT 没回应就由收口逻辑发 goodbye 回到待命。
     {
         let mut tables = shared.tables.lock().await;
@@ -1123,6 +1128,8 @@ async fn send_downlink_frame(shared: &Shared, job: &PlaybackJob, payload: &[u8])
             return false;
         };
         let timestamp = alloc_downlink_ts(session, step);
+        // 真正往外发音频了，收口计时从这里重置。
+        session.last_speech_at = Instant::now();
         (udp_id, timestamp)
     };
     match shared.udp.send_audio(udp_id, timestamp, payload).await {
@@ -1160,8 +1167,6 @@ async fn finish_ready(shared: &Shared, job: &PlaybackJob) {
         }
         session.recording_deadline = None;
         session.last_activity = Instant::now();
-        // 一轮对话到此结束，开始计收口超时。
-        session.last_speech_at = Instant::now();
     }
 
     // 用户说了告别语：回复已经播完，立刻收口让设备回待命。
