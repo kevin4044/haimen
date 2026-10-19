@@ -497,8 +497,10 @@ struct AsrPipelineState {
     frame_samples: usize,
     /// 诊断：已接收并处理的音频帧数（每帧 60ms）
     frame_count: u64,
-    /// 上一帧的 VAD 判定。只在翻转时打日志，避免周期性刷屏。
+    /// 已确认的 VAD 判定（去抖后的）。只在它翻转时打日志。
     last_vad_voice: bool,
+    /// 朝向相反判定的连续帧数，达到 VAD_FLIP_CONFIRM_FRAMES 才确认翻转。
+    vad_flip_run: u8,
     /// 是否检测到过有效语音（初始静音不计入 no_speech_frames）
     speech_detected: bool,
     /// 无语音超时：录音开始后累计的初始静音帧数（60ms/帧，speech_detected 前才累计），
@@ -613,6 +615,13 @@ const VAD_SAMPLE_RATE: u32 = 16_000;
 /// speech_detected / 静音计数疯狂跳变。迟滞是参考实现（silero.py:88-97）的做法。
 const VAD_PROB_HIGH: f32 = 0.5;
 const VAD_PROB_LOW: f32 = 0.3;
+
+/// 判定翻转的去抖帧数：连续这么多帧都在新状态才确认并打日志。
+///
+/// 为什么需要：Silero 在语音起始/结束的过渡带会给出 0.3~0.6 的抖动值，
+/// 逐帧打日志的话 200ms 内能刷出 5 条，反而更难读。
+/// 3 帧 = 180ms，足够过滤过渡带抖动，又不至于吃掉真正的短停顿。
+const VAD_FLIP_CONFIRM_FRAMES: u8 = 3;
 
 /// 会话级的 Silero VAD 封装。
 ///
@@ -1543,6 +1552,7 @@ impl AsrLlmTtsStrategy {
             frame_samples,
             frame_count: 0,
             last_vad_voice: false,
+            vad_flip_run: 0,
             speech_detected: false,
             no_speech_frames: 0,
         };
@@ -1861,18 +1871,24 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 ),
             };
 
-            // 只在判定翻转时打日志。
+            // 只在判定【确认翻转】时打日志，且先过 VAD_FLIP_CONFIRM_FRAMES 去抖。
             //
             // 之前是每 50 帧（3 秒）打一行 RMS/直流/静音计数，一次长对话能刷几十行；
-            // 而且判据换成 Silero 之后那行还写着「阈值=3000」，纯误导。
-            // 真正有用的是「什么时候开始说话、什么时候停」这两个时刻 —— 有界且可读。
+            // 换成翻转日志后又发现过渡带会逐帧抖（170ms 内 5 条）。所以：
+            // 单帧不算数，连续 3 帧都指向新状态才确认 —— 这才是有界且可读的。
             if is_voice != state.last_vad_voice {
-                state.last_vad_voice = is_voice;
-                tracing::warn!(
-                    "VAD → {}（{vad_desc}，第 {} 帧）",
-                    if is_voice { "人声" } else { "静音" },
-                    state.frame_count,
-                );
+                state.vad_flip_run = state.vad_flip_run.saturating_add(1);
+                if state.vad_flip_run >= VAD_FLIP_CONFIRM_FRAMES {
+                    state.vad_flip_run = 0;
+                    state.last_vad_voice = is_voice;
+                    tracing::warn!(
+                        "VAD → {}（{vad_desc}，第 {} 帧）",
+                        if is_voice { "人声" } else { "静音" },
+                        state.frame_count,
+                    );
+                }
+            } else {
+                state.vad_flip_run = 0;
             }
 
             if is_voice {
@@ -4781,6 +4797,7 @@ mod tests {
             frame_samples: 960,
             frame_count: 0,
             last_vad_voice: false,
+            vad_flip_run: 0,
             speech_detected: false,
             no_speech_frames: 0,
         };
