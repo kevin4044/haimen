@@ -196,14 +196,25 @@ impl AgentProvider for OpenAIAgent {
             return Err("消息为空，无法调用 OpenAI".to_string());
         }
         let (sid, messages, turn_id) = self.prepare_turn(message, session_id)?;
-        let response = self.post_chat(&messages, false).await?;
-        let body = response.text().await.map_err(|e| {
-            format!(
-                "读取 OpenAI 响应失败: {}",
-                redact(&e.to_string(), self.api_key.as_deref())
-            )
-        })?;
-        let text = extract_message_content(&body)?;
+        let outcome: Result<String, String> = async {
+            let response = self.post_chat(&messages, false).await?;
+            let body = response.text().await.map_err(|e| {
+                format!(
+                    "读取 OpenAI 响应失败: {}",
+                    redact(&e.to_string(), self.api_key.as_deref())
+                )
+            })?;
+            extract_message_content(&body)
+        }
+        .await;
+        let text = match outcome {
+            Ok(text) => text,
+            Err(err) => {
+                // 失败就地撤回 user 消息，别把孤立的一轮留在上下文里。
+                drop_turn(&self.history, &sid, turn_id);
+                return Err(err);
+            }
+        };
         commit_assistant(&self.history, &sid, self.history_cap, turn_id, &text)?;
         Ok((
             AgentOutput {
@@ -225,7 +236,13 @@ impl AgentProvider for OpenAIAgent {
             return Err("消息为空，无法调用 OpenAI".to_string());
         }
         let (sid, messages, turn_id) = self.prepare_turn(message, session_id)?;
-        let response = self.post_chat(&messages, true).await?;
+        let response = match self.post_chat(&messages, true).await {
+            Ok(response) => response,
+            Err(err) => {
+                drop_turn(&self.history, &sid, turn_id);
+                return Err(err);
+            }
+        };
         let (text_tx, text_rx) = mpsc::channel::<String>(32);
         spawn_sse_reader(
             response,
@@ -456,7 +473,22 @@ fn extract_message_content(body: &str) -> Result<String, String> {
     Ok(content.to_string())
 }
 
-/// 把 assistant 插到对应 in-flight user 之后；空回复或 cap=0 时不写入
+/// 撤回本轮已写入的 user 消息。
+///
+/// 调用失败、或流式结束但一个字都没拿到时用：否则历史里会留一条
+/// 没有回答的孤立 user 消息，下一轮请求会把它当上下文发出去。
+fn drop_turn(history: &Mutex<HashMap<String, VecDeque<ChatMessage>>>, sid: &str, turn_id: u64) {
+    if let Ok(mut guard) = history.lock() {
+        if let Some(queue) = guard.get_mut(sid) {
+            queue.retain(|m| m.turn_id != turn_id);
+            if queue.is_empty() {
+                guard.remove(sid);
+            }
+        }
+    }
+}
+
+/// 把 assistant 插到对应 in-flight user 之后；空回复时撤回 user，cap=0 时不写入
 fn commit_assistant(
     history: &Mutex<HashMap<String, VecDeque<ChatMessage>>>,
     sid: &str,
@@ -464,7 +496,13 @@ fn commit_assistant(
     turn_id: u64,
     assistant: &str,
 ) -> Result<(), String> {
-    if cap == 0 || assistant.is_empty() {
+    if assistant.is_empty() {
+        // 没有 assistant 回答，这条 user 消息就是孤立的。
+        // 留在历史里会被下一轮当成上下文发出去，污染对话（模型会"回答"旧问题）。
+        drop_turn(history, sid, turn_id);
+        return Ok(());
+    }
+    if cap == 0 {
         return Ok(());
     }
     let mut guard = history
@@ -615,6 +653,53 @@ mod tests {
         assert_eq!(queue.len(), 20);
         assert_eq!(queue.front().expect("队列非空").content, "5");
         assert_eq!(queue.back().expect("队列非空").content, "24");
+    }
+
+    /// 调用失败时本轮写入的 user 消息必须撤回，否则会变成孤立轮次污染后续上下文。
+    #[test]
+    fn test_drop_turn_removes_unanswered_user() {
+        let agent = OpenAIAgent::new("http://127.0.0.1:1", None, "m", 0);
+        let (sid, _, turn_a) = agent
+            .prepare_turn("第一句", Some("sess"))
+            .expect("prepare 应成功");
+        assert_eq!(
+            agent
+                .history
+                .lock()
+                .expect("锁")
+                .get(&sid)
+                .map(VecDeque::len),
+            Some(1)
+        );
+
+        // 模拟调用失败
+        drop_turn(&agent.history, &sid, turn_a);
+        assert!(
+            agent.history.lock().expect("锁").get(&sid).is_none(),
+            "唯一一条消息被撤回后，该会话不应留下空队列"
+        );
+
+        // 失败后下一轮上下文应该干净
+        let (_, messages, _) = agent
+            .prepare_turn("第二句", Some("sess"))
+            .expect("prepare 应成功");
+        assert_eq!(messages.len(), 1, "不应带上失败的上一轮");
+        assert_eq!(messages[0].content, "第二句");
+    }
+
+    /// 流式结束但一个字都没拿到时，同样要撤回 user 消息。
+    #[test]
+    fn test_empty_assistant_rolls_back_user() {
+        let agent = OpenAIAgent::new("http://127.0.0.1:1", None, "m", 0);
+        let (sid, _, turn_id) = agent
+            .prepare_turn("会被撤回", Some("sess"))
+            .expect("prepare 应成功");
+        commit_assistant(&agent.history, &sid, DEFAULT_HISTORY_CAP, turn_id, "")
+            .expect("空回复不应报错");
+        assert!(
+            agent.history.lock().expect("锁").get(&sid).is_none(),
+            "空回复应撤回 user 消息"
+        );
     }
 
     #[test]
