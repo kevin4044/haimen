@@ -370,7 +370,7 @@ async fn enter_recording(session: &mut Session) {
     if session.strategy.supports_streaming_asr() {
         if let Err(e) = session
             .strategy
-            .on_recording_start(&session.session_id)
+            .on_recording_start(&session.session_id, &session.session_id)
             .await
         {
             tracing::warn!(

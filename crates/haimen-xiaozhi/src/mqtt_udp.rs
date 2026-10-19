@@ -784,7 +784,11 @@ async fn enter_recording(shared: &Arc<Shared>, client_id: &str) {
         tracing::debug!(client_id = %session.client_id, "进入录音");
         session.protocol_session_id.clone()
     };
-    if let Err(err) = shared.strategy.on_recording_start(&session_id).await {
+    if let Err(err) = shared
+        .strategy
+        .on_recording_start(client_id, &session_id)
+        .await
+    {
         tracing::warn!(%client_id, %err, "on_recording_start 失败，继续收录音");
     }
 }
@@ -1680,7 +1684,11 @@ mod tests {
             Ok(inner.playback.clone())
         }
 
-        async fn on_recording_start(&self, session_id: &str) -> Result<(), String> {
+        async fn on_recording_start(
+            &self,
+            _session_key: &str,
+            session_id: &str,
+        ) -> Result<(), String> {
             self.lock().recording_starts.push(session_id.to_owned());
             Ok(())
         }

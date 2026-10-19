@@ -1619,7 +1619,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
     /// ASR 管道不会在此处创建，而是延迟到 `on_audio_frame` 收到第一帧音频时
     /// 通过 `init_asr_pipeline` 惰性初始化。这样可以避免在用户尚未说话时
     /// 建立 ASR 连接导致服务端对空音频返回误判的 VAD 端点。
-    async fn on_recording_start(&self, session_id: &str) -> Result<(), String> {
+    async fn on_recording_start(&self, _session_key: &str, session_id: &str) -> Result<(), String> {
         // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
         // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
         tracing::warn!(

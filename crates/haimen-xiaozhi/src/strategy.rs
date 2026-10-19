@@ -97,7 +97,11 @@ pub trait ResponseStrategy: Send + Sync {
     ///
     /// 流式策略应在此方法中启动 ASR WebSocket 管道。
     /// 默认实现为 no-op。
-    async fn on_recording_start(&self, _session_id: &str) -> Result<(), String> {
+    async fn on_recording_start(
+        &self,
+        _session_key: &str,
+        _session_id: &str,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -380,7 +384,9 @@ mod tests {
     #[tokio::test]
     async fn test_t11_on_recording_start_noop() {
         let strategy = EchoStrategy;
-        let result = strategy.on_recording_start("test-session").await;
+        let result = strategy
+            .on_recording_start("test-key", "test-session")
+            .await;
         assert!(result.is_ok(), "默认 on_recording_start 应为 Ok(())");
     }
 
@@ -398,7 +404,9 @@ mod tests {
         let strategy: Arc<dyn ResponseStrategy> = Arc::new(EchoStrategy);
         assert!(!strategy.supports_streaming_asr());
 
-        let result = strategy.on_recording_start("test-session").await;
+        let result = strategy
+            .on_recording_start("test-key", "test-session")
+            .await;
         assert!(result.is_ok());
 
         let frame = make_frame(0, &[0x01]);
