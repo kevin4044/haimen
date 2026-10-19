@@ -199,6 +199,19 @@ impl DeviceSession {
             cancel_tx: None,
         }
     }
+
+    /// 停掉当前回放并回到 Ready。UDP 密钥和对端地址留着。
+    fn end_round(&mut self) {
+        self.playback_gen = self.playback_gen.wrapping_add(1);
+        if let Some(tx) = &self.cancel_tx {
+            let _ = tx.send(true);
+        }
+        self.state = SessionState::Ready;
+        self.audio_buffer.clear();
+        self.recording_deadline = None;
+        self.next_send_at = None;
+        self.last_activity = Instant::now();
+    }
 }
 
 struct Tables {
@@ -836,8 +849,15 @@ async fn handle_abort(shared: &Arc<Shared>, client_id: &str) {
             tracing::warn!(%client_id, "还没 hello 就收到 abort，忽略");
         }
         Some(SessionState::Playing) | Some(SessionState::Ready) => {
-            // 播放中或空闲时的 abort 只结束这一轮，MQTT 连接留给设备复用。
-            release_udp(shared, client_id, "abort").await;
+            // 打断只结束这一轮。小智接着发 listen start，并继续用同一条 UDP 通道。
+            // 密钥和对端地址必须留着：注销之后上行会被当成未知会话丢掉，
+            // 下一轮回复也发不出去，直到设备再发一次 hello。
+            {
+                let mut tables = shared.tables.lock().await;
+                if let Some(session) = tables.sessions.get_mut(client_id) {
+                    session.end_round();
+                }
+            }
             if state == Some(SessionState::Playing) {
                 let _ = publish_tts(shared, client_id, TtsState::Stop, None).await;
             }
@@ -1265,7 +1285,8 @@ async fn finish_ready(shared: &Shared, job: &PlaybackJob) {
 /// 注销 UDP 密钥并回到 Ready，但不把 MQTT 会话删掉。
 ///
 /// `reason` 只用于日志：排查「主动播报时报没有 UDP 会话」时，
-/// 需要知道是谁把会话注销掉的（goodbye / abort / 空闲清理）。
+/// 需要知道是谁把会话注销掉的（goodbye / 空闲清理）。
+/// 打断不能走这里：设备会留着同一条音频通道继续说话。
 /// 本项目的 INFO 会被日志过滤，所以这里必须用 warn。
 async fn release_udp(shared: &Shared, client_id: &str, reason: &str) {
     tracing::warn!(%client_id, reason, "注销 UDP 会话");
@@ -1274,15 +1295,7 @@ async fn release_udp(shared: &Shared, client_id: &str, reason: &str) {
         let Some(session) = tables.sessions.get_mut(client_id) else {
             return;
         };
-        session.playback_gen = session.playback_gen.wrapping_add(1);
-        if let Some(tx) = &session.cancel_tx {
-            let _ = tx.send(true);
-        }
-        session.state = SessionState::Ready;
-        session.audio_buffer.clear();
-        session.recording_deadline = None;
-        session.next_send_at = None;
-        session.last_activity = Instant::now();
+        session.end_round();
         let udp_id = session.udp_session_id.take();
         if let Some(id) = udp_id {
             tables.udp_index.remove(&id);
@@ -2214,6 +2227,130 @@ mod tests {
         send_uplink(&env, &crypto, 11, 2, b"stale").await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(env.mock.lock().audio_frames.len(), 1);
+        env.shutdown().await;
+    }
+
+    /// 把已经进 socket 的下行清掉。安静 `quiet` 还没新包就停。
+    async fn drain_udp(env: &Env, quiet: Duration) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut buf = [0u8; 2048];
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "打断后下行还在响，回放没有停"
+            );
+            match tokio::time::timeout(quiet, env.udp.recv_from(&mut buf)).await {
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_keeps_udp_session_for_barge_in() {
+        // 帧数够多，看到 tts start 时回放还在 Playing。
+        let playback: Vec<AudioFrame> = (0..12u8)
+            .map(|index| AudioFrame {
+                timestamp: 0,
+                data: vec![0xB0 + index],
+            })
+            .collect();
+        let mut env = Env::boot(playback).await;
+        let hello = env.hello().await;
+        let crypto = crypto_from_hello(&hello);
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().recording_starts.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 10, 1, b"first").await;
+        wait_frames(&env.mock, 1).await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+        let tts = env.link.wait_type("tts", Duration::from_secs(2)).await;
+        assert_eq!(tts["state"], "start");
+
+        // Playing 中打断。设备接着 listen start，并继续用同一把 UDP 密钥。
+        env.link
+            .publish("device-server", br#"{"type":"abort"}"#)
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(env.mock.lock().generate_calls, 1);
+        drain_udp(&env, Duration::from_millis(200)).await;
+
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if env.mock.lock().recording_starts.len() >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "打断后的 listen start 没有生效"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 20, 2, b"barge").await;
+        wait_frames(&env.mock, 2).await;
+        assert_eq!(env.mock.lock().audio_frames[1].data, b"barge");
+
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+        let down = collect_downlink(&env, &crypto, 1).await;
+        assert_eq!(down[0].payload, vec![0xB0]);
+        assert_eq!(env.mock.lock().generate_calls, 2);
+
+        // 打断时发过一次 tts stop，要等第二轮自己的 start 之后的 stop，才是 Ready。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut saw_start = false;
+        loop {
+            let tts = env.link.wait_type("tts", Duration::from_secs(2)).await;
+            match tts["state"].as_str() {
+                Some("start") => saw_start = true,
+                Some("stop") if saw_start => break,
+                _ => {}
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "第二轮没有等到 tts stop"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drain_udp(&env, Duration::from_millis(200)).await;
+        env.link
+            .publish("device-server", br#"{"type":"abort"}"#)
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if env.mock.lock().recording_starts.len() >= 3 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 30, 3, b"again").await;
+        wait_frames(&env.mock, 3).await;
+        assert_eq!(env.mock.lock().audio_frames[2].data, b"again");
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+        let again = collect_downlink(&env, &crypto, 1).await;
+        assert_eq!(again[0].payload, vec![0xB0]);
+        assert_eq!(env.mock.lock().generate_calls, 3);
         env.shutdown().await;
     }
 
