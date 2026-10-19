@@ -67,6 +67,9 @@ class MqttLink:
     _connected: threading.Event = field(
         default_factory=threading.Event, init=False, repr=False
     )
+    # 连接被拒时记录 CONNACK 返回码（0x04 认证失败 / 0x05 未授权）。
+    # 不记的话 connect() 会误报成功。
+    _connect_error: int | None = field(default=None, init=False, repr=False)
     _subscribed: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -96,6 +99,26 @@ class MqttLink:
             c.loop_stop()
             raise TimeoutError(
                 f"{timeout}s 内没连上 MQTT {self.host}:{self.port}"
+            )
+
+        # 被拒时 paho 也会触发 on_connect，所以必须显式检查返回码。
+        if self._connect_error is not None:
+            # paho VERSION2 会把 MQTT 3.1.1 的 CONNACK 返回码映射成 MQTT5 码：
+            # 0x04 → 0x86（Bad User Name or Password）、0x05 → 0x87（Not authorized）。
+            hint = {
+                4: "认证失败（用户名或密码错误）",
+                0x86: "认证失败（用户名或密码错误）",
+                5: "未授权",
+                0x87: "未授权",
+            }.get(self._connect_error, "服务端拒绝连接")
+            try:
+                c.disconnect()
+                c.loop_stop()
+            finally:
+                self._client = None
+                self._connected.clear()
+            raise ConnectionRefusedError(
+                f"MQTT 连接被拒绝 rc={self._connect_error}（{hint}）"
             )
 
         # 重放连接前登记过的订阅
@@ -185,7 +208,9 @@ class MqttLink:
                 client.subscribe(topic, qos=qos)
             self._connected.set()
         else:
-            # 连接被拒（鉴权失败等）也要让 connect() 解除阻塞
+            # 连接被拒（鉴权失败等）也要解除阻塞，但必须记下原因码，
+            # 否则调用方会误以为连上了。
+            self._connect_error = rc
             self._connected.set()
 
     def _on_message(self, client, userdata, msg):
