@@ -263,3 +263,119 @@ MCP：只做客户端（外部 server / 设备 / mcp-endpoint 三种），不实
 > **它把主动能力做得很薄（只有超时告别/唤醒问候），我们已经领先。**
 > **下一步不该去补它的 Java/Vue 中台，而是把「主动能力 + 长期记忆」接起来
 > ——「它记得昨天你说过什么，并在合适的时候主动提起来」。**
+
+---
+
+# 附录：协议层深读结论（subagent 报告摘要）
+
+## 它的 MQTT+UDP 真相
+
+```
+它不用 mosquitto/emqx，而是虾哥手写的极简 MQTT 3.1.1 broker
+  （xiaozhi-mqtt-gateway，Node.js，app.js:5-16、mqtt-protocol.js:5-14）
+
+"固件不订阅"不是被解决，而是【双方放弃订阅语义】：
+  · 网关 handleSubscribe 只回 SUBACK、不记 topic（app.js:317-325）
+  · 所有下行直接写 devices/p2p/<mac>（app.js:310/410-413）
+  · 固件历史上删了 Subscribe（commit e2c5578），OnMessage 的 topic 完全不用
+  （mqtt_protocol.cc:116-148）
+
+→ 结论：任何标准 broker 都做不到，只能自建。我们的方案是这个约束下的正解。
+```
+
+## 好消息：nonce 我们和它**字节级一致**
+
+```
+01 00 00 00 | UDP路由id(4B BE) | 0 | 0
+```
+我们叫 `udp_session_id`，它叫 `connectionId`。**实现正确。**
+唯一差一点：hello 里可以补 `"version": 3`。
+
+## 好消息：之前的 IV 复用担心是多余的
+
+`say_raw_frames` 每次 `ts=1` **不构成同向 AES-CTR IV 复用**，
+因为 `udp_audio` 的 `next_sequence` 单调递增，计数器块仍不同。
+真正的风险是**上下行共用 key 时跨方向首包可能撞**（device seq=1/ts=1 vs server ts=1/seq=1）。
+→ 建议给下行 random 32-bit timestamp 基址，而不是当成已确认的 bug。
+
+## ⚠️ 我们必须修的四个洞（优先级最高）
+
+### P0-1 MQTT 完全没有 keepalive
+
+```
+mqtt_broker.rs:270-279  明写「只记录、不检测」
+mqtt_broker.rs:173-200  publish_to 只是入队，不代表送达
+```
+**后果**：半开连接变僵尸，`publish_to` 返回成功但设备收不到；
+`prune_sessions` 也清不掉（因为 broker 的 connected_clients 仍有它）。
+**这正是之前「控制面消息已转发给设备」但设备毫无反应的那类现象的可能来源。**
+
+修法：按**入站**判活（收到任何包刷新），超过 1.5× keepalive 就断开清理。
+**不要**抄它的出站刷新（`mqtt-protocol.js:433`）——那样僵尸永远清不掉。
+
+### P0-2 MQTT 完全没有鉴权（安全问题）
+
+```
+mqtt_broker.rs:680-692  解析了 username/password 但【不校验】
+```
+**后果**：
+- 局域网内**任何人**可以发 `haimen/ctl/<client_id>` 注入 `notify` / `__say_audio`
+  → 让你的音箱说出任意内容
+- 还能用真设备的 clientId 连上来，把真设备顶掉
+
+修法：设备级 HMAC（它用 `username=base64({"ip":...})` + `password=HMAC`），
+并对控制主题做授权（只接受 server 自身或已认证来源）。
+
+### P1-3 全局 run_loop 会被阻塞
+
+```
+mqtt_udp.rs:818-822  handle_udp 里 await on_audio_frame(...)
+mqtt_udp.rs:504-509  say_raw_frames 直接在 handle_mqtt 里同步 sleep
+```
+**后果**：一次 10 秒播报会让整个传输层停 10 秒 ——
+期间收不到设备的 listen/abort/上行音频，多设备是全体停摆。
+单设备也会让「播报期间用户插话」失效。
+
+修法：把 say / ASR 调用 / 写队列从一个全局 loop 拆出去（spawn 独立 task）。
+
+### P1-4 策略层是全局单例（多设备架构债）
+
+```
+src/xiaozhi_asr_llm_tts.rs:531-551  streaming_state / vad_notify / end_of_conversation 都是 self 级
+mqtt_udp.rs:825-848  vad_completion 一触发会把所有 Recording 会话一起推进
+```
+**后果**：两个设备同时说话会串 ASR、串收口。
+单设备暂时无感，但接第二台设备前必须按 session_id 隔离。
+
+## 它做得比我们好的（补充）
+
+| 项 | 它 | 我们 |
+|---|---|---|
+| 每连接会话隔离 | ✅ | ❌ 全局单例 |
+| `tts start` 后等状态切换再发首帧 | ✅ 20-100ms | ❓ |
+| `tts stop` 前等 `(prebuffer+2)*60ms` 尾帧 | ✅ | ❓ |
+| 收口 | 120s 无语音 + LLM 告别 + 180s 硬超时 | 15s 直接 goodbye |
+| 退出词 | **精确匹配** | contains（易误判） |
+| MQTT 鉴权 | 有（但有漏洞） | **无** |
+| keepalive | 有（但判活方式错） | **无** |
+
+## 它做得不如我们的（补充）
+
+- 三进程/四配置面（网关 + Python + Java 管理台 + 4 个地址配置）
+- broker 只 QoS0、8KB 上限、无 UNSUBACK、无背压
+- 在线状态 API 把空闲设备判离线（`app.js:621-623`）
+- Python 服务端没有 notify/主动 TTS
+- Python 线程重、队列无界
+- Python 从不发 goodbye（靠网关 bridge 关闭时补发）
+- 我们 broker 支持 QoS1/SUBACK/UNSUBACK、codec 更严格、下行时间戳单调、单测覆盖更全
+
+## 最终 P0 清单（跨三份报告 + 今天的事故）
+
+| # | 事项 | 风险 |
+|---|---|---|
+| 1 | **Hermes LLM 调用加超时** | 今天整机哑掉就是它 |
+| 2 | **MQTT 鉴权** | 局域网可注入任意播报 / 顶掉设备 |
+| 3 | **MQTT keepalive** | 僵尸连接，消息假成功 |
+| 4 | **把 say/ASR 从全局 loop 拆出去** | 播报期间整条链路冻结 |
+| 5 | 收口 120s + 告别语、退出词改精确匹配 | 体验 |
+| 6 | 策略层按 session_id 隔离 | 接第二台设备前必做 |

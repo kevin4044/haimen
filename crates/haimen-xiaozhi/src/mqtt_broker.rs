@@ -10,6 +10,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -267,7 +268,6 @@ async fn handle_connection(
         return Err(protocol("第一个报文必须是 CONNECT"));
     }
     let connect = parse_connect(&first.body)?;
-    // keepalive 先留在这条连接上。超过 1.5 倍无包应断开，M2' 只记录、不检测。
     let keepalive_secs = connect.keepalive_secs;
     tracing::debug!(
       client_id = %connect.client_id,
@@ -275,7 +275,7 @@ async fn handle_connection(
       clean_session = connect.clean_session,
       username = connect.username.as_deref().unwrap_or("-"),
       password_len = connect.password.as_ref().map(Vec::len).unwrap_or(0),
-      "接受 CONNECT，keepalive 已记录但未做空闲超时"
+      "接受 CONNECT"
     );
 
     let conn_id = shared.conn_ids.fetch_add(1, Ordering::Relaxed);
@@ -299,7 +299,15 @@ async fn handle_connection(
     // 读完 CONNECT 不回 CONNACK 的话，esp_mqtt_client 会一直等到 Connect() 超时。
     let result = async {
         send_frame(&write_tx, encode_connack()).await?;
-        conn_loop(&mut reader, &shared, &write_tx, &mut cancel_rx, &client_id).await
+        conn_loop(
+            &mut reader,
+            &shared,
+            &write_tx,
+            &mut cancel_rx,
+            &client_id,
+            keepalive_secs,
+        )
+        .await
     }
     .await;
 
@@ -307,7 +315,7 @@ async fn handle_connection(
     tracing::debug!(
       %client_id,
       keepalive_secs,
-      "MQTT 连接结束，keepalive 未用于超时断开"
+      "MQTT 连接结束"
     );
     result
 }
@@ -318,10 +326,24 @@ async fn conn_loop<R>(
     write_tx: &mpsc::Sender<Vec<u8>>,
     cancel_rx: &mut watch::Receiver<bool>,
     client_id: &str,
+    keepalive_secs: u16,
 ) -> Result<(), MqttBrokerError>
 where
     R: AsyncRead + Unpin,
 {
+    // MQTT 3.1.1 §3.1.2.10：keepalive 为 0 表示不启用。
+    //
+    // 判活只看【入站】报文。不能看出站 —— 写成功不代表对端还活着，
+    // 半开连接（设备断网/掉电但 TCP 未 RST）会一直被当成在线：
+    // `publish_to` 返回成功、`prune_sessions` 清不掉、消息静默丢失。
+    //
+    // 1.5 倍是 MQTT 规范给客户端的宽限（它可能刚好卡在边界上）。
+    let idle_timeout = if keepalive_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(u64::from(keepalive_secs) * 1500))
+    };
+
     loop {
         tokio::select! {
           changed = cancel_rx.changed() => {
@@ -332,6 +354,21 @@ where
           // 写任务退出会丢掉 Receiver，这里才能在没有下行报文时也把连接摘掉。
           _ = write_tx.closed() => {
             return Err(broken_pipe("连接写任务已退出"));
+          }
+          // 空闲超时：每收到一个报文循环就会重来，定时器随之重置。
+          _ = async {
+            match idle_timeout {
+              Some(d) => tokio::time::sleep(d).await,
+              None => std::future::pending::<()>().await,
+            }
+          } => {
+            tracing::warn!(
+              client_id,
+              keepalive_secs,
+              idle_timeout_ms = keepalive_secs as u64 * 1500,
+              "MQTT 空闲超时，断开半开连接并摘除注册表"
+            );
+            return Err(broken_pipe("keepalive 超时"));
           }
           incoming = read_packet(reader, shared.max_packet_size) => {
             match incoming? {
@@ -893,11 +930,19 @@ mod tests {
     }
 
     async fn handshake(addr: SocketAddr, client_id: &str) -> TcpStream {
+        handshake_with_keepalive(addr, client_id, 240).await
+    }
+
+    async fn handshake_with_keepalive(
+        addr: SocketAddr,
+        client_id: &str,
+        keepalive_secs: u16,
+    ) -> TcpStream {
         let mut stream = TcpStream::connect(addr).await.expect("连接 broker");
         stream.set_nodelay(true).expect("客户端 TCP_NODELAY");
         let body = connect_body(
             client_id.as_bytes(),
-            240,
+            keepalive_secs,
             true,
             Some(b"user"),
             Some(b"pass"),
@@ -924,6 +969,39 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// MQTT keepalive 超时必须真的摘掉连接。
+    ///
+    /// 为什么重要：不检测的话，设备断网/掉电但 TCP 没 RST 时会变成半开连接，
+    /// `publish_to` 一直返回成功、`prune_sessions` 也清不掉，
+    /// 表现为「服务端日志说转发成功，设备毫无反应」。
+    #[tokio::test]
+    async fn keepalive_timeout_drops_half_open_connection() {
+        let handle = start_broker().await;
+        // keepalive = 1 秒 → 1.5 倍 = 1.5 秒超时。
+        let mut stream = handshake_with_keepalive(handle.local_addr(), "keepalive-victim", 1).await;
+        wait_for_client(&handle, "keepalive-victim", true).await;
+
+        // 什么都不发，等超时。
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        wait_for_client(&handle, "keepalive-victim", false).await;
+
+        // 连接应当已经被服务端关闭：这里读会立刻结束或报错。
+        let mut buf = [0u8; 16];
+        let _ = stream.read(&mut buf).await;
+    }
+
+    /// keepalive = 0 表示不启用，不能被我们的定时器误杀。
+    #[tokio::test]
+    async fn keepalive_disabled_keeps_connection_alive() {
+        let handle = start_broker().await;
+        let _stream = handshake_with_keepalive(handle.local_addr(), "keepalive-off", 0).await;
+        wait_for_client(&handle, "keepalive-off", true).await;
+
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        wait_for_client(&handle, "keepalive-off", true).await;
     }
 
     #[test]
