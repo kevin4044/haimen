@@ -107,10 +107,15 @@ GET /xiaozhi/say/{id}.ogg
    - 输出 24kHz mono PCM
    - 合成失败 → 502 `tts_failed`
 
-5. **Opus 编码**：
-   - 用 `opus2`，48000 容器 / 24kHz 输入参数，60ms/帧（与下行音频一致）
-   - 封装成 **Ogg Opus 容器**（设备的 HTTP 客户端按 Ogg 解析）
-   - 如果 `opus2` 不直接支持 Ogg mux，允许手写最小 Ogg 页封装（OpusHead / OpusTags / 数据页）
+5. **Opus 编码 + Ogg 封装**：
+   - 编码复用现有的 `pcm_to_opus_frames`（`src/xiaozhi_tts.rs`），24kHz / 60ms/帧
+   - **容器用 `ogg` crate（0.9.2）**，不要手写 Ogg 页
+     - 已核实：纯 Rust，依赖（byteorder/bytes/tokio/futures-*）全在现有依赖树里，
+       交叉编译到 x86_64-apple-darwin 无障碍
+     - 手写 Ogg 要自己算 CRC32 和 granule position，错了设备解不出来，
+       而且现象是"没声音"，极难排查
+   - 结构：`OpusHead`（19B，声道/预跳过/采样率）→ `OpusTags`（可空）→ 数据页
+   - 采样率字段填 24000（虽然 Opus 内部固定 48kHz，头部要按输出采样率声明）
 
 6. **托管**：调 T1 的 `insert()`，URL 基址取配置里的 `advertise_ip`（没有就用本机 LAN IP），
    端口取 HTTP 服务端口。
@@ -133,6 +138,8 @@ GET /xiaozhi/say/{id}.ogg
 - notify 的无 ACK 特性如实反映在响应里（不假装成功保证）
 - **设备忙直接 409，不做排队/重试**（用户决定，理由见 02-design §4）
 - TTS/编码耗时不能阻塞整个 worker：接口内部并发即可，但要设超时（建议 15s）
+- 新增依赖只允许 `ogg`；用 `default-features = false` 只要 mux 能力，
+  不需要它的 async 流特性
 
 ### 完成标准
 

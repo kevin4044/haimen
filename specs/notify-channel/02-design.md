@@ -231,6 +231,7 @@ Hermes 侧接入留待确定 `xiaozhi-mcp` 源码位置后再做。
 | `crates/haimen-xiaozhi/src/lib.rs` | 导出 + `add_routes` 挂新路由 |
 | `crates/haimen-xiaozhi/src/types.rs` | 新增 `say_token` 配置 |
 | `src/gateway/mod.rs` | 传递 `say_token` 与 `advertise_ip` |
+| `Cargo.toml` | 新增依赖 `ogg`（纯 Rust，用于 Ogg Opus 容器封装） |
 
 **不改**：ASR/VAD/TTS 主链路、策略层、MQTT broker 协议实现。
 

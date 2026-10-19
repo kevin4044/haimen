@@ -140,6 +140,13 @@ T2)
     has '"notify"' "${NOTIFY}" && pass "构造 type=notify" || fail "未构造 notify 消息"
     has "audio_url" "${NOTIFY}" && pass "带 audio_url"   || fail "缺 audio_url"
 
+    # Ogg 容器：应当用 crate 而不是手写
+    if grep -qE '^ogg|ogg =' Cargo.toml 2>/dev/null; then
+        pass "用 ogg crate 做容器封装"
+    else
+        info "未发现 ogg 依赖，确认容器封装方式（手写需自行保证 CRC/granule 正确）"
+    fi
+
     # 音色策略：必须沿用配置，不得由调用方指定
     if grep -qE '\\bvoice\\b' "${NOTIFY}" 2>/dev/null; then
         if grep -qE 'voice_override|effective_voice|resolve_voice' "${NOTIFY}" 2>/dev/null; then
