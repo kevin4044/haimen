@@ -1,283 +1,311 @@
 #!/usr/bin/env bash
 #
-# scripts/cd.sh —— 本地 CD：构建镜像 → 重建容器 → 验证真的换上了
+# scripts/cd.sh —— CD：交叉编译 → 部署到 Mac mini（原生二进制）→ 验证
 #
-# ⚠️ 核心教训：`docker restart` 不会换镜像。必须 `docker rm` + `docker run`。
-#    这个脚本最后会【强制校验】容器实际使用的镜像 ID 等于本次构建出的镜像 ID，
-#    不相等就报错退出。今天就是漏了这一步，白测一整轮。
+# 历史：这原来是 Docker 版（构建镜像 → 重建容器 → 校验镜像 ID）。
+# 2026-10-19 迁到 Mac mini 后改成原生部署，原因见 specs/运维-迁移到Mac-mini.md:
+#   Colima 的 Docker 不转发 UDP 端口（实测宿主机 lsof 无监听、对端 Connection
+#   refused），而音频通道就是 UDP，所以容器方案在 mini 上不可用。
 #
 # 用法：
-#   ./scripts/cd.sh                 # 先跑 CI，再构建 + 部署
+#   ./scripts/cd.sh                 # CI → 构建 → 部署 → 验证
 #   ./scripts/cd.sh --skip-ci       # 跳过 CI（急着验证时）
-#   ./scripts/cd.sh --no-build      # 只重建容器，不重新构建镜像
+#   ./scripts/cd.sh --no-deploy     # 只构建并校验产物，不部署
+#   ./scripts/cd.sh --rollback      # 回滚到上一版（bin/haimen.prev）
 #
 # 环境变量：
-#   HAIMEN_CONFIG_DIR   配置目录（默认 ~/works/haimen-data）
-#   HAIMEN_PORT         宿主机端口（默认 9527）
-#   HAIMEN_CONTAINER    容器名（默认 haimen-test）
+#   HAIMEN_DEPLOY_HOST   部署目标（默认 wangjunlong@192.168.50.33）
+#   HAIMEN_REMOTE_DIR    远端目录，相对远端 ${HOME}（默认 haimen）
+#   HAIMEN_HTTP_PORT     健康检查端口（默认 9527）
+#   HAIMEN_LABEL         launchd 标签（默认 ai.haimen.serve）
+#
+# ⚠️ 这个脚本存在的意义是下面这条安全约束：
+#   新二进制必须【在目标机上真跑通 --version】才允许替换旧的。
+#   交叉编译 + 部署目标设错，可以产出"本机能构建、目标机加载不了"的产物
+#   （编译机 macOS 27，目标机 15.7；不设 MACOSX_DEPLOYMENT_TARGET 就会踩）。
+#   所以顺序是：构建 → 校验架构与 minos → 传输 → 目标机试跑 → 备份 → 替换
+#   → 重启 → 校验线上 sha 与本次构建一致。任何一步失败都保留旧二进制。
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "${REPO_ROOT}"
 
-CONFIG_DIR="${HAIMEN_CONFIG_DIR:-$HOME/works/haimen-data}"
-HOST_PORT="${HAIMEN_PORT:-9527}"
-CONTAINER="${HAIMEN_CONTAINER:-haimen-test}"
-RUN_IMAGE="${HAIMEN_RUN_IMAGE:-haimen:local}"
+DEPLOY_HOST="${HAIMEN_DEPLOY_HOST:-wangjunlong@192.168.50.33}"
+REMOTE_DIR="${HAIMEN_REMOTE_DIR:-haimen}"
+HTTP_PORT="${HAIMEN_HTTP_PORT:-9527}"
+LABEL="${HAIMEN_LABEL:-ai.haimen.serve}"
+
+# 目标机是 Intel Mac mini，跑 macOS 15.7.5
+TARGET="x86_64-apple-darwin"
+TOOLCHAIN="+stable"          # 见下方说明：不能用项目固定的 1.96 工具链
+DEPLOY_TARGET_MACOS="15.0"
 
 SKIP_CI=0
-NO_BUILD=0
+NO_DEPLOY=0
+ROLLBACK=0
 for arg in "$@"; do
-    case "$arg" in
-        --skip-ci)  SKIP_CI=1 ;;
-        --no-build) NO_BUILD=1 ;;
-        *) echo "未知参数: $arg" >&2; exit 2 ;;
-    esac
+  case "${arg}" in
+    --skip-ci)   SKIP_CI=1 ;;
+    --no-deploy) NO_DEPLOY=1 ;;
+    --rollback)  ROLLBACK=1 ;;
+    -h|--help)   sed -n '2,26p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) echo "未知参数: ${arg}（用 --help 看用法）" >&2; exit 2 ;;
+  esac
 done
 
-step() {
-    echo
-    echo "══════════════════════════════════════════════════════"
-    echo "▶ $*"
-    echo "══════════════════════════════════════════════════════"
-}
+STEP=0
+step() { STEP=$((STEP + 1)); echo; echo "▶ [${STEP}] $*"; }
+info() { echo "   $*"; }
+ok()   { echo "   ✅ $*"; }
+warn() { echo "   ⚠️  $*"; }
+die()  { echo "   ❌ $*" >&2; exit 1; }
 
-die() { echo "❌ $*" >&2; exit 1; }
+SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes)
+SSH_DEST_HOST="${DEPLOY_HOST#*@}"
+
+remote() { ssh "${SSH_OPTS[@]}" "${DEPLOY_HOST}" "$@"; }
 
 # ─────────────────────────────────────────────
 # 0. 环境检查
 # ─────────────────────────────────────────────
 step "环境检查"
-docker info >/dev/null 2>&1 || die "Docker 不可用，请先启动 OrbStack"
-command -v docker >/dev/null 2>&1 || die "找不到 docker"
 
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 GIT_DIRTY="$(git status --porcelain | wc -l | tr -d ' ')"
 BRANCH="$(git branch --show-current 2>/dev/null || echo '-')"
-echo "  分支:       $BRANCH"
-echo "  提交:       $GIT_SHA"
-echo "  未提交改动: $GIT_DIRTY 个 $([ "$GIT_DIRTY" != "0" ] && echo '⚠️  （镜像里会包含这些改动）')"
-echo "  配置目录:   $CONFIG_DIR"
-echo "  容器名:     $CONTAINER"
-echo "  端口:       $HOST_PORT"
+info "分支 ${BRANCH} @ ${GIT_SHA}，未提交改动 ${GIT_DIRTY} 个"
+
+if ! remote true 2>/dev/null; then
+  die "SSH 连不上 ${DEPLOY_HOST}（需要免密登录）"
+fi
+ok "SSH 可达 ${DEPLOY_HOST}"
+
+REMOTE_ARCH="$(remote 'uname -m' 2>/dev/null)"
+[ "${REMOTE_ARCH}" = "x86_64" ] || die "目标机架构是 ${REMOTE_ARCH}，期望 x86_64"
+ok "目标机架构 x86_64"
+
+# ─────────────────────────────────────────────
+# 回滚分支
+# ─────────────────────────────────────────────
+if [ "${ROLLBACK}" = "1" ]; then
+  step "回滚到上一版（bin/haimen.prev）"
+  remote "bash -s" <<REMOTE_EOF
+set -euo pipefail
+BIN="\${HOME}/${REMOTE_DIR}/bin/haimen"
+[ -f "\${BIN}.prev" ] || { echo "   ❌ 没有 \${BIN}.prev，无法回滚"; exit 1; }
+cp "\${BIN}.prev" "\${BIN}"
+chmod +x "\${BIN}"
+launchctl kickstart -k "gui/\$(id -u)/${LABEL}"
+echo "   已回滚并重启"
+REMOTE_EOF
+  sleep 5
+  remote "lsof -nP -iTCP:${HTTP_PORT} -sTCP:LISTEN >/dev/null 2>&1" \
+    && ok "回滚后端口 ${HTTP_PORT} 已监听" || die "回滚后端口未监听"
+  echo
+  echo "✅ 已回滚到 ${DEPLOY_HOST}:${REMOTE_DIR}/bin/haimen.prev"
+  exit 0
+fi
 
 # ─────────────────────────────────────────────
 # 1. CI
 # ─────────────────────────────────────────────
-if [ "$SKIP_CI" = "0" ]; then
-    step "CI（fmt + clippy + test）"
-    ./scripts/ci.sh || die "CI 未通过，已中止部署（旧容器保持运行）"
+if [ "${SKIP_CI}" = "0" ]; then
+  step "CI（fmt + clippy + test）"
+  ./scripts/ci.sh || die "CI 未通过，已中止部署（线上服务保持运行）"
+  ok "CI 通过"
 else
-    step "CI"
-    echo "  ⏭  已跳过（--skip-ci）"
+  step "CI 已跳过（--skip-ci）"
 fi
 
 # ─────────────────────────────────────────────
-# 2. 构建镜像
+# 2. 交叉编译
 # ─────────────────────────────────────────────
-if [ "$NO_BUILD" = "0" ]; then
-    step "构建运行镜像 $RUN_IMAGE"
-    docker build -t "$RUN_IMAGE" . || die "镜像构建失败，旧容器保持运行"
-    # 额外打一个 commit 标签，方便回滚和对照
-    docker tag "$RUN_IMAGE" "${RUN_IMAGE%%:*}:$GIT_SHA" 2>/dev/null || true
-    echo "  ✅ 已构建并标记为 ${RUN_IMAGE%%:*}:$GIT_SHA"
+step "交叉编译 ${TARGET}（部署目标 macOS ${DEPLOY_TARGET_MACOS}）"
+
+command -v cargo >/dev/null 2>&1 || die "找不到 cargo"
+
+# 为什么必须 +stable：项目 rust-toolchain.toml 固定 1.96，而那条工具链
+# 交叉编译时 proc-macro 全部 `can't find crate`
+# （tokio_macros / thiserror_impl / zerofrom_derive）。标准 stable 正常。
+if ! rustup target list --installed --toolchain stable 2>/dev/null | grep -qx "${TARGET}"; then
+  info "安装交叉目标 ${TARGET} …"
+  rustup target add "${TARGET}" --toolchain stable >/dev/null 2>&1 \
+    || die "安装 ${TARGET} 失败"
+fi
+ok "目标 ${TARGET} 就绪（工具链 ${TOOLCHAIN}）"
+
+export MACOSX_DEPLOYMENT_TARGET="${DEPLOY_TARGET_MACOS}"
+BIN="target/${TARGET}/release/haimen"
+
+BUILD_START=$(date +%s)
+if ! cargo "${TOOLCHAIN}" build --release --target "${TARGET}"; then
+  die "构建失败（线上服务未受影响）"
+fi
+BUILD_SECS=$(( $(date +%s) - BUILD_START ))
+[ -f "${BIN}" ] || die "产物不存在: ${BIN}"
+ok "构建完成（${BUILD_SECS}s，$(ls -lh "${BIN}" | awk '{print $5}')）"
+
+# ─────────────────────────────────────────────
+# 3. 产物校验（防止把跑不起来的二进制推上去）
+# ─────────────────────────────────────────────
+step "产物校验"
+
+FILE_INFO="$(file "${BIN}" 2>/dev/null || true)"
+echo "${FILE_INFO}" | grep -q "x86_64" || die "产物架构不是 x86_64: ${FILE_INFO}"
+ok "架构 x86_64"
+
+MINOS="$(otool -l "${BIN}" 2>/dev/null | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')"
+[ -n "${MINOS}" ] || die "读不到产物 minos"
+if awk -v a="${MINOS}" -v b="${DEPLOY_TARGET_MACOS}" 'BEGIN{exit !(a+0 <= b+0)}'; then
+  ok "minos ${MINOS} ≤ ${DEPLOY_TARGET_MACOS}（目标机 macOS 15.7.5 可加载）"
 else
-    step "构建镜像"
-    echo "  ⏭  已跳过（--no-build）"
+  die "minos ${MINOS} 高于 ${DEPLOY_TARGET_MACOS}，目标机会拒绝加载"
+fi
+
+NON_SYSTEM_LIBS="$(otool -L "${BIN}" 2>/dev/null | tail -n +2 \
+  | grep -vE '/usr/lib|/System/' | awk '{print $1}' || true)"
+if [ -n "${NON_SYSTEM_LIBS}" ]; then
+  warn "依赖了非系统动态库（目标机可能没有）："
+  echo "${NON_SYSTEM_LIBS}" | sed 's/^/         /'
+  die "请改静态链接，或把库一并部署"
+fi
+ok "只依赖系统库，自包含"
+
+LOCAL_SHA="$(shasum -a 256 "${BIN}" | awk '{print $1}')"
+info "sha256 ${LOCAL_SHA:0:16}…"
+
+if [ "${NO_DEPLOY}" = "1" ]; then
+  step "只构建（--no-deploy）"
+  ok "产物: ${BIN}"
+  exit 0
 fi
 
 # ─────────────────────────────────────────────
-# 3. 准备配置目录
+# 4. 传输 + 目标机试跑（此时还没动线上）
 # ─────────────────────────────────────────────
-step "准备配置目录"
-mkdir -p "$CONFIG_DIR"
-if [ ! -f "$CONFIG_DIR/settings.toml" ]; then
-    echo "  ⚠️  $CONFIG_DIR/settings.toml 不存在，容器首次启动会因缺凭证退出"
-    echo "      请在 Web 界面 http://localhost:$HOST_PORT 配置 ASR / TTS / Agent"
-fi
-ls -la "$CONFIG_DIR" | sed 's/^/  /'
+step "传输并试跑（不动线上）"
 
-# ─────────────────────────────────────────────
-# 4. 重建容器（关键：不是 restart）
-# ─────────────────────────────────────────────
-step "重建容器（rm + run，不是 restart）"
-if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-    echo "  移除旧容器 $CONTAINER"
-    docker rm -f "$CONTAINER" >/dev/null
-fi
+REMOTE_TMP="/tmp/haimen-deploy-$$"
+trap 'remote "rm -f ${REMOTE_TMP}" >/dev/null 2>&1 || true' EXIT
 
-echo "  启动新容器"
+scp -q "${SSH_OPTS[@]}" "${BIN}" "${DEPLOY_HOST}:${REMOTE_TMP}" || die "scp 失败"
+ok "已传输至 ${DEPLOY_HOST}:${REMOTE_TMP}"
 
-# 小智传输协议。mqtt 模式下必须额外暴露 broker 端口与 UDP 音频端口，
-# 否则设备连不上（OTA 下发的是宿主机局域网地址）。
-XZ_PROTOCOL="websocket"
-if [ -f "$CONFIG_DIR/settings.toml" ]; then
-    PARSED=$(grep -E '^\s*protocol\s*=\s*"mqtt"' "$CONFIG_DIR/settings.toml" 2>/dev/null | head -1)
-    [ -n "$PARSED" ] && XZ_PROTOCOL="mqtt"
-fi
+REMOTE_SHA="$(remote "shasum -a 256 ${REMOTE_TMP} | awk '{print \$1}'" 2>/dev/null)"
+[ "${REMOTE_SHA}" = "${LOCAL_SHA}" ] || die "传输校验失败（本地 ${LOCAL_SHA} / 远端 ${REMOTE_SHA}）"
+ok "sha256 一致"
 
-# MQTT broker 端口：取 settings 里 endpoint 的端口，缺省 1883
-MQTT_PORT="1883"
-if [ -f "$CONFIG_DIR/settings.toml" ]; then
-    EP=$(grep -E '^\s*endpoint\s*=' "$CONFIG_DIR/settings.toml" 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -n "$EP" ] && echo "$EP" | grep -q ':'; then
-        MQTT_PORT="${EP##*:}"
-    fi
-fi
-
-# UDP 音频端口：取 settings 里 bind_addr 的端口，缺省 8888
-UDP_PORT="8888"
-if [ -f "$CONFIG_DIR/settings.toml" ]; then
-    UB=$(grep -E '^\s*bind_addr\s*=' "$CONFIG_DIR/settings.toml" 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -n "$UB" ] && echo "$UB" | grep -q ':'; then
-        UDP_PORT="${UB##*:}"
-    fi
-fi
-
-# 容器时区必须和宿主机一致。
-# 小智 OTA 用 Local::now().offset() 算时区偏移下发给设备设置时钟
-# （ota.cc: ts += timezone_offset * 60 * 1000; settimeofday）。
-# 容器默认 Etc/UTC 会让 timezone_offset 变成 0，设备时钟慢 8 小时。
-HOST_TZ="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
-if [ -z "${HOST_TZ}" ]; then
-    HOST_TZ="Asia/Shanghai"
-    echo "  ⚠️ 未能从 /etc/localtime 推断时区，回退 ${HOST_TZ}"
-fi
-echo "  容器时区: ${HOST_TZ}（和宿主机一致，否则设备时钟会偏）"
-
-if [ "$XZ_PROTOCOL" = "mqtt" ]; then
-    echo "  小智协议: mqtt  → 额外暴露 TCP ${MQTT_PORT}（broker）与 UDP ${UDP_PORT}（音频）"
-    docker run -d --name "$CONTAINER" \
-        -p "${HOST_PORT}:9527" \
-        -p "${MQTT_PORT}:${MQTT_PORT}" \
-        -p "${UDP_PORT}:${UDP_PORT}/udp" \
-        -v "$CONFIG_DIR":/root/.haimen \
-        -e "TZ=${HOST_TZ}" \
-        --restart unless-stopped \
-        "$RUN_IMAGE" >/dev/null
-else
-    echo "  小智协议: websocket（只暴露 HTTP ${HOST_PORT}）"
-    docker run -d --name "$CONTAINER" \
-        -p "${HOST_PORT}:9527" \
-        -v "$CONFIG_DIR":/root/.haimen \
-        -e "TZ=${HOST_TZ}" \
-        --restart unless-stopped \
-        "$RUN_IMAGE" >/dev/null
-fi
+# ★ 关键：在目标机上真跑一次。跑不起来就到此为止，线上仍是旧版。
+REMOTE_VER="$(remote "chmod +x ${REMOTE_TMP} && ${REMOTE_TMP} --version" 2>&1 | head -1)"
+echo "${REMOTE_VER}" | grep -q "^haimen " || die "目标机试跑失败: ${REMOTE_VER}"
+ok "目标机试跑通过: ${REMOTE_VER}"
 
 # ─────────────────────────────────────────────
-# 5. 【强制校验】容器用的确实是刚构建的镜像
+# 5. 备份 → 原子替换 → 重启
 # ─────────────────────────────────────────────
-step "校验容器镜像（防止跑到旧镜像上）"
-BUILT_ID="$(docker inspect "$RUN_IMAGE" --format '{{.Id}}')"
-RUNNING_ID="$(docker inspect "$CONTAINER" --format '{{.Image}}')"
+step "替换并重启服务"
 
-echo "  刚构建的镜像: $BUILT_ID"
-echo "  容器实际用的: $RUNNING_ID"
+remote "REMOTE_TMP='${REMOTE_TMP}' REMOTE_DIR='${REMOTE_DIR}' LABEL='${LABEL}' bash -s" <<'REMOTE_EOF' || die "远端部署失败"
+set -euo pipefail
+DIR="${HOME}/${REMOTE_DIR}"
+BIN="${DIR}/bin/haimen"
+mkdir -p "${DIR}/bin"
 
-if [ "$BUILT_ID" != "$RUNNING_ID" ]; then
-    echo
-    echo "❌ 致命：容器没有用上新镜像！"
-    echo "   这正是 docker restart 的坑。请检查上面的 docker run 是否成功。"
-    exit 1
+if [ -f "${BIN}" ]; then
+    cp "${BIN}" "${BIN}.prev"
+    echo "   已备份旧版本 → bin/haimen.prev"
 fi
-echo "  ✅ 一致"
+
+# mv 在同一文件系统内是原子的，不会出现"半截二进制"
+mv "${REMOTE_TMP}" "${BIN}"
+chmod +x "${BIN}"
+echo "   已替换 ${BIN}"
+
+# kickstart -k：杀掉当前进程后按 plist 拉起（比 bootout+bootstrap 干净）
+if ! launchctl kickstart -k "gui/$(id -u)/${LABEL}" 2>/dev/null; then
+    echo "   kickstart 失败，回退 bootout + bootstrap"
+    launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "${HOME}/Library/LaunchAgents/${LABEL}.plist"
+fi
+echo "   已重启 launchd 服务"
+REMOTE_EOF
+trap - EXIT
+ok "部署完成"
 
 # ─────────────────────────────────────────────
-# 6. 健康检查
+# 6. 验证真的换上了
 # ─────────────────────────────────────────────
-step "健康检查"
-HEALTH_OK=0
-for i in $(seq 1 20); do
-    sleep 2
-    if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-        CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 3 \
-            "http://127.0.0.1:${HOST_PORT}/api/v1/system/info" 2>/dev/null || echo 000)"
-        if [ "$CODE" = "200" ]; then
-            HEALTH_OK=1
-            break
-        fi
-    else
-        echo "  ⚠️  容器退出了，看日志："
-        docker logs "$CONTAINER" 2>&1 | tail -20 | sed 's/^/     /'
-        exit 1
-    fi
+step "部署后验证"
+
+# 端口就绪（最多 20 秒）
+READY=0
+for _ in $(seq 1 20); do
+  if remote "lsof -nP -iTCP:${HTTP_PORT} -sTCP:LISTEN >/dev/null 2>&1" 2>/dev/null; then
+    READY=1; break
+  fi
+  sleep 1
 done
+[ "${READY}" = "1" ] || die "服务没起来：HTTP 端口 ${HTTP_PORT} 无监听"
+ok "HTTP 端口 ${HTTP_PORT} 已监听"
 
-if [ "$HEALTH_OK" != "1" ]; then
-    echo "  ❌ 健康检查失败（20 次重试后仍不可用）"
-    echo "  日志："
-    docker logs "$CONTAINER" 2>&1 | tail -20 | sed 's/^/     /'
-    exit 1
-fi
+# 线上二进制必须就是本次构建的那个
+RUNNING_SHA="$(remote "shasum -a 256 \${HOME}/${REMOTE_DIR}/bin/haimen | awk '{print \$1}'" 2>/dev/null)"
+[ "${RUNNING_SHA}" = "${LOCAL_SHA}" ] || die "线上二进制不是本次构建！本地 ${LOCAL_SHA} / 线上 ${RUNNING_SHA}"
+ok "线上二进制 == 本次构建（sha256 一致）"
 
-echo "  ✅ HTTP 200"
-curl -s -m 3 "http://127.0.0.1:${HOST_PORT}/api/v1/system/info" | sed 's/^/  /'
+# launchd 状态
+LAUNCHD_LINE="$(remote "launchctl list 2>/dev/null | grep '${LABEL}'" 2>/dev/null || true)"
+echo "${LAUNCHD_LINE}" | grep -q "${LABEL}" || die "launchd 里找不到 ${LABEL}"
+LAUNCHD_EXIT="$(echo "${LAUNCHD_LINE}" | awk '{print $2}')"
+[ "${LAUNCHD_EXIT}" = "0" ] || die "launchd 上次退出码 ${LAUNCHD_EXIT}（非 0）"
+ok "launchd 正常（退出码 0）"
 
-# ─────────────────────────────────────────────
-# 7. OTA 端点自检（设备接入用）
-# ─────────────────────────────────────────────
-step "OTA 端点自检"
-OTA_BODY='{"version":2,"mac_address":"DE:AD:BE:EF:00:01","uuid":"selftest","chip_model_name":"esp32s3","application":{"name":"xiaozhi","version":"1.0.0"},"board":{"type":"bread-compact-wifi-lcd","name":"selftest"},"flash_size":16777216,"minimum_free_heap_size":"200000"}'
-OTA_CODE="$(curl -s -o /tmp/cd_ota.json -w '%{http_code}' -m 5 -X POST \
-    "http://127.0.0.1:${HOST_PORT}/xiaozhi/ota/" \
-    -H 'Content-Type: application/json' \
-    -H 'Device-Id: DE:AD:BE:EF:00:01' \
-    -H 'Client-Id: selftest' \
-    -H 'Activation-Version: 1' \
-    -d "$OTA_BODY" 2>/dev/null || echo 000)"
-echo "  POST /xiaozhi/ota/ → HTTP $OTA_CODE"
-if [ "$OTA_CODE" = "200" ]; then
-    python3 -c "
-import json
-d = json.load(open('/tmp/cd_ota.json'))
-ws = (d.get('websocket') or {}).get('url')
-mq = d.get('mqtt') or {}
-if mq:
-    print(f'  协议: mqtt')
-    print(f'  broker endpoint   = {mq.get("endpoint")}')
-    print(f'  publish_topic     = {mq.get("publish_topic")}')
-    print(f'  client_id         = {mq.get("client_id")}')
-else:
-    print(f'  协议: websocket')
-    print(f'  websocket.url = {ws}')
-" 2>/dev/null || cat /tmp/cd_ota.json 2>/dev/null | head -c 300
-    # mqtt 模式下额外确认 broker 端口在监听（否则设备连上了也白搭）
-    if python3 -c "
-import json, sys
-d = json.load(open('/tmp/cd_ota.json'))
-sys.exit(0 if (d.get('mqtt') or {}) else 1)
-" 2>/dev/null; then
-        MQ_EP=$(python3 -c "
-import json
-d = json.load(open('/tmp/cd_ota.json'))
-print((d.get('mqtt') or {}).get('endpoint',''))
-" 2>/dev/null)
-        MQ_HOST="${MQ_EP%%:*}"; MQ_PORT="${MQ_EP##*:}"
-        if nc -z -w 3 "$MQ_HOST" "$MQ_PORT" 2>/dev/null; then
-            echo "  ✅ MQTT broker 可达: ${MQ_HOST}:${MQ_PORT}"
-        else
-            echo "  ❌ MQTT broker 不可达: ${MQ_HOST}:${MQ_PORT} —— 设备将无法连接"
-        fi
-    fi
-    echo "  ✅ OTA 正常（注意：地址必须带结尾斜杠 /xiaozhi/ota/）"
-else
-    echo "  ⚠️  OTA 端点异常，设备会连不上"
-fi
+# 三个端口
+MISSING=""
+remote "lsof -nP -iTCP:${HTTP_PORT} -sTCP:LISTEN >/dev/null 2>&1" || MISSING="${MISSING} ${HTTP_PORT}/tcp"
+remote "lsof -nP -iTCP:1883 -sTCP:LISTEN >/dev/null 2>&1"       || MISSING="${MISSING} 1883/tcp"
+remote "lsof -nP -iUDP:8888 >/dev/null 2>&1"                    || MISSING="${MISSING} 8888/udp"
+[ -z "${MISSING}" ] || die "端口未监听:${MISSING}"
+ok "端口正常（${HTTP_PORT}/tcp, 1883/tcp, 8888/udp）"
+
+# HTTP 健康
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://${SSH_DEST_HOST}:${HTTP_PORT}/api/v1/system/info" 2>/dev/null || echo 000)"
+[ "${CODE}" = "200" ] || die "HTTP 健康检查失败（${CODE}）"
+ok "HTTP /api/v1/system/info → 200"
+
+# OTA 冒烟：endpoint 必须指向目标机
+OTA_JSON="$(curl -s -m 8 -X POST "http://${SSH_DEST_HOST}:${HTTP_PORT}/xiaozhi/ota/" \
+  -H 'Content-Type: application/json' -H 'Device-Id: DE:AD:BE:EF:00:01' \
+  -d '{"version":2,"mac_address":"DE:AD:BE:EF:00:01","uuid":"cd-selftest","application":{"name":"xiaozhi","version":"2.5.2"},"board":{"type":"bread-compact-wifi-lcd","name":"cd","mac":"DE:AD:BE:EF:00:01"}}' 2>/dev/null || true)"
+OTA_ENDPOINT="$(echo "${OTA_JSON}" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("mqtt") or {}).get("endpoint",""))' 2>/dev/null || true)"
+[ -n "${OTA_ENDPOINT}" ] || die "OTA 冒烟失败（拿不到 mqtt.endpoint）"
+ok "OTA mqtt.endpoint = ${OTA_ENDPOINT}"
+case "${OTA_ENDPOINT}" in
+  "${SSH_DEST_HOST}":*) ok "endpoint 指向本机，正确" ;;
+  *) warn "endpoint 指向 ${OTA_ENDPOINT}，不是本机 ${SSH_DEST_HOST} —— 设备会连错地方！" ;;
+esac
+
+# 进程
+PID="$(remote "pgrep -f '${REMOTE_DIR}/bin/haimen serve' | head -1" 2>/dev/null || true)"
+[ -n "${PID}" ] || die "找不到运行中的 haimen 进程"
+ok "进程运行中（PID ${PID}）"
 
 # ─────────────────────────────────────────────
-# 8. 汇总
+# 7. 汇总
 # ─────────────────────────────────────────────
-step "部署完成"
-echo "  分支:       $BRANCH @ $GIT_SHA"
-echo "  镜像:       $RUN_IMAGE (= ${RUN_IMAGE%%:*}:$GIT_SHA)"
-echo "  容器:       $CONTAINER ($(docker ps --filter "name=$CONTAINER" --format '{{.Status}}'))"
-echo "  配置:       $CONFIG_DIR/settings.toml"
-echo "  Web UI:     http://localhost:$HOST_PORT"
-echo "  OTA 地址:   http://<本机局域网IP>:$HOST_PORT/xiaozhi/ota/   ⚠️ 结尾斜杠不能少"
 echo
-echo "  看日志:     docker logs -f $CONTAINER"
-echo "  看状态:     ./scripts/status.sh"
+echo "════════════════════════════════════════════"
+echo "✅ CD 完成"
+echo "   分支:    ${BRANCH} @ ${GIT_SHA}"
+echo "   目标:    ${DEPLOY_HOST}（原生二进制，launchd: ${LABEL}）"
+echo "   版本:    ${REMOTE_VER}"
+echo "   sha256:  ${LOCAL_SHA:0:16}…"
+echo "   OTA:     http://${SSH_DEST_HOST}:${HTTP_PORT}/xiaozhi/ota/   ⚠️ 结尾斜杠不能少"
+echo "   Web UI:  http://${SSH_DEST_HOST}:${HTTP_PORT}"
 echo
-echo "  ⚠️  设备如果卡在旧会话，需要【断电 10 秒】重启才能重连"
+echo "   看日志:  ssh ${DEPLOY_HOST} 'tail -f ~/${REMOTE_DIR}/logs/haimen.log'"
+echo "   回滚:    ./scripts/cd.sh --rollback"
+echo
+echo "   ⚠️  设备不重启就不会重新拉 OTA；改了 endpoint 需断电重启设备"
+echo "════════════════════════════════════════════"
