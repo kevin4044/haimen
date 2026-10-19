@@ -17,41 +17,15 @@ use crate::types::*;
 /// 并带上服务器时间、固件信息和音频参数。
 pub async fn handle_ota(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     Json(body): Json<OtaRequest>,
 ) -> Result<Json<OtaResponse>, (StatusCode, Json<serde_json::Value>)> {
     // 来源校验必须在派生密码之前：MQTT 模式下这个响应里带着设备的
     // 连接密码，谁能访问这个端点，谁就能冒充任意设备。
-    let private_only = current_xiaozhi_config().ota_allow_private_only;
-    if !ota_peer_allowed(peer.ip(), private_only) {
-        tracing::warn!(
-          %peer,
-          "OTA 请求来自非私有网络地址，拒绝（可配置 [xiaozhi] ota_allow_private_only 关闭该限制）"
-        );
+    if let Err(reason) = ota_source_allowed(peer.ip(), &uri, &headers, &current_xiaozhi_config()) {
+        tracing::warn!(%peer, reason, "OTA 来源校验未通过，拒绝");
         return Err(forbidden_ota_peer());
-    }
-    // 反向代理场景：TCP 对端就是代理自己（通常回环或内网），只查它会全部放行，
-    // 公网客户端照样能拿到派生密码。这里再对 X-Forwarded-For 的**最左**
-    // （最接近真实客户端）地址判一次，任一环不是内网就拒 —— 失败关闭。
-    //
-    // 直接连接时攻击者可以自己伪造这个头，但那只会让请求更容易被拒，
-    // 帮不到他；固件本身不发这个头，正常设备不受影响。
-    if private_only {
-        if let Some(client_ip) = first_forwarded_for_ip(&headers) {
-            tracing::warn!(
-              %peer,
-              %client_ip,
-              "OTA 请求带 X-Forwarded-For（说明前面有代理），额外校验真实客户端地址"
-            );
-            if !ota_peer_allowed(client_ip, true) {
-                tracing::warn!(
-                  %peer,
-                  %client_ip,
-                  "经代理转发的真实客户端不是私有网络地址，拒绝"
-                );
-                return Err(forbidden_ota_peer());
-            }
-        }
     }
     // 记录设备自报的固件与板子信息。
     // 用于排查「某个功能设备没反应」——比如 notify 需要较新固件，
@@ -103,6 +77,14 @@ pub async fn handle_ota(
 /// 必须在 HTTP 服务启动**之前**调用，否则第一台设备的 OTA 会拿到默认
 /// （websocket）配置。根 crate 在 `cli.rs` 里用 `AppConfig.xiaozhi` 调用它。
 pub fn set_xiaozhi_ota_config(cfg: XiaozhiConfig) {
+    // 启动即说明 OTA 的真实防护强度，避免「配了 IP 限制就安全了」的误解。
+    if cfg.ota_token.trim().is_empty() {
+        tracing::warn!(
+            private_only = cfg.ota_allow_private_only,
+            "OTA 端点未配置 ota_token：MQTT 模式下 /xiaozhi/ota/ 会向任何可达客户端           下发派生的连接密码。基于 IP 的限制在 Docker 端口映射 / 反向代理下           会被削弱（容器内看到的对端恒为网桥地址），只有令牌是可靠的。\
+           建议：设备 ota_url 带上 ?token=<随机串>，并在 [xiaozhi] 配同名 ota_token。"
+        );
+    }
     match ota_config_slot().lock() {
         Ok(mut guard) => *guard = cfg,
         Err(poisoned) => {
@@ -150,13 +132,89 @@ fn forbidden_ota_peer() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// 取 `X-Forwarded-For` 里最左（最接近真实客户端）的 IP。
+/// OTA 来源校验。返回 Err(原因) 表示拒绝。
 ///
-/// 该头格式是 `client, proxy1, proxy2`；解析不出来时返回 None（视为没有代理）。
-fn first_forwarded_for_ip(headers: &HeaderMap) -> Option<IpAddr> {
+/// 两道闸，任一不过就拒：
+///
+/// 1. **令牌**（若配置了 `ota_token`）：OTA 端点唯一无法伪造的凭据。
+///    IP 判断在 Docker 端口映射与反向代理下都会失效，令牌不会。
+/// 2. **来源地址**（若 `ota_allow_private_only`）：见 [`resolve_client_ip`]。
+///
+/// 刻意做成 fail-closed：只要无法确认来源是内网，就拒绝。
+fn ota_source_allowed(
+    peer: IpAddr,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    cfg: &XiaozhiConfig,
+) -> Result<(), &'static str> {
+    let expected = cfg.ota_token.trim();
+    if !expected.is_empty() {
+        let supplied = query_token(uri)
+            .or_else(|| {
+                headers
+                    .get("x-haimen-ota-token")
+                    .and_then(|v| v.to_str().ok())
+            })
+            .unwrap_or("");
+        if !constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+            return Err("OTA 令牌缺失或不匹配");
+        }
+        // 令牌对上了就不再依赖 IP 判定 —— 令牌本身就是强凭据。
+        return Ok(());
+    }
+    if !cfg.ota_allow_private_only {
+        return Ok(());
+    }
+    let client_ip = resolve_client_ip(peer, headers, &cfg.ota_trusted_proxies)
+        .ok_or("无法确定真实客户端地址（对端是代理但缺少可用的 X-Forwarded-For）")?;
+    if !ota_peer_allowed(client_ip, true) {
+        return Err("客户端不是私有网络地址");
+    }
+    Ok(())
+}
+
+/// 解析真实客户端地址。
+///
+/// - 对端**不在** `trusted_proxies` 里：客户端就是对端，`X-Forwarded-For`
+///   一律忽略 —— 任何人都能伪造这个头，读了只会被绕过。
+/// - 对端**在** `trusted_proxies` 里：说明请求经过了我们认可的代理，
+///   真实客户端只能从 `X-Forwarded-For` 得到。此时**从右往左**跳过同样
+///   可信的代理条目，取第一个非代理地址。
+///   （从右往左而不是从左往右：左侧条目完全由客户端控制，攻击者可以
+///   前置一个 `10.0.0.1` 冒充内网。）
+/// - 该头缺失、为空或无法解析：返回 None，由调用方按失败关闭处理。
+fn resolve_client_ip(
+    peer: IpAddr,
+    headers: &HeaderMap,
+    trusted_proxies: &[IpAddr],
+) -> Option<IpAddr> {
+    if !trusted_proxies.contains(&peer) {
+        return Some(peer);
+    }
     let raw = headers.get("x-forwarded-for")?.to_str().ok()?;
-    let first = raw.split(',').next()?.trim();
-    first.parse().ok()
+    for hop in raw.split(',').map(str::trim).rev() {
+        let Ok(ip) = hop.parse::<IpAddr>() else {
+            // 解析不了就当作不可信，直接失败关闭。
+            return None;
+        };
+        if !trusted_proxies.contains(&ip) {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+/// 从 `?token=` 取 OTA 令牌。
+fn query_token(uri: &axum::http::Uri) -> Option<&str> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "token").then_some(value)
+    })
+}
+
+/// 常量时间比较，避免按字节提前返回泄露令牌前缀。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn current_xiaozhi_config() -> XiaozhiConfig {
@@ -322,6 +380,124 @@ mod tests {
 
     /// 构建一个包含 Device-Id 头的最小请求
     /// OTA handler 现在要求 ConnectInfo；测试里统一用回环地址。
+    fn cfg_with(token: &str, private_only: bool, proxies: &[&str]) -> XiaozhiConfig {
+        let mut cfg = XiaozhiConfig::default();
+        cfg.ota_token = token.to_string();
+        cfg.ota_allow_private_only = private_only;
+        cfg.ota_trusted_proxies = proxies
+            .iter()
+            .map(|raw| raw.parse().expect("代理地址"))
+            .collect();
+        cfg
+    }
+
+    fn uri_with_token(token: &str) -> axum::http::Uri {
+        format!("/xiaozhi/ota/?token={token}").parse().expect("URI")
+    }
+
+    fn headers_with_xff(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_str(value).expect("头"));
+        headers
+    }
+
+    /// 对端不是可信代理时，`X-Forwarded-For` 必须被完全忽略 ——
+    /// 否则公网客户端只要自报一个内网地址就能绕过来源校验。
+    #[test]
+    fn forwarded_for_is_ignored_for_untrusted_peer() {
+        let peer: IpAddr = "8.8.8.8".parse().expect("ip");
+        let got = resolve_client_ip(peer, &headers_with_xff("10.0.0.1"), &[]);
+        assert_eq!(got, Some(peer), "不可信对端时 XFF 应被忽略");
+
+        // 即使伪造的 XFF 是内网地址，也照样判公网 → 拒绝
+        let cfg = cfg_with("", true, &[]);
+        assert!(
+            ota_source_allowed(peer, &test_uri(), &headers_with_xff("10.0.0.1"), &cfg).is_err(),
+            "伪造 XFF 不能绕过"
+        );
+    }
+
+    /// 对端是可信代理时，从**右往左**取第一个非代理地址。
+    ///
+    /// 从右往左是关键：左侧条目由客户端控制，攻击者可以前置
+    /// `10.0.0.1` 冒充内网；右侧的才是代理追加的真实来源。
+    #[test]
+    fn forwarded_for_uses_rightmost_untrusted_hop() {
+        let peer: IpAddr = "127.0.0.1".parse().expect("ip");
+        let rules: Vec<IpAddr> = vec!["127.0.0.1".parse().expect("ip")];
+
+        // 攻击者前置内网地址：真实客户端在右侧
+        let headers = headers_with_xff("10.0.0.1, 203.0.113.5");
+        assert_eq!(
+            resolve_client_ip(peer, &headers, &rules),
+            Some("203.0.113.5".parse().expect("ip")),
+            "应取右侧的真实客户端地址"
+        );
+
+        // 中间还有一跳可信代理：继续往左跳过
+        let rules2: Vec<IpAddr> = vec![
+            "127.0.0.1".parse().expect("ip"),
+            "10.0.0.2".parse().expect("ip"),
+        ];
+        let headers2 = headers_with_xff("1.2.3.4, 10.0.0.2");
+        assert_eq!(
+            resolve_client_ip(peer, &headers2, &rules2),
+            Some("1.2.3.4".parse().expect("ip"))
+        );
+    }
+
+    /// 对端是可信代理但缺少 XFF → 失败关闭（不能默认放行）。
+    #[test]
+    fn trusted_proxy_without_forwarded_header_fails_closed() {
+        let peer: IpAddr = "127.0.0.1".parse().expect("ip");
+        let rules: Vec<IpAddr> = vec!["127.0.0.1".parse().expect("ip")];
+        assert_eq!(resolve_client_ip(peer, &HeaderMap::new(), &rules), None);
+
+        let cfg = cfg_with("", true, &["127.0.0.1"]);
+        assert!(
+            ota_source_allowed(peer, &test_uri(), &HeaderMap::new(), &cfg).is_err(),
+            "缺少 XFF 时应拒绝"
+        );
+    }
+
+    /// 配置了令牌时：缺失/错误都拒，正确才放行（且不再依赖 IP）。
+    #[test]
+    fn token_is_required_when_configured() {
+        let cfg = cfg_with("s3cret", true, &[]);
+        let public: IpAddr = "8.8.8.8".parse().expect("ip");
+
+        assert!(
+            ota_source_allowed(public, &test_uri(), &HeaderMap::new(), &cfg).is_err(),
+            "缺少令牌应拒绝"
+        );
+        assert!(
+            ota_source_allowed(public, &uri_with_token("wrong"), &HeaderMap::new(), &cfg).is_err(),
+            "令牌错误应拒绝"
+        );
+        assert!(
+            ota_source_allowed(public, &uri_with_token("s3cret"), &HeaderMap::new(), &cfg).is_ok(),
+            "令牌正确应放行（令牌本身就是强凭据）"
+        );
+
+        // 也支持头部传递
+        let mut headers = HeaderMap::new();
+        headers.insert("x-haimen-ota-token", HeaderValue::from_static("s3cret"));
+        assert!(ota_source_allowed(public, &test_uri(), &headers, &cfg).is_ok());
+    }
+
+    /// 查询参数解析与常量时间比较的基础行为。
+    #[test]
+    fn token_query_and_compare() {
+        assert_eq!(query_token(&uri_with_token("abc")), Some("abc"));
+        assert_eq!(query_token(&test_uri()), None);
+        let with_others: axum::http::Uri = "/xiaozhi/ota/?k=v&token=xyz".parse().expect("URI");
+        assert_eq!(query_token(&with_others), Some("xyz"));
+
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"same", b"diff"));
+        assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
     /// OTA 来源策略：默认只放行私有/回环地址。
     #[test]
     fn ota_peer_policy_allows_private_only() {
@@ -365,61 +541,6 @@ mod tests {
         }
     }
 
-    /// 反向代理场景：TCP 对端是代理（内网），真实客户端在 X-Forwarded-For 里。
-    /// 只查对端会让公网客户端混进来，所以必须同时校验最左的那个 IP。
-    #[tokio::test]
-    async fn ota_rejects_public_forwarded_client() {
-        let _lock = ota_test_lock();
-        let mut headers = make_headers();
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("8.8.8.8, 192.168.1.1"),
-        );
-        let result = handle_ota(
-            test_peer(), // 对端是回环（模拟代理）
-            headers,
-            Json(sample_request("84:c7:bb:59:93:64")),
-        )
-        .await;
-        let (status, _) = result.expect_err("经代理转发的公网客户端应被拒绝");
-        assert_eq!(status, StatusCode::FORBIDDEN);
-    }
-
-    /// 经代理转发的内网客户端应当放行（不能把正常设备挡在门外）。
-    #[tokio::test]
-    async fn ota_allows_private_forwarded_client() {
-        let _lock = ota_test_lock();
-        let mut headers = make_headers();
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("192.168.110.59, 192.168.1.1"),
-        );
-        let result = handle_ota(
-            test_peer(),
-            headers,
-            Json(sample_request("84:c7:bb:59:93:64")),
-        )
-        .await;
-        assert!(result.is_ok(), "内网转发来源应放行");
-    }
-
-    /// X-Forwarded-For 解析：取最左一项，解析不了当没有代理。
-    #[test]
-    fn forwarded_for_parsing() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(first_forwarded_for_ip(&headers), None);
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("10.0.0.1, 10.0.0.2"),
-        );
-        assert_eq!(
-            first_forwarded_for_ip(&headers),
-            Some("10.0.0.1".parse().unwrap())
-        );
-        headers.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
-        assert_eq!(first_forwarded_for_ip(&headers), None);
-    }
-
     /// 公网来源的 OTA 请求必须被拒 —— 否则它能拿到派生 MQTT 密码。
     #[tokio::test]
     async fn ota_rejects_public_peer() {
@@ -427,6 +548,7 @@ mod tests {
         let peer = ConnectInfo(SocketAddr::from(([8, 8, 8, 8], 1234)));
         let result = handle_ota(
             peer,
+            test_uri(),
             make_headers(),
             Json(sample_request("84:c7:bb:59:93:64")),
         )
@@ -437,6 +559,11 @@ mod tests {
 
     fn test_peer() -> ConnectInfo<SocketAddr> {
         ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0)))
+    }
+
+    /// 默认不带 query 的请求 URI。
+    fn test_uri() -> axum::http::Uri {
+        "/xiaozhi/ota/".parse().expect("URI")
     }
 
     fn make_headers() -> HeaderMap {
@@ -488,7 +615,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(test_peer(), headers, Json(body)).await;
+        let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
         assert!(result.is_err());
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -510,7 +637,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(test_peer(), headers, Json(body)).await;
+        let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
         assert!(result.is_ok());
 
         let response = result.unwrap().0;
@@ -540,7 +667,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(test_peer(), headers, Json(body)).await;
+        let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
         assert!(result.is_ok());
 
         let response = result.unwrap().0;
@@ -570,7 +697,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(test_peer(), headers, Json(body)).await;
+        let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
         assert!(result.is_ok());
 
         let response = result.unwrap().0;
@@ -596,7 +723,7 @@ mod tests {
             ota: None,
         };
 
-        let result = handle_ota(test_peer(), headers, Json(body)).await;
+        let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
         assert!(result.is_ok());
 
         let response = result.unwrap().0;
@@ -615,6 +742,7 @@ mod tests {
 
         let response = handle_ota(
             test_peer(),
+            test_uri(),
             make_headers(),
             Json(sample_request("84:c7:bb:59:93:64")),
         )
@@ -633,6 +761,7 @@ mod tests {
 
         let response = handle_ota(
             test_peer(),
+            test_uri(),
             make_headers(),
             Json(sample_request("84:c7:bb:59:93:64")),
         )

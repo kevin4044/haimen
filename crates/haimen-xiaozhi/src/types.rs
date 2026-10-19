@@ -246,6 +246,29 @@ pub struct XiaozhiConfig {
     /// 这个端点的可达范围。
     #[serde(default = "default_ota_allow_private_only")]
     pub ota_allow_private_only: bool,
+    /// OTA 共享令牌（可选，但强烈建议设置）。
+    ///
+    /// **这是 OTA 端点唯一无法被伪造的关卡。** 基于 IP 的判断在
+    /// Docker 端口映射 / 反向代理下都会失效 —— 容器里看到的对端永远是
+    /// 网桥地址，X-Forwarded-For 又可以由客户端伪造。而 ota_url 存在设备
+    /// NVS 里、由我们在 `http->Open()` 时原样发出，所以把令牌放进
+    /// query 就能形成真正的共享密钥：
+    ///
+    /// ```text
+    /// 设备 NVS ota_url = http://<host>:9527/xiaozhi/ota/?token=<令牌>
+    /// haimen settings  [xiaozhi] ota_token = "<同一个令牌>"
+    /// ```
+    ///
+    /// 为空表示不校验（向后兼容，但 OTA 仍能被任意可达客户端利用）。
+    #[serde(default)]
+    pub ota_token: String,
+    /// 可信反向代理地址列表。
+    ///
+    /// 只有当 TCP 对端在这个列表里时，才会去读 `X-Forwarded-For`，
+    /// 并从右往左跳过同样是可信代理的条目，取第一个非代理地址作为
+    /// 真实客户端。对端不在列表里时 **完全忽略** 该头（它可被伪造）。
+    #[serde(default)]
+    pub ota_trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for XiaozhiConfig {
@@ -255,6 +278,8 @@ impl Default for XiaozhiConfig {
             mqtt: XiaozhiMqttConfig::default(),
             udp: XiaozhiUdpConfig::default(),
             ota_allow_private_only: true,
+            ota_token: String::new(),
+            ota_trusted_proxies: Vec::new(),
         }
     }
 }
