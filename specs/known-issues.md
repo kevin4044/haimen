@@ -364,3 +364,22 @@ if (cJSON_IsBool(hide_subtitle)) {
 2. 自己编译固件，加 `CONFIG_USE_WECHAT_MESSAGE_STYLE=y`
    （恢复气泡 UI）或 `CONFIG_USE_MULTILINE_CHAT_MESSAGE=y`（底部多行）
 3. 用 MCP `self.assets.set_download_url` 让设备下载自定义 assets
+
+---
+
+## 待办：从开源对比里捞出来的「小而准」修正（2026-10-19 记录）
+
+来源：`specs/对比-xiaozhi-esp32-server.md`（xiaozhi-esp32-server v0.9.7 深读）。
+用户当前决定：**先记下来，暂不实施**。
+
+| # | 事项 | 参考实现位置 | 成本 | 收益 |
+|---|---|---|---|---|
+| A | **唤醒后 2 秒内屏蔽 VAD**（强制 `have_voice=false`） | `receiveAudioHandle.py:20-26,37-40` | 1h | 消掉「自己的提示音/唤醒回声把自己打断」一类误判 |
+| B | **最短有效语音 900ms**（低于此长度直接丢弃，不调 LLM） | `asr/base.py:79` | 1h | 关门/咳嗽不再触发一整轮对话 |
+| C | **预卷 600ms**（VAD 触发时先补发前 10 帧给 ASR） | `asr/base.py:71` + `doubao_stream.py:123-136` | 半天 | 首字不丢，直接提识别率 |
+| D | **退出词改精确匹配**（现在是 `contains`，会把「再见面」误判成「再见」） | `intentHandler.py:53-63` | 1h | 减少误收口 |
+| E | **首句用更宽的标点集切分**（含「，、,」，首句遇逗号就切） | `tts/base.py:84-107` | 半天 | 首帧更早出声（首句延迟下降最明显） |
+| F | **悬空 `tool_calls` 修复** | `dialogue.py:64-92` | 半天 | 语音场景高频打断，迟早触发 OpenAI 兼容接口 400 |
+| G | **收口 15s → 可配（如 60~120s）+ 关闭前说句告别语** | `receiveAudioHandle.py:110-136` | 半天 | 体验柔和；现在 15s 静默直接 goodbye 很生硬 |
+
+优先级判断：**A/B/D 各 1 小时，可以先做**；C/E 半天，配合 Silero VAD 一起做更划算；F 是稳定性隐患；G 属体验。
