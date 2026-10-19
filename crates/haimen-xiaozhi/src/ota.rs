@@ -107,9 +107,20 @@ fn ota_peer_allowed(peer: IpAddr, private_only: bool) -> bool {
         return true;
     }
     match peer {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback(),
+        IpAddr::V4(v4) => is_private_v4(v4),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unique_local()      // fd00::/8
+                || v6.is_unicast_link_local() // fe80::/10
+                // 双栈监听会把 IPv4 连接呈现成 IPv4-mapped 的 IPv6（::ffff:a.b.c.d），
+                // 不还原成 v4 判一次的话，局域网设备会被误拒、拿不到 OTA。
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_private_v4(v4))
+        }
     }
+}
+
+fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_private() || v4.is_loopback() || v4.is_link_local()
 }
 
 fn current_xiaozhi_config() -> XiaozhiConfig {
@@ -292,6 +303,30 @@ mod tests {
         // 关闭限制时一律放行
         assert!(ota_peer_allowed(public, false));
         assert!(ota_peer_allowed(public_v6, false));
+    }
+
+    /// IPv6 的内网地址也必须放行：双栈监听的 IPv4-mapped 地址、
+    /// 唯一本地地址（fd00::/8）、链路本地地址（fe80::/10）。
+    #[test]
+    fn ota_peer_policy_allows_private_ipv6() {
+        use std::net::IpAddr;
+        let cases = [
+            ("::1", true),
+            ("fd00::1", true),
+            ("fe80::1", true),
+            ("::ffff:192.168.1.10", true), // IPv4-mapped 的局域网地址
+            ("::ffff:127.0.0.1", true),    // IPv4-mapped 的回环
+            ("::ffff:8.8.8.8", false),     // IPv4-mapped 的公网地址
+            ("2001:4860:4860::8888", false),
+        ];
+        for (raw, expect) in cases {
+            let ip: IpAddr = raw.parse().expect("解析 IP");
+            assert_eq!(
+                ota_peer_allowed(ip, true),
+                expect,
+                "{raw} 的判定应为 {expect}"
+            );
+        }
     }
 
     /// 公网来源的 OTA 请求必须被拒 —— 否则它能拿到派生 MQTT 密码。
