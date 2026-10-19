@@ -600,6 +600,16 @@ const SILENCE_RMS_THRESHOLD: f64 = 3000.0;
 /// 注意：这条路径只有 `SILENCE_RMS_THRESHOLD` 能正确区分人声与噪音时才生效。
 const MAX_SILENCE_FRAMES: u64 = 15;
 
+/// 批处理 ASR 兜底的超时。
+///
+/// 原来写死 30 秒。实测（2026-10-19）批处理路径 3 次触发 0 次成功，
+/// 最长的一次让用户干等了整整 30 秒 —— 现象就是「助手卡住了」。
+///
+/// 兜底的意义是「补救」，不是「让用户等半分钟」：一个几秒钟的音频，
+/// 正常 ASR 1~2 秒就该出结果，6 秒还没出就是没戏，不如早点回一句
+/// 「没听清」让用户重说。
+const BATCH_ASR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// 无语音超时帧数阈值：按 60ms/帧向上取整，保证实际时长 ≥ 配置值
 fn no_speech_threshold_frames(timeout_ms: u64) -> u64 {
     timeout_ms.div_ceil(60)
@@ -1209,13 +1219,10 @@ impl AsrLlmTtsStrategy {
 
         let audio_stream = adapt_audio_input(AudioInput::Data(pcm_16k), DEFAULT_CHUNK_SIZE);
 
-        let text = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            asr_listen_to_text(&*asr, audio_stream),
-        )
-        .await
-        .map_err(|_| "ASR 识别超时 (30s)".to_string())?
-        .map_err(|e| format!("ASR 识别失败: {}", e))?;
+        let text = tokio::time::timeout(BATCH_ASR_TIMEOUT, asr_listen_to_text(&*asr, audio_stream))
+            .await
+            .map_err(|_| format!("批处理 ASR 超时 ({}s)", BATCH_ASR_TIMEOUT.as_secs()))?
+            .map_err(|e| format!("ASR 识别失败: {}", e))?;
 
         if text.is_empty() {
             return Ok(None);
@@ -3066,12 +3073,21 @@ async fn asr_listen_to_text(
         .map_err(|e| format!("ASR 启动失败: {}", e))?;
 
     let mut full_text = String::new();
+    // 火山在 end_window_size 偏短时不会发 is_final，只发中间结果。
+    // 只认 is_final 的话这里会永远拿到空串 —— 实测批处理兜底 3 次触发 0 次成功，
+    // 而且流也结束不了，只能干等超时。
+    // 这里保留最后一次非空结果兜底，与流式路径的 last_nonempty_text 保持一致。
+    let mut last_nonempty_text = String::new();
     let mut chunk_count = 0;
 
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(chunk) => {
                 chunk_count += 1;
+                // univoice 的 chunk.text 是【累积文本】，整体替换即可，不用拼接。
+                if !chunk.text.is_empty() {
+                    last_nonempty_text.clone_from(&chunk.text);
+                }
                 if chunk.is_final && !chunk.text.is_empty() {
                     full_text.push_str(&chunk.text);
                 }
@@ -3080,6 +3096,15 @@ async fn asr_listen_to_text(
                 tracing::warn!("ASR 识别块错误: {}", e);
             }
         }
+    }
+
+    if full_text.is_empty() && !last_nonempty_text.is_empty() {
+        tracing::warn!(
+            chunk_count = chunk_count,
+            text_len = last_nonempty_text.len(),
+            "批处理 ASR: 未收到 is_final 块，使用最后中间结果兜底",
+        );
+        full_text = last_nonempty_text;
     }
 
     tracing::debug!(
