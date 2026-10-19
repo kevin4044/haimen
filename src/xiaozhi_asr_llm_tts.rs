@@ -1125,6 +1125,20 @@ impl AsrLlmTtsStrategy {
         error: Option<&str>,
         started: std::time::Instant,
     ) {
+        // 记录 agent 的完整回复原文。
+        //
+        // 为什么需要：出过「模型只说了一句『我先帮你查一下』就结束回合」的事故，
+        // 而原来只记 TTS 首块（2 个字），事后完全看不出模型到底说了什么，
+        // 只能靠 Hermes 侧的 token 计数反推。一行/轮，不是噪音。
+        if let Some(text) = output {
+            tracing::warn!(
+                session_id = %session_id,
+                status,
+                chars = text.chars().count(),
+                text = %text,
+                "Agent 回复全文"
+            );
+        }
         let events = Self::take_agent_events(agent_events).await;
         self.record_agent_log(
             user_text,
