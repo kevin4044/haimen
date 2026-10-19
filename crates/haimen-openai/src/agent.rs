@@ -258,6 +258,19 @@ impl AgentProvider for OpenAIAgent {
         Ok((stream, sid, events_rx))
     }
 
+    /// 丢弃某个会话的全部历史。
+    ///
+    /// 由策略层在设备 hello（新对话开始）时调用。历史原先只靠条数上限
+    /// 自然淘汰，条目按 session_id 永久留存 —— 设备每唤醒一次就可能换一个
+    /// session_id，旧条目再没人读却一直占着内存，这同时是泄漏和「上一轮
+    /// 内容污染下一轮」的根源。
+    fn drop_session(&self, session_id: &str) {
+        // 锁中毒只说明别的线程 panic 过；清理失败不该反过来打断新对话。
+        if let Ok(mut history) = self.history.lock() {
+            let _ = history.remove(session_id);
+        }
+    }
+
     /// `GET {base_url}/models`：200 可用，401/403 视为鉴权失败
     async fn check_available(&self) -> Result<(), String> {
         if self.base_url.is_empty() {
@@ -786,6 +799,56 @@ mod tests {
                 ("assistant", "reply-b")
             ]
         );
+    }
+
+    /// hello 清上下文后，旧会话的历史条目必须真的从 map 里消失：
+    /// 只清 session_id 不清历史的话，内存泄漏还在，Agent 也会继续带着旧对话。
+    #[test]
+    fn test_drop_session_removes_history_entry() {
+        let agent = OpenAIAgent::new("http://127.0.0.1:1", None, "m", 0);
+        let (sid, _, turn_id) = agent
+            .prepare_turn("第一轮", Some("sess"))
+            .expect("prepare 应成功");
+        commit_assistant(&agent.history, &sid, DEFAULT_HISTORY_CAP, turn_id, "回答")
+            .expect("写入 assistant 应成功");
+        assert!(
+            agent.history.lock().expect("锁").contains_key(&sid),
+            "准备阶段应已建立历史条目"
+        );
+
+        agent.drop_session(&sid);
+        assert!(
+            agent.history.lock().expect("锁").get(&sid).is_none(),
+            "drop_session 后该会话的历史条目应被删除"
+        );
+
+        // 删不存在的会话是 no-op，不能 panic
+        agent.drop_session("never-seen");
+    }
+
+    /// 清掉旧会话后开新会话，第二轮请求不能带上上一轮的任何消息。
+    #[test]
+    fn test_drop_session_leaves_new_session_clean() {
+        let agent = OpenAIAgent::new("http://127.0.0.1:1", None, "m", 0);
+        let (old_sid, _, old_turn) = agent
+            .prepare_turn("上一轮的问题", None)
+            .expect("prepare 应成功");
+        commit_assistant(
+            &agent.history,
+            &old_sid,
+            DEFAULT_HISTORY_CAP,
+            old_turn,
+            "上一轮的回答",
+        )
+        .expect("写入 assistant 应成功");
+        agent.drop_session(&old_sid);
+
+        let (new_sid, messages, _) = agent
+            .prepare_turn("新对话的问题", None)
+            .expect("prepare 应成功");
+        assert_ne!(new_sid, old_sid, "新会话应拿到新的 session_id");
+        assert_eq!(messages.len(), 1, "新对话不应带上一轮的历史");
+        assert_eq!(messages[0].content, "新对话的问题");
     }
 
     #[test]

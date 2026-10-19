@@ -33,7 +33,12 @@
 //! # 多轮对话
 //!
 //! 策略内部维护 LLM 的 `session_id`，每次 `generate_response` 调用后更新，
-//! 实现音色多轮对话的上下文连续性。
+//! 实现一次对话内部的多轮上下文连续性。
+//!
+//! 上下文的边界是「设备 hello → goodbye」：hello 时
+//! [`ResponseStrategy::on_conversation_start`] 会清掉上一轮留下的 session_id，
+//! 并让 Agent 丢掉它本地存的历史。否则设备重连后仍会复用旧 session，上一轮
+//! 内容被整包带进新对话（改了 Agent 的提示词也不生效，因为模型在模仿旧对话）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1845,6 +1850,38 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             state.silence_closed = false;
         })?;
 
+        Ok(())
+    }
+
+    /// 设备 hello：新的 hello → goodbye 对话开始，丢掉上一轮留下的会话上下文。
+    ///
+    /// 为什么必须在这里清：`llm_session_id` 是按 session_key（client_id）存的，
+    /// 设备 goodbye 后通常不换 MQTT 连接就再发 hello，这条记录会一直留着，
+    /// 上一轮对话于是被整包带进下一轮 —— 表现就是改了 Agent 的 SOUL.md 却不生效，
+    /// 因为模型还在模仿旧对话的语气。只清 session_id 还不够：OpenAI 兼容 Agent
+    /// 在进程内另存了一份按 session_id 索引的历史，得让它一起丢掉。
+    ///
+    /// 失败只上报、不 panic：清理失败最多让这一轮多带点旧内容，
+    /// 不能反过来把设备已经成功的 hello 流程判死。
+    async fn on_conversation_start(&self, session_key: &str) -> Result<(), String> {
+        // take() 而不是 clone()：旧 session 只能被消费一次，
+        // 避免并发的 hello 看到同一个 id 重复清历史。
+        let old = self.with_session(session_key, |state| state.llm_session_id.take())?;
+        let Some(old) = old else {
+            // 首次 hello（或刚被清过）时无事可做，安静返回。
+            return Ok(());
+        };
+        // 用当前生效的 Agent：热切换后旧会话本来就已按代数作废，
+        // 这里 drop 只是尽力回收那份历史，不要求代数匹配。
+        let agent = crate::gateway::agent_handle::current_agent(&self.agent);
+        agent.drop_session(&old.session_id);
+        // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+        // 这行是验证「新对话确实清掉了旧上下文」的关键证据，必须可见。
+        tracing::warn!(
+            session_key = %session_key,
+            old_llm_session = %old.session_id,
+            "新 hello：已清空上一轮 LLM 会话与对话历史"
+        );
         Ok(())
     }
 
@@ -3782,6 +3819,45 @@ mod tests {
         }
     }
 
+    /// 模拟 Agent：记录 drop_session 被调用的 session_id
+    ///
+    /// 用它验证「hello 时不仅清掉策略侧的 session_id，还让 Agent 丢掉本地历史」。
+    struct DropRecordingAgent {
+        dropped: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl AgentProvider for DropRecordingAgent {
+        fn name(&self) -> &str {
+            "drop-recording-agent"
+        }
+
+        async fn process(
+            &self,
+            message: &str,
+            _session_id: Option<&str>,
+            _work_dir: &str,
+        ) -> Result<(AgentOutput, String), String> {
+            Ok((
+                AgentOutput {
+                    text: message.to_string(),
+                    events: Vec::new(),
+                },
+                "drop-recording-session".to_string(),
+            ))
+        }
+
+        async fn check_available(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn drop_session(&self, session_id: &str) {
+            if let Ok(mut dropped) = self.dropped.lock() {
+                dropped.push(session_id.to_string());
+            }
+        }
+    }
+
     fn test_tts_config() -> crate::config::settings::TtsConfig {
         let mut providers = std::collections::HashMap::new();
         let mut creds = std::collections::HashMap::new();
@@ -4102,6 +4178,104 @@ mod tests {
             strategy.llm_session_at("test", 1).unwrap(),
             None,
             "Agent 换代后旧会话应作废，避免传给新 Agent"
+        );
+    }
+
+    /// 下一次 hello：上一轮残留的 LLM session_id 必须变成 None。
+    #[tokio::test]
+    async fn test_t18c_conversation_start_clears_llm_session() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy.store_llm_session_at("dev", "old-session".to_string(), 0);
+        assert_eq!(
+            strategy.llm_session_at("dev", 0).unwrap().as_deref(),
+            Some("old-session")
+        );
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("on_conversation_start 不应失败");
+
+        assert!(
+            strategy.llm_session_at("dev", 0).unwrap().is_none(),
+            "新 hello 后 llm_session_id 应为 None"
+        );
+    }
+
+    /// 首次 hello（没有旧会话）也要安全返回，且不该调用 Agent 的 drop_session。
+    #[tokio::test]
+    async fn test_t18d_conversation_start_without_old_session() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let strategy = make_strategy(Arc::new(DropRecordingAgent {
+            dropped: Arc::clone(&dropped),
+        }));
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("没有旧会话时也应返回 Ok");
+
+        assert!(
+            dropped.lock().expect("锁").is_empty(),
+            "没有旧 session 时不应调用 drop_session"
+        );
+    }
+
+    /// 清 session_id 的同时必须让 Agent 丢掉对应历史，否则内存泄漏和
+    /// 「上一轮污染下一轮」都还在。
+    #[tokio::test]
+    async fn test_t18e_conversation_start_drops_agent_history() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let strategy = make_strategy(Arc::new(DropRecordingAgent {
+            dropped: Arc::clone(&dropped),
+        }));
+        strategy.store_llm_session_at("dev", "old-session".to_string(), 0);
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("on_conversation_start 不应失败");
+
+        assert_eq!(
+            dropped.lock().expect("锁").as_slice(),
+            ["old-session"],
+            "应把旧 session_id 交给 Agent 丢弃历史"
+        );
+
+        // 再 hello 一次：旧会话已清，不能重复 drop
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("重复调用不应失败");
+        assert_eq!(
+            dropped.lock().expect("锁").len(),
+            1,
+            "同一旧 session 只该被丢弃一次"
+        );
+    }
+
+    /// 一次 hello → goodbye 内部的多轮必须持续复用同一个 LLM 会话，
+    /// 只有下一次 hello 才清 —— 否则多轮对话会被误清成单轮。
+    #[test]
+    fn test_t18f_same_conversation_reuses_llm_session_across_turns() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        // 第一轮：没有旧会话，Agent 返回 session 后落盘
+        assert!(strategy.llm_session_at("dev", 0).unwrap().is_none());
+        strategy.store_llm_session_at("dev", "mock-session-id".to_string(), 0);
+
+        // 第二轮：应带上第一轮的 session_id 继续同一会话
+        assert_eq!(
+            strategy.llm_session_at("dev", 0).unwrap().as_deref(),
+            Some("mock-session-id"),
+            "同一对话的第二轮应复用第一轮的 session_id"
+        );
+        strategy.store_llm_session_at("dev", "mock-session-id".to_string(), 0);
+
+        // 第三轮：仍然复用，说明轮间没有误清
+        assert_eq!(
+            strategy.llm_session_at("dev", 0).unwrap().as_deref(),
+            Some("mock-session-id"),
+            "同一对话的第三轮仍应复用同一个 session_id"
         );
     }
 

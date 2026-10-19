@@ -817,6 +817,17 @@ async fn handle_hello(shared: &Arc<Shared>, client_id: &str, value: serde_json::
         return;
     }
     tracing::info!(%client_id, %protocol_session_id, %server, port, "UDP hello 已下发");
+
+    // hello 下发成功 = 设备确实开始了一次新对话，这时才通知策略清掉上一轮的
+    // 会话级上下文（LLM session_id / 本地对话历史）。
+    //
+    // 位置必须在下发之后：下发失败时设备根本没开通道，此时清掉上下文纯属白干；
+    // 也必须在下发之后同步等待，保证紧接着的 listen start 一定看到清空后的状态
+    // （主循环是单线程顺序处理 MQTT 消息的）。
+    // 失败只 warn：清理是优化，不能反过来把已经成功的 hello 流程判死。
+    if let Err(err) = shared.strategy.on_conversation_start(client_id).await {
+        tracing::warn!(%client_id, %err, "on_conversation_start 失败，忽略并继续 hello 流程");
+    }
 }
 
 async fn handle_listen(shared: &Arc<Shared>, client_id: &str, value: serde_json::Value) {
@@ -1855,6 +1866,7 @@ mod tests {
     const CLIENT_ID: &str = "GID_haimen@@@84:c7:bb:59:93:64@@@84:c7:bb:59:93:64";
 
     struct MockInner {
+        conversation_starts: Vec<String>,
         recording_starts: Vec<String>,
         audio_frames: Vec<AudioFrame>,
         generate_calls: usize,
@@ -1869,6 +1881,7 @@ mod tests {
         fn new(playback: Vec<AudioFrame>) -> Self {
             Self {
                 inner: StdMutex::new(MockInner {
+                    conversation_starts: Vec::new(),
                     recording_starts: Vec::new(),
                     audio_frames: Vec::new(),
                     generate_calls: 0,
@@ -1922,6 +1935,11 @@ mod tests {
             frame: &AudioFrame,
         ) -> Result<(), String> {
             self.lock().audio_frames.push(frame.clone());
+            Ok(())
+        }
+
+        async fn on_conversation_start(&self, session_key: &str) -> Result<(), String> {
+            self.lock().conversation_starts.push(session_key.to_owned());
             Ok(())
         }
     }
@@ -2244,6 +2262,64 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(env.mock.lock().recording_starts, vec![session_id]);
+        env.shutdown().await;
+    }
+
+    /// hello 成功下发之后必须通知策略「新对话开始」，策略据此清上一轮上下文。
+    /// 断言里用 client_id 而不是协议 session_id：设备重连后协议 session_id 会变，
+    /// 拿它当键就找不到上一轮的状态，清理也就落空了。
+    #[tokio::test]
+    async fn hello_calls_on_conversation_start() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.hello().await;
+        // hello 是「先下发、再调钩子」，所以这里要等钩子跑完而不是立刻断言
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().conversation_starts.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "on_conversation_start 没有被调用"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            env.mock.lock().conversation_starts,
+            vec![CLIENT_ID.to_owned()]
+        );
+        env.shutdown().await;
+    }
+
+    /// 一次对话内部（hello 之后、goodbye 之前）的多轮不能触发清理：
+    /// listen stop → start 是同一轮对话里的下一句，上下文必须保留。
+    #[tokio::test]
+    async fn listen_round_does_not_call_on_conversation_start() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.hello().await;
+        // 等 hello 的钩子到齐，避免把它的调用算进下一轮的增量
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while env.mock.lock().conversation_starts.is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "hello 钩子未触发");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before = env.mock.lock().conversation_starts.len();
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().recording_starts.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "录音没有开始");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            env.mock.lock().conversation_starts.len(),
+            before,
+            "同一对话内的下一轮不应触发 on_conversation_start（否则上下文被误清）"
+        );
         env.shutdown().await;
     }
 
