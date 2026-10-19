@@ -98,7 +98,7 @@ case "$TASK" in
     MIN_TESTS=10
     ;;
   *)
-    fail "未知任务 $TASK（已实现 T1 / T2 / T3 / T4 / T5）"
+    fail "未知任务 ${TASK}（已实现 T1 / T2 / T3 / T4 / T5）"
     echo; echo "验收失败：$FAILURES 项"; exit 1
     ;;
 esac
@@ -432,7 +432,7 @@ pass "未触碰 ws.rs / protocol.rs / strategy.rs"
 if [ "$TASK" != "T5" ]; then
     for f in crates/haimen-xiaozhi/src/types.rs crates/haimen-xiaozhi/src/ota.rs; do
         if git status --porcelain | grep -q " $f$"; then
-            fail "不应改动 $f（仅 T5 允许）"
+            fail "不应改动 ${f}（仅 T5 允许）"
         fi
     done
     pass "未触碰 types.rs / ota.rs（非 T5）"

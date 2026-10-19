@@ -81,7 +81,7 @@ if [ "$CODE" = "200" ]; then
     cat /tmp/st_sys.json 2>/dev/null | sed 's/^/      /'
     echo
 else
-    bad "HTTP $CODE（服务未响应）"
+    bad "HTTP ${CODE}（服务未响应）"
 fi
 
 # ── 5. 语音配置 ──
