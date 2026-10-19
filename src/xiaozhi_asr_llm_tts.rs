@@ -402,6 +402,9 @@ async fn tts_aggregate_task(
     cleaned_full: Arc<Mutex<String>>,
 ) {
     let mut agg = TtsTextAggregator::new(TTS_AGGREGATE_THRESHOLD);
+    // 每条回复只打一次首块长度：它直接决定「第一帧音频多久后出声」。
+    // 一行/轮的代价，换来 E（首句宽标点切分）这类改动的可验证性。
+    let mut first_block_logged = false;
     let mut interval = tokio::time::interval(TTS_FLUSH_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = interval.tick().await; // 跳过首 tick
@@ -412,6 +415,14 @@ async fn tts_aggregate_task(
                 match chunk {
                     Some(delta) => {
                         for block in agg.push(&delta) {
+                            if !first_block_logged {
+                                first_block_logged = true;
+                                tracing::warn!(
+                                    chars = block.chars().count(),
+                                    text = %block,
+                                    "TTS 首块（长度决定首帧延迟）"
+                                );
+                            }
                             if !emit_block(&agg_tx, &cleaned_full, block).await {
                                 return;
                             }
