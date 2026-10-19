@@ -280,3 +280,58 @@ MQTT+UDP：音频帧走 UDP，不可靠、可能乱序/丢包
 
 需要一个「这句话说完后要结束会话」的信号，从策略传到传输层。
 可参考现有的 `no_speech_completion()` / `goodbye_frames()` 钩子设计。
+
+---
+
+## 里程碑：固件升级 2.2.6 → 2.5.2（2026-10-19）
+
+**设备**：`bread-compact-wifi-lcd`（ESP32-S3，LCD ST7789 240x320）
+**固件**：`v2.5.2_bread-compact-wifi-lcd.zip`
+（SHA256 `0523dfcac6129718707048d41982d4cbdbcbadcd197ecd4783133aa218f1ff72`）
+
+### 刷机方式与结果
+
+**无需 erase，直接刷 merged-binary.bin**：
+```
+esptool.py --chip esp32s3 -p <port> -b 460800 write_flash 0x0 merged-binary.bin
+```
+
+依据（三条实证）：
+1. 官方发布包只有 `merged-binary.bin`，设计就是从 0x0 直刷
+2. 2.2.6 与 2.5.2 的分区表 `partitions/v2/16m.csv` **逐字节相同**
+   （nvs 0x9000/0x4000、otadata 0xd000、ota_0 0x20000、assets 0x800000）
+3. `idf.py merge-bin` 不含 nvs 分区 → NVS 里的 WiFi 凭据与 `ota_url` 都保留
+
+实测：刷完设备仍拉取我们的 OTA（`ota_url` 保住），OTA 日志确认
+`app_version=2.5.2`、`board=bread-compact-wifi-lcd`、MAC 未变。
+
+### notify 能力验证通过 ✅
+
+固件 2.5.2 支持 `notify`（2.2.6 不支持，当时完全无反应）。
+
+实测流程：
+```
+1. 起 HTTP 服务提供单声道 Ogg Opus（ffmpeg 从 say 生成）
+2. 通过控制面 haimen/ctl/<client_id> 发
+   {"type":"notify","audio_url":"http://192.168.110.35:8899/notify.ogg"}
+3. haimen 日志：控制面消息已转发给设备
+4. HTTP 日志：192.168.110.59 - "GET /notify.ogg" 200    ← 设备真身来取
+5. 设备播放完成，自动回到 Idle
+```
+
+**两种主动能力的定位（都已实测）**：
+
+| 能力 | 路径 | 前提 | 播完状态 | 适用 |
+|---|---|---|---|---|
+| 纯播报 | `notify` | 仅需 Idle | Idle | 洗衣机好了、门铃、温度告警 |
+| 主动问询 | `tts` 会话 | 先唤醒过 + 120s 内 | Listening | "要开空调吗？"→ 等回答 |
+
+`notify` 突破了 `tts` 会话的两个硬限制：不需要先唤醒、不依赖 UDP 通道超时。
+
+### 待办：把 notify 做成正式功能
+
+当前还是外部脚本 + 临时 HTTP 服务，正式化需要：
+1. haimen 内置静态音频服务（或复用现有 HTTP server 的 `/notify` 路由）
+2. 内置 TTS：文本 → Ogg Opus（需 Ogg 容器封装；`opus2` 只能编 Opus 包）
+3. HTTP API：`POST /api/v1/xiaozhi/notify {"text": "...", "then_listen": false}`
+4. 之后 HA 自动化可直接调用
