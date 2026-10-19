@@ -26,7 +26,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqtt_link import MqttLink
+from mqtt_link import MqttLink, admin_credentials
 
 DEFAULT_MAC = "84:c7:bb:59:93:64"
 DEFAULT_BROKER = "192.168.110.35:1883"
@@ -70,7 +70,8 @@ def main() -> int:
     print(f"主题: {ctl}")
     print(f"消息: {json.dumps(payload, ensure_ascii=False)}")
 
-    with MqttLink(host, int(port or 1883), client_id="haimen-ctl-sender") as link:
+    _cid, _user, _pwd = admin_credentials()
+    with MqttLink(host, int(port or 1883), _user, _pwd, client_id=_cid) as link:
         link.publish(ctl, payload, qos=0)
         time.sleep(0.4)
 

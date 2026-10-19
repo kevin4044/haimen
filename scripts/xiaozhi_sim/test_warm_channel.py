@@ -29,7 +29,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqtt_link import MqttLink
+from mqtt_link import MqttLink, admin_credentials
 from opus_codec import extract_ogg_packets
 
 DEFAULT_MAC = "84:c7:bb:59:93:64"
@@ -102,7 +102,8 @@ def main() -> int:
 
     # ③ 推 tts 会话
     mark = time.monotonic()
-    with MqttLink(host, int(port or 1883), client_id="haimen-warm-test") as link:
+    _cid, _user, _pwd = admin_credentials()
+    with MqttLink(host, int(port or 1883), _user, _pwd, client_id=_cid) as link:
         link.publish(ctl, payload, qos=0)
         time.sleep(0.5)
 

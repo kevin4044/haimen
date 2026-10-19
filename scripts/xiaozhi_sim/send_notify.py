@@ -34,7 +34,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqtt_link import MqttLink
+from mqtt_link import MqttLink, admin_credentials
 
 DEFAULT_MAC = "84:c7:bb:59:93:64"
 
@@ -102,7 +102,8 @@ def main() -> int:
     print(f"控制主题:          {ctl}")
     print(f"消息:              {json.dumps(msg, ensure_ascii=False)}")
 
-    with MqttLink(host, int(port or 1883), client_id="haimen-notify-sender") as link:
+    _cid, _user, _pwd = admin_credentials()
+    with MqttLink(host, int(port or 1883), _user, _pwd, client_id=_cid) as link:
         link.publish(ctl, msg, qos=0)
         time.sleep(0.5)
 

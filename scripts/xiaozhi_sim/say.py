@@ -29,7 +29,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqtt_link import MqttLink
+from mqtt_link import MqttLink, admin_credentials
 from opus_codec import extract_ogg_packets
 
 DEFAULT_MAC = "84:c7:bb:59:93:64"
@@ -93,7 +93,8 @@ def main() -> int:
     body = json.dumps(payload)
     print(f"消息体大小: {len(body)} 字节")
 
-    with MqttLink(host, int(port or 1883), client_id="haimen-say-sender") as link:
+    _cid, _user, _pwd = admin_credentials()
+    with MqttLink(host, int(port or 1883), _user, _pwd, client_id=_cid) as link:
         link.publish(ctl, payload, qos=0)
         time.sleep(0.5)
 

@@ -23,7 +23,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqtt_link import MqttLink
+from mqtt_link import MqttLink, admin_credentials
 
 DEFAULT_MAC = "84:c7:bb:59:93:64"
 DEFAULT_BROKER = "192.168.110.35:1883"
@@ -95,7 +95,8 @@ def main() -> int:
     before = len(read_log(args.log))
     print(f"[{time.strftime('%H:%M:%S')}] 发送 notify …")
 
-    with MqttLink(host, int(port or 1883), client_id="haimen-notify-idle") as link:
+    _cid, _user, _pwd = admin_credentials()
+    with MqttLink(host, int(port or 1883), _user, _pwd, client_id=_cid) as link:
         link.publish(ctl, {"type": "notify", "audio_url": args.url,
                            "subtitles": [{"start_ms": 0, "text": "客厅有点热"}]}, qos=0)
         time.sleep(0.5)

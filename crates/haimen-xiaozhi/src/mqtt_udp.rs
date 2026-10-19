@@ -533,6 +533,19 @@ async fn say_raw_frames(shared: &Arc<Shared>, client_id: &str, frames: Vec<Vec<u
 async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
     // ── 控制面转发：haimen/ctl/<target_client_id> → 直接推给该设备 ──
     if let Some(target) = msg.topic.strip_prefix(CONTROL_TOPIC_PREFIX) {
+        // 控制主题能让设备说任意话，必须只允许控制面客户端发布。
+        // 不拦的话，一台被攻陷的设备（或局域网内任何人）就能操纵其它设备。
+        // 未配置 auth_key 时不强制，保持向后兼容。
+        if shared.cfg.broker.auth_key.is_some()
+            && msg.client_id != crate::mqtt_broker::ADMIN_CLIENT_ID
+        {
+            tracing::warn!(
+              client_id = %msg.client_id,
+              topic = %msg.topic,
+              "非控制面客户端尝试发布控制主题，拒绝"
+            );
+            return;
+        }
         let target = target.trim();
         if target.is_empty() {
             tracing::warn!(topic = %msg.topic, "控制主题缺少目标 client_id，丢弃");

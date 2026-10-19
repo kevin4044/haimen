@@ -146,11 +146,19 @@ fn build_ws_info(headers: &HeaderMap) -> WebsocketInfo {
 /// 拼 MQTT 下发段。`endpoint` 缺端口时补 `:1883`，否则固件会走 8883 TLS。
 fn build_mqtt_info(mqtt: &XiaozhiMqttConfig, mac: &str) -> MqttInfo {
     let safe = mac_safe(mac);
+    let client_id = format!("GID_haimen@@@{safe}@@@{safe}");
+    // 配了 auth_key 就用每设备派生的密码，否则沿用配置文件里的静态值。
+    // 派生密码 = HMAC-SHA256(auth_key, client_id)，broker 侧重算比较。
+    let password = if mqtt.auth_key.is_empty() {
+        mqtt.password.clone()
+    } else {
+        crate::mqtt_broker::derive_mqtt_password(&mqtt.auth_key, &client_id)
+    };
     MqttInfo {
         endpoint: ensure_mqtt_endpoint(&mqtt.endpoint),
-        client_id: format!("GID_haimen@@@{safe}@@@{safe}"),
+        client_id,
         username: mqtt.username.clone(),
-        password: mqtt.password.clone(),
+        password,
         keepalive: mqtt.keepalive,
         publish_topic: apply_mac_template(&mqtt.publish_topic_template, &safe),
         subscribe_topic: apply_mac_template(&mqtt.downlink_topic_template, &safe),

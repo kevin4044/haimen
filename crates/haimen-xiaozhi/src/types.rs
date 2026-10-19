@@ -258,6 +258,13 @@ pub struct XiaozhiMqttConfig {
     pub username: String,
     #[serde(default)]
     pub password: String,
+    /// MQTT 连接鉴权密钥。留空 = 不校验（向后兼容）。
+    ///
+    /// 设置后：设备密码由 `HMAC-SHA256(auth_key, client_id)` 派生，
+    /// broker 在 CONNECT 时重算比较；控制面客户端用 client_id =
+    /// `haimen-admin`。不设的话局域网内任何人都能注入播报或顶掉设备。
+    #[serde(default)]
+    pub auth_key: String,
     #[serde(default = "default_keepalive")]
     pub keepalive: u32,
     #[serde(default = "default_publish_topic")]
@@ -284,6 +291,7 @@ impl Default for XiaozhiMqttConfig {
             endpoint: String::new(),
             username: String::new(),
             password: String::new(),
+            auth_key: String::new(),
             keepalive: default_keepalive(),
             publish_topic_template: default_publish_topic(),
             downlink_topic_template: default_downlink_topic(),

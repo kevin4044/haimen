@@ -17,6 +17,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+import os
+import pathlib
 
 try:
     import paho.mqtt.client as mqtt
@@ -192,6 +194,51 @@ class MqttLink:
     def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
         self._connected.clear()
 
+# ─────────────────────────────────────────────────────────────
+# 控制面凭据
+# ─────────────────────────────────────────────────────────────
+# broker 开启鉴权后（settings.toml 里 [xiaozhi.mqtt].auth_key 非空），
+# 控制主题 haimen/ctl/ 只接受 client_id == "haimen-admin" 的连接，
+# 密码是 HMAC-SHA256(auth_key, "haimen-admin")。
+# 未配置 auth_key 时 broker 不校验，这里返回的密码为空即可。
+
+SETTINGS_PATH = os.path.expanduser("~/works/haimen-data/settings.toml")
+
+
+def admin_credentials(settings_path: str | None = None) -> tuple[str, str | None, str | None]:
+    """返回控制面连接用的 (client_id, username, password)。
+
+    - 没配 auth_key → ("haimen-admin", None, None)，broker 不校验
+    - 配了 auth_key → ("haimen-admin", "haimen", hmac_hex)
+    """
+    import hashlib
+    import hmac as _hmac
+
+    path = settings_path or SETTINGS_PATH
+    auth_key = ""
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+        in_mqtt = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("["):
+                in_mqtt = stripped == "[xiaozhi.mqtt]"
+                continue
+            if in_mqtt and stripped.startswith("auth_key"):
+                _, _, value = stripped.partition("=")
+                auth_key = value.strip().strip('"').strip("'")
+                break
+    except OSError:
+        pass
+
+    client_id = "haimen-admin"
+    if not auth_key:
+        return client_id, None, None
+    digest = _hmac.new(auth_key.encode(), client_id.encode(), hashlib.sha256).hexdigest()
+    return client_id, "haimen", digest
+
+
+
 
 if __name__ == "__main__":
     # 冒烟测试：连上 broker，订阅，然后自己发一条自己收
@@ -209,3 +256,4 @@ if __name__ == "__main__":
         link.publish("haimen/test/ping", {"ok": True})
         msg = link.wait_for(lambda m: m.topic == "haimen/test/ping", timeout=5)
         print(f"收到: {msg.topic} {msg.text()}" if msg else "❌ 没收到自己发的消息")
+

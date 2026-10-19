@@ -20,7 +20,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqtt_link import MqttLink
+from mqtt_link import MqttLink, admin_credentials
 
 DEFAULT_MAC = "84:c7:bb:59:93:64"
 DEFAULT_URL = "http://192.168.110.35:8899/notify.ogg"
@@ -73,7 +73,8 @@ def main() -> int:
     print()
 
     found = None
-    with MqttLink(host, int(port or 1883), client_id="haimen-notify-loop") as link:
+    _cid, _user, _pwd = admin_credentials()
+    with MqttLink(host, int(port or 1883), _user, _pwd, client_id=_cid) as link:
         for i in range(args.times):
             link.publish(topic, {"type": "notify", "audio_url": args.url}, qos=0)
             print(f"[{time.strftime('%H:%M:%S')}] 第 {i + 1} 次发送", flush=True)

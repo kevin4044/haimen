@@ -22,6 +22,8 @@ opus2 = { workspace = true }
 # MQTT + UDP 传输层（见 specs/mqtt-udp/实现方案.md）
 rumqttc = { workspace = true }
 aes = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 ctr = { workspace = true }
 
 [dev-dependencies]

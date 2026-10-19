@@ -504,6 +504,8 @@ pub(crate) fn build_mqtt_udp_config(
         broker: haimen_xiaozhi::mqtt_broker::MqttBrokerConfig {
             bind_addr: format!("0.0.0.0:{port}"),
             max_packet_size: 256 * 1024,
+            // 空 auth_key = 不校验（向后兼容）
+            auth_key: (!x.mqtt.auth_key.is_empty()).then(|| x.mqtt.auth_key.clone()),
         },
         udp: haimen_xiaozhi::udp_audio::UdpAudioConfig {
             bind_addr: x.udp.bind_addr.clone(),

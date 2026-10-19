@@ -45,6 +45,13 @@ pub struct MqttBrokerConfig {
     pub bind_addr: String,
     /// 单连接最大包体（防止恶意大包）。`Default` 为 256 KiB。
     pub max_packet_size: usize,
+    /// 连接鉴权密钥。`None` 表示不校验（向后兼容）。
+    ///
+    /// 开启后，设备必须用 `derive_mqtt_password(auth_key, client_id)` 算出的
+    /// 密码连接；控制面客户端用 client_id = [`ADMIN_CLIENT_ID`]。
+    /// 不设的话，局域网内任何人都能发 `haimen/ctl/<client_id>` 注入任意播报，
+    /// 也能用真设备的 client_id 把它顶掉。
+    pub auth_key: Option<String>,
 }
 
 impl Default for MqttBrokerConfig {
@@ -52,6 +59,7 @@ impl Default for MqttBrokerConfig {
         Self {
             bind_addr: "0.0.0.0:1883".to_owned(),
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            auth_key: None,
         }
     }
 }
@@ -92,6 +100,7 @@ struct BrokerShared {
     incoming_tx: mpsc::Sender<BrokerIncoming>,
     max_packet_size: usize,
     conn_ids: AtomicU64,
+    auth_key: Option<String>,
 }
 
 struct ConnEntry {
@@ -154,6 +163,7 @@ impl MqttBrokerHandle {
             incoming_tx,
             max_packet_size: cfg.max_packet_size,
             conn_ids: AtomicU64::new(1),
+            auth_key: cfg.auth_key.clone(),
         });
         let accept_shared = Arc::clone(&shared);
         tokio::spawn(async move {
@@ -268,6 +278,31 @@ async fn handle_connection(
         return Err(protocol("第一个报文必须是 CONNECT"));
     }
     let connect = parse_connect(&first.body)?;
+    // ── 鉴权：开启后密码必须是 HMAC(auth_key, client_id) ──
+    if let Some(auth_key) = shared.auth_key.as_deref() {
+        let supplied = connect
+            .password
+            .as_deref()
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .unwrap_or_default();
+        let expected = derive_mqtt_password(auth_key, &connect.client_id);
+        // 常量时间比较：长度先对齐再逐字节异或，避免按字节提前返回。
+        let ok = supplied.len() == expected.len()
+            && supplied
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if !ok {
+            tracing::warn!(
+              client_id = %connect.client_id,
+              username = connect.username.as_deref().unwrap_or("-"),
+              "MQTT 鉴权失败，拒绝连接"
+            );
+            let _ = send_frame(&write_tx, encode_connack(0x04)).await;
+            return Ok(());
+        }
+    }
     let keepalive_secs = connect.keepalive_secs;
     tracing::debug!(
       client_id = %connect.client_id,
@@ -298,7 +333,7 @@ async fn handle_connection(
     // 先登记再回 CONNACK：客户端读到 CONNACK 时，publish_to 已经能找到它。
     // 读完 CONNECT 不回 CONNACK 的话，esp_mqtt_client 会一直等到 Connect() 超时。
     let result = async {
-        send_frame(&write_tx, encode_connack()).await?;
+        send_frame(&write_tx, encode_connack(0x00)).await?;
         conn_loop(
             &mut reader,
             &shared,
@@ -622,8 +657,30 @@ fn encode_packet(packet_type: u8, flags: u8, body: &[u8]) -> Result<Vec<u8>, Mqt
 }
 
 /// session_present 固定 0：没有持久会话，`clean_session=false` 也不恢复状态。
-fn encode_connack() -> Vec<u8> {
-    vec![(CONNACK << 4), 0x02, 0x00, 0x00]
+fn encode_connack(return_code: u8) -> Vec<u8> {
+    vec![(CONNACK << 4), 0x02, 0x00, return_code]
+}
+
+/// 控制面客户端（发布 `haimen/ctl/<设备>` 命令）的固定 client_id。
+///
+/// 设备**不允许**发控制主题：否则一台被攻陷的设备就能操纵其它设备。
+/// 这个身份由 broker 的 HMAC 校验背书，伪造需要知道 auth_key。
+pub const ADMIN_CLIENT_ID: &str = "haimen-admin";
+
+/// 由 auth_key 和 client_id 派生 MQTT 密码（hex 的 HMAC-SHA256）。
+///
+/// OTA 下发 mqtt 配置时用它生成设备密码，broker 在 CONNECT 时重算比较。
+pub fn derive_mqtt_password(auth_key: &str, client_id: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(auth_key.as_bytes()).expect("HMAC 接受任意长度密钥");
+    mac.update(client_id.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn encode_pingresp() -> Vec<u8> {
@@ -878,9 +935,14 @@ mod tests {
     }
 
     async fn start_broker() -> MqttBrokerHandle {
+        start_broker_with_auth(None).await
+    }
+
+    async fn start_broker_with_auth(auth_key: Option<String>) -> MqttBrokerHandle {
         MqttBrokerHandle::start(MqttBrokerConfig {
             bind_addr: "127.0.0.1:0".to_owned(),
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            auth_key,
         })
         .await
         .expect("启动 broker")
@@ -1004,6 +1066,72 @@ mod tests {
         wait_for_client(&handle, "keepalive-off", true).await;
     }
 
+    /// 派生函数必须是确定的、且不同 client_id 得到不同密码。
+    #[test]
+    fn derive_mqtt_password_is_deterministic() {
+        let a = derive_mqtt_password("secret", "dev-1");
+        assert_eq!(a, derive_mqtt_password("secret", "dev-1"));
+        assert_ne!(a, derive_mqtt_password("secret", "dev-2"));
+        assert_ne!(a, derive_mqtt_password("other", "dev-1"));
+        // hex 的 SHA256 = 64 字符
+        assert_eq!(a.len(), 64);
+    }
+
+    /// 开启鉴权后，密码不对必须被拒绝（CONNACK 0x04），且不进在线列表。
+    #[tokio::test]
+    async fn auth_rejects_wrong_password() {
+        let handle = start_broker_with_auth(Some("k".to_string())).await;
+        let mut stream = TcpStream::connect(handle.local_addr())
+            .await
+            .expect("连接 broker");
+        let body = connect_body(
+            "dev-1".as_bytes(),
+            60,
+            true,
+            Some(b"haimen"),
+            Some(b"wrong"),
+        );
+        let packet = finish_packet(0x10, &body);
+        stream.write_all(&packet).await.expect("写 CONNECT");
+        let connack = read_frame(&mut stream).await;
+        assert_eq!(connack.packet_type, CONNACK);
+        assert_eq!(connack.body, vec![0x00, 0x04], "应返回 0x04 认证失败");
+
+        // 拒绝后不应登记
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handle
+                .connected_clients()
+                .await
+                .iter()
+                .any(|id| id == "dev-1"),
+            "鉴权失败的连接不能进在线列表"
+        );
+    }
+
+    /// 开启鉴权后，派生密码正确就应该正常连上。
+    #[tokio::test]
+    async fn auth_accepts_correct_password() {
+        let key = "k";
+        let handle = start_broker_with_auth(Some(key.to_string())).await;
+        let password = derive_mqtt_password(key, "dev-1");
+        let mut stream = TcpStream::connect(handle.local_addr())
+            .await
+            .expect("连接 broker");
+        let body = connect_body(
+            "dev-1".as_bytes(),
+            60,
+            true,
+            Some(b"haimen"),
+            Some(password.as_bytes()),
+        );
+        let packet = finish_packet(0x10, &body);
+        stream.write_all(&packet).await.expect("写 CONNECT");
+        let connack = read_frame(&mut stream).await;
+        assert_eq!(connack.body, vec![0x00, 0x00], "应返回 0x00 接受");
+        wait_for_client(&handle, "dev-1", true).await;
+    }
+
     #[test]
     fn varint_encode_decode_known_values() {
         let cases = [
@@ -1113,7 +1241,7 @@ mod tests {
 
     #[test]
     fn connack_bytes_are_session_present_zero() {
-        assert_eq!(encode_connack(), vec![0x20, 0x02, 0x00, 0x00]);
+        assert_eq!(encode_connack(0x00), vec![0x20, 0x02, 0x00, 0x00]);
     }
 
     #[test]
