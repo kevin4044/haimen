@@ -757,6 +757,10 @@ async fn handle_hello(shared: &Arc<Shared>, client_id: &str, value: serde_json::
                 let _ = tx.send(true);
             }
             session.last_activity = Instant::now();
+            // 必须同时刷新收口计时：设备唤醒后往往要先看屏幕/想一下才开口。
+            // 不刷新的话 last_speech_at 还停在会话创建时刻，15 秒后 prune_sessions
+            // 会把刚打开、还没说过话的通道直接 goodbye 掉。
+            session.last_speech_at = Instant::now();
             previous
         };
         if let Some(prev) = previous {
