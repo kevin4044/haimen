@@ -217,7 +217,10 @@ PY
         ERR="$(python3 -c "import json;print(json.load(open('/tmp/say-resp.json')).get('error',''))" 2>/dev/null)"
         [ -n "${ERR}" ] && pass "接口可用，设备忙（error=${ERR}）" || fail "409 但缺 error 字段"
         ;;
-      401) pass "接口要求鉴权（401），符合 say_token 配置" ;;
+      401)
+        pass "接口返回 401（说明 say_token 已配置并生效）"
+        info "注意：默认 say_token 应为空、不校验；若这里是 401 请确认是有意开启"
+        ;;
       404) fail "接口不存在（404）" ;;
       *)   fail "接口异常（HTTP ${CODE}）" ;;
     esac

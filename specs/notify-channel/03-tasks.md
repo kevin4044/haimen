@@ -121,13 +121,17 @@ GET /xiaozhi/say/{id}.ogg
 ```
    走现有控制主题转发路径发给该设备。
 
-8. **配置**：`[xiaozhi] say_token`（可选，见 §4.5）。非空时校验
-   `Authorization: Bearer <token>`，不匹配 → 401。
+8. **配置**：`[xiaozhi] say_token`（见 §4.5）。
+   - 字段**必须实现**，默认空串
+   - 空串 → **不校验，直接放行**（当前实际行为），启动时打一条 warn 说明"鉴权未启用"
+   - 非空 → 校验 `Authorization: Bearer <token>`，不匹配 → 401
+   - **不要留 TODO**：校验逻辑现在就要能跑，只是默认不触发
 
 ### 约束
 
 - 不改 ASR/VAD/策略链路
 - notify 的无 ACK 特性如实反映在响应里（不假装成功保证）
+- **设备忙直接 409，不做排队/重试**（用户决定，理由见 02-design §4）
 - TTS/编码耗时不能阻塞整个 worker：接口内部并发即可，但要设超时（建议 15s）
 
 ### 完成标准
@@ -135,7 +139,8 @@ GET /xiaozhi/say/{id}.ogg
 - `./scripts/ci.sh` 全绿
 - 单测：设备忙碌时返回 409 且带 `state`
 - 单测：多设备未指定 → 409 `multiple_devices`
-- 单测：`say_token` 配置后，无 Bearer → 401
+- 单测：`say_token` 为空 → **不校验**，请求正常放行
+- 单测：`say_token` 非空时，无 Bearer → 401；错误 token → 401；正确 token → 通过
 - 单测：正常路径返回 200 且 `audio_url` 可被 GET（用 T1 的路由在同一 router 内验证）
 - 单测：请求里多传 `voice` 字段应被忽略（不报错，也不改变合成音色）
 
