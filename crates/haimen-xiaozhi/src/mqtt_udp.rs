@@ -1147,20 +1147,32 @@ fn alloc_downlink_ts(session: &mut DeviceSession, step: u32) -> u32 {
 }
 
 async fn finish_ready(shared: &Shared, job: &PlaybackJob) {
-    let mut tables = shared.tables.lock().await;
-    let Some(session) = tables.sessions.get_mut(&job.client_id) else {
-        return;
-    };
-    if session.playback_gen != job.generation {
-        return;
+    {
+        let mut tables = shared.tables.lock().await;
+        let Some(session) = tables.sessions.get_mut(&job.client_id) else {
+            return;
+        };
+        if session.playback_gen != job.generation {
+            return;
+        }
+        if session.state == SessionState::Playing {
+            session.state = SessionState::Ready;
+        }
+        session.recording_deadline = None;
+        session.last_activity = Instant::now();
+        // 一轮对话到此结束，开始计收口超时。
+        session.last_speech_at = Instant::now();
     }
-    if session.state == SessionState::Playing {
-        session.state = SessionState::Ready;
+
+    // 用户说了告别语：回复已经播完，立刻收口让设备回待命。
+    // 不能等 IDLE_CLOSE_LIMIT 超时 —— 那样设备会白听 15 秒并继续推麦克风音频。
+    if shared.strategy.end_of_conversation() {
+        tracing::warn!(
+            client_id = %job.client_id,
+            "用户说了告别语，回复播完立即结束会话"
+        );
+        close_idle_conversation(shared, &job.client_id).await;
     }
-    session.recording_deadline = None;
-    session.last_activity = Instant::now();
-    // 一轮对话到此结束，开始计收口超时。
-    session.last_speech_at = Instant::now();
 }
 
 /// 注销 UDP 密钥并回到 Ready，但不把 MQTT 会话删掉。

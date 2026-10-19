@@ -32,6 +32,21 @@ pub trait ResponseStrategy: Send + Sync {
     /// 策略名称（用于日志和诊断）
     fn name(&self) -> &'static str;
 
+    /// 这一轮回复播完后，是否应该结束会话（用户说了告别语）。
+    ///
+    /// 传输层在 `finish_ready` 里读取：返回 `true` 就立刻给设备发
+    /// `goodbye`，让它关闭音频通道回到 Idle，而不是等空闲超时。
+    ///
+    /// 小智官方云端就是这么做的：识别到「再见」→ 回一句告别 →
+    /// 服务端发 goodbye → 设备回待命。固件本身**没有**任何自动回
+    /// Idle 的机制，不发 goodbye 设备会永远停在 Listening，持续把
+    /// 麦克风音频推上来。
+    ///
+    /// 默认实现返回 `false`，Echo / TTS 等策略不受影响。
+    fn end_of_conversation(&self) -> bool {
+        false
+    }
+
     /// 返回 HELLO 握手时应告知设备的音频参数
     ///
     /// 默认实现回传客户端发送的参数（Echo 模式适用）。

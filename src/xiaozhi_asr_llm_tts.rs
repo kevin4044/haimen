@@ -540,6 +540,15 @@ pub struct AsrLlmTtsStrategy {
     /// ASR 是否已返回非空文本（用于决定是否允许本地 VAD 提前关闭流）
     /// 使用 Arc 以便在 ASR 后台任务中写入
     asr_received_text: Arc<AtomicBool>,
+    /// 本轮用户是否说了告别语（「再见」等）。
+    ///
+    /// 置位后由传输层在回复播完时读取并发送 `goodbye`，让设备关闭音频
+    /// 通道回到待命。固件本身不会自动回 Idle，不发 goodbye 设备会一直
+    /// 停在 Listening 并持续上传麦克风音频。
+    ///
+    /// 谁置位：ASR 转写完成时匹配告别词。
+    /// 谁清除：`end_of_conversation()` 读取时 swap 清除（一次性信号）。
+    end_of_conversation: Arc<AtomicBool>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -962,6 +971,7 @@ impl AsrLlmTtsStrategy {
             no_speech_notify: Mutex::new(Arc::new(Notify::new())),
             silence_closed: AtomicBool::new(false),
             asr_received_text: Arc::new(AtomicBool::new(false)),
+            end_of_conversation: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1017,6 +1027,7 @@ impl AsrLlmTtsStrategy {
             no_speech_notify: Mutex::new(Arc::new(Notify::new())),
             silence_closed: AtomicBool::new(false),
             asr_received_text: Arc::new(AtomicBool::new(false)),
+            end_of_conversation: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1153,6 +1164,8 @@ impl AsrLlmTtsStrategy {
             .unwrap_or_else(|| Arc::new(Notify::new()));
 
         let asr_text_received = self.asr_received_text.clone();
+        // `self` 的借用活不过 tokio::spawn，所以提前把 Arc 克隆进来。
+        let end_of_conv = self.end_of_conversation.clone();
 
         let asr_handle: tokio::task::JoinHandle<Result<String, String>> = tokio::spawn(
             async move {
@@ -1306,6 +1319,7 @@ impl AsrLlmTtsStrategy {
                     );
 
                     if !full_text.is_empty() {
+                        mark_end_of_conversation(&end_of_conv, &full_text);
                         return Ok(full_text);
                     }
 
@@ -1325,6 +1339,7 @@ impl AsrLlmTtsStrategy {
                             last_nonempty_text.chars().count(),
                             last_nonempty_text,
                         );
+                        mark_end_of_conversation(&end_of_conv, &last_nonempty_text);
                         return Ok(last_nonempty_text);
                     }
 
@@ -1531,8 +1546,39 @@ impl AsrLlmTtsStrategy {
     }
 }
 
+/// 用户在告别吗？
+///
+/// 小智官方云端就是这么识别「再见」并结束对话的：固件只认 `goodbye`
+/// 消息，自己不会回 Idle。所以意图判断必须在服务端做。
+///
+/// 匹配策略保守一些：宁可漏判（靠 15 秒空闲收口兜底），
+/// 也不要把「再见面」这类正常句子误判成告别。
+fn mark_end_of_conversation(flag: &AtomicBool, text: &str) {
+    const FAREWELL_WORDS: &[&str] = &[
+        "再见",
+        "拜拜",
+        "不聊了",
+        "不说了",
+        "结束对话",
+        "退出对话",
+        "关闭对话",
+        "goodbye",
+        "bye bye",
+    ];
+    let lowered = text.to_lowercase();
+    if FAREWELL_WORDS.iter().any(|w| lowered.contains(w)) {
+        flag.store(true, Ordering::Release);
+        tracing::warn!(text = %text, "识别到告别语，回复播完后将结束会话");
+    }
+}
+
 #[async_trait]
 impl ResponseStrategy for AsrLlmTtsStrategy {
+    /// 一次性信号：读取即清除，避免下一轮被误收口。
+    fn end_of_conversation(&self) -> bool {
+        self.end_of_conversation.swap(false, Ordering::AcqRel)
+    }
+
     fn name(&self) -> &'static str {
         "asr-llm-tts"
     }
