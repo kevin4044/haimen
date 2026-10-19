@@ -140,11 +140,11 @@ fi
 # （ota.cc: ts += timezone_offset * 60 * 1000; settimeofday）。
 # 容器默认 Etc/UTC 会让 timezone_offset 变成 0，设备时钟慢 8 小时。
 HOST_TZ="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
-if [ -z "$HOST_TZ" ]; then
+if [ -z "${HOST_TZ}" ]; then
     HOST_TZ="Asia/Shanghai"
-    echo "  ⚠️ 未能从 /etc/localtime 推断时区，回退 $HOST_TZ"
+    echo "  ⚠️ 未能从 /etc/localtime 推断时区，回退 ${HOST_TZ}"
 fi
-echo "  容器时区: $HOST_TZ（和宿主机一致，否则设备时钟会偏）"
+echo "  容器时区: ${HOST_TZ}（和宿主机一致，否则设备时钟会偏）"
 
 if [ "$XZ_PROTOCOL" = "mqtt" ]; then
     echo "  小智协议: mqtt  → 额外暴露 TCP ${MQTT_PORT}（broker）与 UDP ${UDP_PORT}（音频）"
