@@ -22,17 +22,36 @@ pub async fn handle_ota(
 ) -> Result<Json<OtaResponse>, (StatusCode, Json<serde_json::Value>)> {
     // 来源校验必须在派生密码之前：MQTT 模式下这个响应里带着设备的
     // 连接密码，谁能访问这个端点，谁就能冒充任意设备。
-    if !ota_peer_allowed(peer.ip(), current_xiaozhi_config().ota_allow_private_only) {
+    let private_only = current_xiaozhi_config().ota_allow_private_only;
+    if !ota_peer_allowed(peer.ip(), private_only) {
         tracing::warn!(
           %peer,
           "OTA 请求来自非私有网络地址，拒绝（可配置 [xiaozhi] ota_allow_private_only 关闭该限制）"
         );
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "OTA 端点仅允许私有网络访问"
-            })),
-        ));
+        return Err(forbidden_ota_peer());
+    }
+    // 反向代理场景：TCP 对端就是代理自己（通常回环或内网），只查它会全部放行，
+    // 公网客户端照样能拿到派生密码。这里再对 X-Forwarded-For 的**最左**
+    // （最接近真实客户端）地址判一次，任一环不是内网就拒 —— 失败关闭。
+    //
+    // 直接连接时攻击者可以自己伪造这个头，但那只会让请求更容易被拒，
+    // 帮不到他；固件本身不发这个头，正常设备不受影响。
+    if private_only {
+        if let Some(client_ip) = first_forwarded_for_ip(&headers) {
+            tracing::warn!(
+              %peer,
+              %client_ip,
+              "OTA 请求带 X-Forwarded-For（说明前面有代理），额外校验真实客户端地址"
+            );
+            if !ota_peer_allowed(client_ip, true) {
+                tracing::warn!(
+                  %peer,
+                  %client_ip,
+                  "经代理转发的真实客户端不是私有网络地址，拒绝"
+                );
+                return Err(forbidden_ota_peer());
+            }
+        }
     }
     // 记录设备自报的固件与板子信息。
     // 用于排查「某个功能设备没反应」——比如 notify 需要较新固件，
@@ -114,13 +133,30 @@ fn ota_peer_allowed(peer: IpAddr, private_only: bool) -> bool {
                 || v6.is_unicast_link_local() // fe80::/10
                 // 双栈监听会把 IPv4 连接呈现成 IPv4-mapped 的 IPv6（::ffff:a.b.c.d），
                 // 不还原成 v4 判一次的话，局域网设备会被误拒、拿不到 OTA。
-                || v6.to_ipv4_mapped().is_some_and(|v4| is_private_v4(v4))
+                || v6.to_ipv4_mapped().is_some_and(is_private_v4)
         }
     }
 }
 
 fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
     v4.is_private() || v4.is_loopback() || v4.is_link_local()
+}
+
+/// 统一的 OTA 来源拒绝响应。
+fn forbidden_ota_peer() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": "OTA 端点仅允许私有网络访问" })),
+    )
+}
+
+/// 取 `X-Forwarded-For` 里最左（最接近真实客户端）的 IP。
+///
+/// 该头格式是 `client, proxy1, proxy2`；解析不出来时返回 None（视为没有代理）。
+fn first_forwarded_for_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let raw = headers.get("x-forwarded-for")?.to_str().ok()?;
+    let first = raw.split(',').next()?.trim();
+    first.parse().ok()
 }
 
 fn current_xiaozhi_config() -> XiaozhiConfig {
@@ -327,6 +363,61 @@ mod tests {
                 "{raw} 的判定应为 {expect}"
             );
         }
+    }
+
+    /// 反向代理场景：TCP 对端是代理（内网），真实客户端在 X-Forwarded-For 里。
+    /// 只查对端会让公网客户端混进来，所以必须同时校验最左的那个 IP。
+    #[tokio::test]
+    async fn ota_rejects_public_forwarded_client() {
+        let _lock = ota_test_lock();
+        let mut headers = make_headers();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("8.8.8.8, 192.168.1.1"),
+        );
+        let result = handle_ota(
+            test_peer(), // 对端是回环（模拟代理）
+            headers,
+            Json(sample_request("84:c7:bb:59:93:64")),
+        )
+        .await;
+        let (status, _) = result.expect_err("经代理转发的公网客户端应被拒绝");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// 经代理转发的内网客户端应当放行（不能把正常设备挡在门外）。
+    #[tokio::test]
+    async fn ota_allows_private_forwarded_client() {
+        let _lock = ota_test_lock();
+        let mut headers = make_headers();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("192.168.110.59, 192.168.1.1"),
+        );
+        let result = handle_ota(
+            test_peer(),
+            headers,
+            Json(sample_request("84:c7:bb:59:93:64")),
+        )
+        .await;
+        assert!(result.is_ok(), "内网转发来源应放行");
+    }
+
+    /// X-Forwarded-For 解析：取最左一项，解析不了当没有代理。
+    #[test]
+    fn forwarded_for_parsing() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(first_forwarded_for_ip(&headers), None);
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("10.0.0.1, 10.0.0.2"),
+        );
+        assert_eq!(
+            first_forwarded_for_ip(&headers),
+            Some("10.0.0.1".parse().unwrap())
+        );
+        headers.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(first_forwarded_for_ip(&headers), None);
     }
 
     /// 公网来源的 OTA 请求必须被拒 —— 否则它能拿到派生 MQTT 密码。
