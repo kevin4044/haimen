@@ -175,3 +175,10 @@ cargo tarpaulin                     # 生成覆盖率报告
 - `perf` - 性能优化
 - `test` - 测试相关
 - `chore` - 构建/工具
+
+## Cursor Cloud specific instructions
+
+- 时区是 `Asia/Shanghai`。`web-ui` 的 `formatTime` 测试把 `+08:00` 按本地时间格式化，UTC 下会失败。
+- `cargo test` 在 TTY 中会停在卸载确认（`cmd_uninstall` 把 stdin 当成终端）。用 `cargo test -- --test-threads=1 < /dev/null`。
+- 未配置 ASR API Key 时，`haimen serve` 的默认语音模式会直接退出。本地控制台用 `haimen serve --host 0.0.0.0 --port 9527 --no-browser --xiaozhi-echo`。Vite（`pnpm dev --host 0.0.0.0 --port 5173`）把 `/api` 代理到 9527。
+- Node 24（`.node-version`）和 pnpm 11.5.2（`web-ui/package.json` 的 `packageManager`）。`cargo build` 会通过 `build.rs` 执行前端的 `pnpm install --frozen-lockfile` 和 `pnpm build`。
