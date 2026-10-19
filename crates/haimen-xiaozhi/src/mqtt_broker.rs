@@ -287,6 +287,17 @@ async fn handle_connection(
         return Err(protocol("第一个报文必须是 CONNECT"));
     }
     let connect = parse_connect(&first.body)?;
+    // client_id 会一路传到策略层当会话键，并被拼进
+    // `~/.haimen/tts_recordings/tts-{session_id}-{ts}.wav` 这种路径。
+    // 不限制字符的话，含 `/` 和 `..` 的 id 能让写入逃出归档目录。
+    if !is_valid_client_id(&connect.client_id) {
+        tracing::warn!(
+          client_id = %connect.client_id,
+          "client_id 含非法字符，拒绝连接"
+        );
+        let _ = send_frame(&write_tx, encode_connack(0x05)).await;
+        return Ok(());
+    }
     // ── 鉴权：开启后密码必须是 HMAC(auth_key, client_id) ──
     if let Some(auth_key) = shared.auth_key.as_deref() {
         let supplied = connect
@@ -701,6 +712,20 @@ pub const ADMIN_CLIENT_ID: &str = "haimen-admin";
 /// 迁移期旧密码只对这个前缀的 client_id 生效，防止有人用旧密码
 /// 冒充 [`ADMIN_CLIENT_ID`] 拿到控制面权限。
 pub const DEVICE_CLIENT_ID_PREFIX: &str = "GID_haimen@@@";
+
+/// client_id 最大长度。真实设备的是 `GID_haimen@@@<mac>@@@<mac>`，约 50 字符。
+const MAX_CLIENT_ID_LEN: usize = 128;
+
+/// client_id 只允许这些字符：字母、数字、`_`、`@`、`.`、`:`、`-`。
+///
+/// 这个值会被当作会话键并参与文件路径拼接，必须挡住 `/`、`\`、`..` 之类。
+fn is_valid_client_id(client_id: &str) -> bool {
+    !client_id.is_empty()
+        && client_id.len() <= MAX_CLIENT_ID_LEN
+        && client_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '.' | ':' | '-'))
+}
 
 /// 由 auth_key 和 client_id 派生 MQTT 密码（hex 的 HMAC-SHA256）。
 ///
@@ -1215,8 +1240,7 @@ mod tests {
     /// 等于用旧密码换到了 HMAC 本该独占的管理权限。
     #[tokio::test]
     async fn auth_grace_rejects_admin_with_legacy_password() {
-        let handle =
-            start_broker_with_auth_and_legacy("k".to_string(), "haimen".to_string()).await;
+        let handle = start_broker_with_auth_and_legacy("k".to_string(), "haimen".to_string()).await;
         let mut stream = TcpStream::connect(handle.local_addr())
             .await
             .expect("连接 broker");
@@ -1242,6 +1266,44 @@ mod tests {
                 .iter()
                 .any(|id| id == ADMIN_CLIENT_ID),
             "被拒的管理端连接不能进在线列表"
+        );
+    }
+
+    /// client_id 白名单：合法设备 id 通过，含路径分隔符的拒绝。
+    #[test]
+    fn client_id_allowlist() {
+        assert!(is_valid_client_id(
+            "GID_haimen@@@84_c7_bb_59_93_64@@@84_c7_bb_59_93_64"
+        ));
+        assert!(is_valid_client_id("haimen-admin"));
+        assert!(is_valid_client_id("a.b:c-d_e@f"));
+
+        assert!(!is_valid_client_id(""));
+        assert!(!is_valid_client_id("../etc/passwd"));
+        assert!(!is_valid_client_id("foo/bar"));
+        assert!(!is_valid_client_id("foo\\bar"));
+        assert!(!is_valid_client_id("a b"));
+        assert!(!is_valid_client_id(&"x".repeat(MAX_CLIENT_ID_LEN + 1)));
+    }
+
+    /// 含路径穿越的 client_id 必须在 CONNECT 阶段就被拒。
+    #[tokio::test]
+    async fn rejects_path_traversal_client_id() {
+        let handle = start_broker().await;
+        let mut stream = TcpStream::connect(handle.local_addr())
+            .await
+            .expect("连接 broker");
+        let body = connect_body(b"../../evil", 60, true, None, None);
+        let packet = finish_packet(0x10, &body);
+        stream.write_all(&packet).await.expect("写 CONNECT");
+        let connack = read_frame(&mut stream).await;
+        assert_eq!(connack.body, vec![0x00, 0x05], "应返回 0x05 未授权");
+        assert!(
+            !handle
+                .connected_clients()
+                .await
+                .iter()
+                .any(|id| id.contains("evil"))
         );
     }
 

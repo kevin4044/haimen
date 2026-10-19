@@ -3066,7 +3066,18 @@ fn save_tts_audio_as_wav(pcm: &[u8], session_id: &str) {
         .unwrap_or_default()
         .as_micros();
 
-    let filename = format!("tts-{}-{}.wav", session_id, timestamp);
+    // 纵深防御：即使上游漏了校验，也不让 session_id 里的路径分隔符生效。
+    let safe_session: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let filename = format!("tts-{}-{}.wav", safe_session, timestamp);
     let path = dir.join(&filename);
 
     const SAMPLE_RATE: u32 = 24000;
