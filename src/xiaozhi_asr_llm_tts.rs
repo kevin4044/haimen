@@ -51,6 +51,7 @@ use univoice::asr::{
     MimoAsrOption, QwenAsr, QwenAsrOption, XfyunAsr, XfyunAsrOption, adapt_audio_input,
 };
 use univoice::tts::TtsRequest;
+use voice_activity_detector::VoiceActivityDetector;
 
 use crate::config::settings::{AsrConfig, TtsConfig};
 use crate::gateway::provider::{AgentEventStream, AgentLogEvent};
@@ -534,6 +535,8 @@ struct SessionAsrState {
     silence_closed: bool,
     asr_received_text: Arc<AtomicBool>,
     end_of_conversation: Arc<AtomicBool>,
+    /// Silero VAD（有状态，按会话隔离）；初始化失败时为 None，回退能量阈值。
+    silero: Option<SileroVad>,
 }
 
 impl SessionAsrState {
@@ -547,6 +550,7 @@ impl SessionAsrState {
             silence_closed: false,
             asr_received_text: Arc::new(AtomicBool::new(false)),
             end_of_conversation: Arc::new(AtomicBool::new(false)),
+            silero: SileroVad::new(),
         }
     }
 }
@@ -599,6 +603,78 @@ const SILENCE_RMS_THRESHOLD: f64 = 3000.0;
 /// 15 帧 = 900ms，对齐小智云端判停量级（其 Silero VAD 为 1000ms）。
 /// 注意：这条路径只有 `SILENCE_RMS_THRESHOLD` 能正确区分人声与噪音时才生效。
 const MAX_SILENCE_FRAMES: u64 = 15;
+
+/// Silero VAD 要求 16kHz 下每块恰好 512 个样本（32ms）。
+/// 我们是 60ms（960 样本）一帧，所以要自己攒块、余数留到下一帧。
+const VAD_CHUNK: usize = 512;
+const VAD_SAMPLE_RATE: u32 = 16_000;
+/// 双阈值迟滞：>= HIGH 判人声、<= LOW 判静音，中间保持上一判定。
+///
+/// 为什么不用单阈值：模型输出在 0.3~0.5 之间会来回抖，单阈值会让
+/// speech_detected / 静音计数疯狂跳变。迟滞是参考实现（silero.py:88-97）的做法。
+const VAD_PROB_HIGH: f32 = 0.5;
+const VAD_PROB_LOW: f32 = 0.3;
+
+/// 会话级的 Silero VAD 封装。
+///
+/// 为什么必须包一层：
+/// 1. **有状态** —— Silero 内部维护 `state [2,1,128]` 与 `context [1,64]`，
+///    两个设备共用一个实例会互相污染（和 SessionAsrState 隔离是同一个道理）。
+/// 2. **块大小固定** —— 模型只接受 512 样本/块，而我们是 960 样本/帧，
+///    需要攒块并把余数留到下一帧。
+///
+/// 为什么换成神经网络：实测（2026-10-19）能量阈值 SILENCE_RMS_THRESHOLD=3000
+/// 在本机麦克风上会把真实语音判成静音 —— 说话时 RMS 只有 1510~2183
+/// （见 examples/vad_probe.rs，同一段录音 Silero 给 0.88~0.99）。
+struct SileroVad {
+    detector: VoiceActivityDetector,
+    /// 攒够 VAD_CHUNK 就推理，余数跨帧保留。
+    pending: Vec<i16>,
+    last_voice: bool,
+}
+
+impl SileroVad {
+    fn new() -> Option<Self> {
+        match VoiceActivityDetector::builder()
+            .sample_rate(VAD_SAMPLE_RATE)
+            .chunk_size(VAD_CHUNK)
+            .build()
+        {
+            Ok(detector) => Some(Self {
+                detector,
+                pending: Vec::with_capacity(VAD_CHUNK * 2),
+                last_voice: false,
+            }),
+            Err(err) => {
+                // 模型加载失败不该让整条链路挂掉：回退到能量阈值继续跑。
+                tracing::warn!(%err, "Silero VAD 初始化失败，回退到能量阈值判据");
+                None
+            }
+        }
+    }
+
+    /// 喂一帧 16kHz i16 PCM，返回本帧是否检测到人声。
+    ///
+    /// 一帧 960 样本通常能凑出 1~2 块，只要有任一块判为人声就算本帧有人声。
+    fn push_frame(&mut self, samples: &[i16]) -> bool {
+        self.pending.extend_from_slice(samples);
+        let mut any_voice = false;
+        while self.pending.len() >= VAD_CHUNK {
+            let chunk: Vec<i16> = self.pending.drain(..VAD_CHUNK).collect();
+            let prob = self.detector.predict(chunk);
+            let voice = if prob >= VAD_PROB_HIGH {
+                true
+            } else if prob <= VAD_PROB_LOW {
+                false
+            } else {
+                self.last_voice
+            };
+            self.last_voice = voice;
+            any_voice |= voice;
+        }
+        any_voice
+    }
+}
 
 /// 批处理 ASR 兜底的超时。
 ///
@@ -1790,7 +1866,15 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 );
             }
 
-            if rms >= SILENCE_RMS_THRESHOLD {
+            // 判据：优先 Silero（神经网络），模型不可用时退回能量阈值。
+            // 注意 silero 挂在 session（会话级）而不是 state（单次录音管道）：
+            // 模型内部有跨帧状态，必须跟着会话走，不能每条录音重来。
+            let is_voice = match session.silero.as_mut() {
+                Some(vad) => vad.push_frame(&pcm_buf[..decoded_samples]),
+                None => rms >= SILENCE_RMS_THRESHOLD,
+            };
+
+            if is_voice {
                 state.speech_detected = true;
                 state.silence_count = 0;
                 state.no_speech_frames = 0; // 检测到有效语音，无语音超时作废
@@ -3746,6 +3830,19 @@ mod tests {
         );
     }
 
+    /// Silero VAD 冒烟：模型能从 crate 内置资源加载，且对纯静音不误报。
+    ///
+    /// 这条测试同时保证 ONNX Runtime 在构建环境里可用 —— 它是整个
+    /// Silero 方案唯一的运行时依赖，加载失败会直接体现为这里 panic。
+    #[test]
+    fn silero_vad_loads_and_ignores_silence() {
+        let mut vad = SileroVad::new().expect("Silero VAD 应能加载内置模型");
+        // 960 个 0 样本 = 一帧 60ms 静音（刚好凑出 1 块 512，余 448 留到下一帧）
+        let silence = vec![0i16; 960];
+        assert!(!vad.push_frame(&silence), "纯静音不该判成人声");
+        assert!(!vad.push_frame(&silence), "纯静音不该判成人声");
+    }
+
     /// 会话级状态必须按 session_key 隔离。
     ///
     /// 这是多设备的基础：A 设备的静音标记 / 告别标记不能影响 B。
@@ -4801,6 +4898,13 @@ mod tests {
     #[tokio::test]
     async fn test_ns3_no_speech_resets_on_speech() {
         let strategy = make_strategy_with_pipeline(300); // 5 帧
+        // 这条测试验证的是「无语音超时计数」的逻辑，不是 VAD 实现本身。
+        // Silero 只认真实语音，会把下面这个合成正弦音判成非人声（这是对的），
+        // 所以这里强制回退到能量判据，让测试保持确定性。
+        // VAD 本身由 silero_vad_loads_and_ignores_silence 覆盖。
+        strategy
+            .with_session("test", |state| state.silero = None)
+            .expect("准备会话");
         // 4 帧静音 + 1 帧响亮（检测到语音，无语音超时作废）
         for _ in 0..4 {
             strategy

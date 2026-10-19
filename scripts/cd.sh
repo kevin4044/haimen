@@ -135,6 +135,21 @@ if ! rustup target list --installed --toolchain stable 2>/dev/null | grep -qx "$
 fi
 ok "目标 ${TARGET} 就绪（工具链 ${TOOLCHAIN}）"
 
+# ort 在构建期要从 cdn.pyke.io 下载 ONNX Runtime 二进制（每平台约 19MB）。
+# 该 CDN 直连只有 30~40 KB/s —— 19MB 要 8 分钟，而 ort 的 build script 有全局
+# 超时，会直接失败。这里自动从 macOS 系统代理推导，可用 HAIMEN_BUILD_PROXY 覆盖。
+if [ -z "${HTTPS_PROXY:-}" ]; then
+  PROXY_HOST="$(scutil --proxy 2>/dev/null | awk '/HTTPSProxy/{print $3}')"
+  PROXY_PORT="$(scutil --proxy 2>/dev/null | awk '/HTTPSPort/{print $3}')"
+  if [ -n "${PROXY_HOST}" ] && [ -n "${PROXY_PORT}" ]; then
+    export HTTPS_PROXY="http://${PROXY_HOST}:${PROXY_PORT}"
+    export HTTP_PROXY="${HTTPS_PROXY}"
+    info "构建代理: ${HTTPS_PROXY}（ort 下载 ONNX Runtime 用）"
+  else
+    warn "没检测到系统代理；如果 ort 下载超时，用 HAIMEN_BUILD_PROXY=http://host:port 指定"
+  fi
+fi
+
 export MACOSX_DEPLOYMENT_TARGET="${DEPLOY_TARGET_MACOS}"
 BIN="target/${TARGET}/release/haimen"
 
