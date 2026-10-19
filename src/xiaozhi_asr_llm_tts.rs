@@ -67,14 +67,37 @@ pub type SharedAsrConfig = Arc<RwLock<AsrConfig>>;
 // 句切分工具
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// 首句额外认可的切分标点（逗号、顿号、逗号、波浪号）。
+///
+/// 参考实现（tts/base.py:94-105）给第一句单独一套更宽的标点集。
+/// 为什么只对首句放宽：首句决定「第一帧音频什么时候出声」，这段延迟用户最敏感；
+/// 但把「，」当句末会切出更多短句，后面每句都要重新起调，听起来会碎。
+/// 所以这个取舍只做在第一句上 —— 后面仍按完整句子切。
+const FIRST_SENTENCE_EXTRA_PUNCT: &[char] = &['，', '、', ',', '~'];
+
+/// 常规句末标点（含换行，用于切分行内列表）。
+fn is_sentence_boundary(ch: char, first_sentence: bool) -> bool {
+    matches!(ch, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n')
+        || (first_sentence && FIRST_SENTENCE_EXTRA_PUNCT.contains(&ch))
+}
+
 /// 从句子缓冲区提取一个完整句子（含结尾标点），并消费掉它。
 ///
 /// 找不到句末标点时返回 `None`（残句留在 `buf` 中，等待后续 chunk 累积）。
 /// ASCII `.` 不纳入句末标点，避免拆分 `Mr.` / `3.14` 等缩写与数字。
 fn take_sentence(buf: &mut String) -> Option<String> {
+    take_sentence_with(buf, false)
+}
+
+/// `first_sentence = true` 时用更宽的标点集（额外接受 `，、,~`）。
+///
+/// 场景：LLM 第一个 delta 就是完整一句「好的，我来帮你打开客厅的灯。」。
+/// 只认句末标点的话这一整句（14 字）都会塞给 TTS，首帧要等它合成完；
+/// 放宽后切成「好的，」，TTS 可以立刻开始出声。
+fn take_sentence_with(buf: &mut String, first_sentence: bool) -> Option<String> {
     let mut end = None;
     for (i, ch) in buf.char_indices() {
-        if matches!(ch, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n') {
+        if is_sentence_boundary(ch, first_sentence) {
             end = Some(i + ch.len_utf8());
             break;
         }
@@ -318,8 +341,14 @@ impl TtsTextAggregator {
         self.raw_buf.push_str(delta);
         let mut blocks = Vec::new();
 
-        // 切出完整句（take_sentence 消费掉含结尾标点，空残句天然被过滤）
-        while let Some(s) = take_sentence(&mut self.raw_buf) {
+        // 切出完整句（消费掉含结尾标点，空残句天然被过滤）。
+        // 首句用宽标点集（连「，」也算句末）：首帧音频能更早出声，
+        // 后续句子回到常规标点，避免整段回复被逗号切得太碎。
+        loop {
+            let first = !self.emitted_first;
+            let Some(s) = take_sentence_with(&mut self.raw_buf, first) else {
+                break;
+            };
             let cleaned = clean_markdown_for_tts(&s);
             if !cleaned.is_empty() {
                 blocks.push(cleaned);
@@ -4282,6 +4311,44 @@ mod tests {
         assert_eq!(provider.name(), "qwen");
     }
 
+    // ─── 首句宽标点切分（E：首帧更早出声）─────────────────
+
+    /// 首句遇到逗号就切。LLM 第一个 delta 常是「好的，我这就…」这种
+    /// 带逗号但没有句末标点的片段，不切的话整段都要等 TTS 合成完才出声。
+    #[test]
+    fn test_t48_first_sentence_splits_on_comma() {
+        let mut agg = TtsTextAggregator::new(180);
+        let blocks = agg.push("好的，我这就");
+        assert_eq!(blocks.len(), 1, "首句应切出一块");
+        assert_eq!(blocks[0], "好的，", "首句应在逗号处切开");
+    }
+
+    /// 首句整句带逗号：切成两块，第一块明显更短 —— TTS 可以先合成短的那块出声。
+    #[test]
+    fn test_t49_first_sentence_shorter_first_block() {
+        let mut agg = TtsTextAggregator::new(180);
+        let blocks = agg.push("好的，我这就帮你打开客厅的灯。");
+        assert_eq!(blocks.len(), 2, "首句应被逗号切成两块");
+        assert_eq!(blocks[0], "好的，");
+        assert!(
+            blocks[0].chars().count() < blocks[1].chars().count(),
+            "第一块应明显短于第二块"
+        );
+    }
+
+    /// 非首句不按逗号切 —— 否则整段回复会被逗号切碎，每小段都要重新起调。
+    #[test]
+    fn test_t50_later_sentences_ignore_comma() {
+        let mut agg = TtsTextAggregator::new(180);
+        let first = agg.push("第一句。");
+        assert_eq!(first, vec!["第一句。"]);
+        let blocks = agg.push("第二句有逗号，但不该在这里切开");
+        assert!(
+            blocks.is_empty(),
+            "非首句的逗号不该触发切分，残句应留在缓冲等句末标点"
+        );
+    }
+
     // ─── take_sentence 句切分测试 ──────────────────────────
 
     #[test]
@@ -4491,7 +4558,11 @@ mod tests {
     fn test_a5_clean_marks_in_aggregator() {
         let mut agg = TtsTextAggregator::new(100);
         let blocks = agg.push("**你好**，世界。");
-        assert_eq!(blocks, vec!["你好，世界。"]);
+        // 这条测试关心的是 markdown 清洗（`**` 被去掉），不是切分粒度。
+        // 首句现在会在逗号处切开（E：首帧更早出声），所以这里是两块；
+        // 拼起来比对，既验证清洗又不会被切分策略变动影响。
+        assert_eq!(blocks.concat(), "你好，世界。");
+        assert_eq!(blocks, vec!["你好，", "世界。"]);
     }
 
     #[tokio::test]
