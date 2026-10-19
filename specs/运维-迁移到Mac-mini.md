@@ -83,6 +83,58 @@ timestamp:   非 0、按 60 递增 ✅
 
 `device_sim.py` 连接时自动带上设备凭据（否则被 CONNACK 0x04 拒绝）。
 
+## CD 流程（`./scripts/cd.sh`）
+
+已改成部署到 mini，一步到位：
+
+```bash
+./scripts/cd.sh                # CI → 交叉编译 → 部署 → 验证
+./scripts/cd.sh --skip-ci      # 跳过 CI
+./scripts/cd.sh --no-deploy    # 只构建校验，不碰线上
+./scripts/cd.sh --rollback     # 回滚到 bin/haimen.prev
+```
+
+### 脚本的安全约束（它存在的意义）
+
+```
+构建 → 校验架构/minos/自包含
+     → scp 到 /tmp
+     → 【目标机上真跑 --version】   ← 跑不起来就到此为止，线上不动
+     → 备份 bin/haimen.prev
+     → mv 原子替换
+     → launchctl kickstart -k
+     → 校验线上 sha256 == 本次构建
+```
+
+**为什么必须"目标机试跑"这一步**：编译机 macOS 27 / 目标机 15.7，
+不设 `MACOSX_DEPLOYMENT_TARGET` 产出的二进制本机能跑、目标机加载不了。
+只校验架构是不够的，必须在目标机实际执行一次。
+
+### 部署后自动验证的 7 项
+
+1. HTTP 端口 9527 监听
+2. 线上二进制 sha256 == 本次构建（防止部署到旧文件）
+3. launchd 退出码为 0
+4. 三个端口都监听（9527/tcp、1883/tcp、8888/udp）
+5. `GET /api/v1/system/info` → 200
+6. OTA 返回的 `mqtt.endpoint` 指向本机（而不是别的机器）
+7. 进程存在
+
+### 实测
+
+```
+CI 通过 → 构建 19s → 部署 → 7 项验证全绿 → 设备自动重连
+```
+
+改动服务会让设备断开约 2 秒，固件自动重连，无需断电。
+（但**改了 endpoint 就必须断电重启设备**才能重新拉 OTA。）
+
+### 回滚
+
+```bash
+./scripts/cd.sh --rollback     # 用 bin/haimen.prev 恢复并重启
+```
+
 ## ⏳ Silero VAD：未完成，卡在 ONNX Runtime 获取
 
 尝试过 `voice_activity_detector 0.2.1`（封装 Silero V5 + ort），失败：
