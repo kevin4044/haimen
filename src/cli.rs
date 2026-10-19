@@ -492,10 +492,22 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             let mut xiaozhi_mqtt_transport = None;
             if settings.xiaozhi.protocol == haimen_xiaozhi::XiaozhiProtocol::Mqtt {
                 let mqtt_cfg = crate::gateway::build_mqtt_udp_config(&settings.xiaozhi);
+                // advertise_ip 就是 MQTT endpoint 的 host，notify 音频 URL 用它做基址。
+                // mqtt_cfg 随后被 move 进 start，先取出来。
+                let advertise_ip = mqtt_cfg.advertise_ip.clone();
                 match haimen_xiaozhi::MqttUdpTransport::start(mqtt_cfg, xiaozhi_strategy.clone())
                     .await
                 {
                     Ok(t) => {
+                        // 安装 notify 通路的设备门面与 URL 基址。
+                        //
+                        // ★ 这里必须和传输层 start 在同一个分支里：`haimen serve`
+                        // 走的是本文件这条路径，而 gateway/mod.rs 里那份是另一条
+                        // 入口（同款代码的另一副本）。只在 gateway 里装的话，
+                        // serve 时 say_hub() 永远是 None，/api/v1/xiaozhi/say
+                        // 会一直报 device_offline。
+                        haimen_xiaozhi::mqtt_udp::install_say_hub(t.say_hub());
+                        haimen_xiaozhi::notify::set_say_advertise_ip(advertise_ip);
                         tracing::warn!(
                             broker = %t.broker_addr(),
                             udp = %t.udp_addr(),

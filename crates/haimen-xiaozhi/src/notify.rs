@@ -243,6 +243,7 @@ pub async fn handle_say(headers: HeaderMap, Json(req): Json<SayRequest>) -> Resp
     // say_hub 为 None = MQTT 传输层没跑（websocket 模式），
     // notify 是 MQTT 通路的能力，此时没有任何可下发的通道，按设备离线报。
     let Some(hub) = crate::mqtt_udp::say_hub() else {
+        tracing::warn!("[say 诊断] say_hub() 为 None —— install_say_hub 没生效");
         return device_offline();
     };
 
