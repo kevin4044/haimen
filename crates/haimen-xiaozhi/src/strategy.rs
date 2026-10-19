@@ -42,8 +42,11 @@ pub trait ResponseStrategy: Send + Sync {
     /// Idle 的机制，不发 goodbye 设备会永远停在 Listening，持续把
     /// 麦克风音频推上来。
     ///
+    /// `session_key` 是**每连接稳定**的键（MQTT 用 client_id，WS 用会话号），
+    /// 用于把状态隔离到单个设备；不要用每次 hello 都会变的协议 session_id。
+    ///
     /// 默认实现返回 `false`，Echo / TTS 等策略不受影响。
-    fn end_of_conversation(&self) -> bool {
+    fn end_of_conversation(&self, _session_key: &str) -> bool {
         false
     }
 
@@ -104,7 +107,7 @@ pub trait ResponseStrategy: Send + Sync {
     /// 注意：即使支持流式 ASR，音频仍会缓冲在 `audio_buffer` 中，
     /// 供 [`generate_response`] 在需要时使用（如作为后备）。
     /// 默认实现为 no-op。
-    async fn on_audio_frame(&self, _frame: &AudioFrame) -> Result<(), String> {
+    async fn on_audio_frame(&self, _session_key: &str, _frame: &AudioFrame) -> Result<(), String> {
         Ok(())
     }
 
@@ -162,7 +165,7 @@ pub trait ResponseStrategy: Send + Sync {
     /// ws.rs 收到此信号后可提前结束录音，立即进入回放处理阶段。
     ///
     /// 返回 `None` 表示不支持 VAD 信号（将依赖安全超时或 Listen::Stop 结束录音）。
-    fn vad_completion(&self) -> Option<Arc<Notify>> {
+    fn vad_completion(&self, _session_key: &str) -> Option<Arc<Notify>> {
         None
     }
 
@@ -189,7 +192,7 @@ pub trait ResponseStrategy: Send + Sync {
     ///
     /// ws.rs 收到此信号后可主动播报告别（[`goodbye_frames`]）并关闭连接。
     /// 返回 `None` 表示不支持该信号（依赖正常录音结束流程）。默认返回 `None`。
-    fn no_speech_completion(&self) -> Option<Arc<Notify>> {
+    fn no_speech_completion(&self, _session_key: &str) -> Option<Arc<Notify>> {
         None
     }
 
@@ -385,7 +388,7 @@ mod tests {
     async fn test_t12_on_audio_frame_noop() {
         let strategy = EchoStrategy;
         let frame = make_frame(0, &[0x01, 0x02]);
-        let result = strategy.on_audio_frame(&frame).await;
+        let result = strategy.on_audio_frame("test", &frame).await;
         assert!(result.is_ok(), "默认 on_audio_frame 应为 Ok(())");
     }
 
@@ -399,7 +402,7 @@ mod tests {
         assert!(result.is_ok());
 
         let frame = make_frame(0, &[0x01]);
-        let result = strategy.on_audio_frame(&frame).await;
+        let result = strategy.on_audio_frame("test", &frame).await;
         assert!(result.is_ok());
     }
 
@@ -449,7 +452,7 @@ mod tests {
     fn test_t17_no_speech_completion_default_none() {
         let strategy = EchoStrategy;
         assert!(
-            strategy.no_speech_completion().is_none(),
+            strategy.no_speech_completion("test").is_none(),
             "默认 no_speech_completion 应返回 None（不支持无语音超时信号）"
         );
     }

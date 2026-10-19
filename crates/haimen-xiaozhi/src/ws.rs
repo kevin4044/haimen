@@ -137,7 +137,7 @@ async fn handle_ws_connection(
             let tokio_deadline = tokio::time::Instant::from_std(deadline);
 
             // 获取 VAD 完成信号（如果策略支持流式 ASR + VAD）
-            let vad_completion = session.strategy.vad_completion();
+            let vad_completion = session.strategy.vad_completion(&session.session_id);
             let has_vad = vad_completion.is_some();
 
             // VAD 等待 future（需在 select! 前 pin 住）
@@ -151,7 +151,7 @@ async fn handle_ws_connection(
             tokio::pin!(vad_fut);
 
             // 获取无语音超时信号（策略可选）
-            let no_speech_completion = session.strategy.no_speech_completion();
+            let no_speech_completion = session.strategy.no_speech_completion(&session.session_id);
             let has_no_speech = no_speech_completion.is_some();
 
             let no_speech_fut = async move {
@@ -429,7 +429,11 @@ async fn buffer_audio(data: &[u8], socket: &mut WebSocket, session: &mut Session
 
             // 如果策略支持流式 ASR，将帧实时喂入 ASR 管道
             if session.strategy.supports_streaming_asr() {
-                if let Err(e) = session.strategy.on_audio_frame(&frame).await {
+                if let Err(e) = session
+                    .strategy
+                    .on_audio_frame(&session.session_id, &frame)
+                    .await
+                {
                     tracing::warn!(
                         device_id = %session.device_id,
                         error = %e,
@@ -1331,7 +1335,11 @@ mod tests {
             true
         }
 
-        async fn on_audio_frame(&self, _frame: &AudioFrame) -> Result<(), String> {
+        async fn on_audio_frame(
+            &self,
+            _session_key: &str,
+            _frame: &AudioFrame,
+        ) -> Result<(), String> {
             let count = self.frame_count.fetch_add(1, Ordering::SeqCst) + 1;
             if count >= self.frame_threshold {
                 self.notify.notify_one();
@@ -1339,7 +1347,7 @@ mod tests {
             Ok(())
         }
 
-        fn no_speech_completion(&self) -> Option<Arc<Notify>> {
+        fn no_speech_completion(&self, _session_key: &str) -> Option<Arc<Notify>> {
             Some(self.notify.clone())
         }
 

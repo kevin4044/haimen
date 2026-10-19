@@ -1590,7 +1590,7 @@ fn mark_end_of_conversation(flag: &AtomicBool, text: &str) {
 #[async_trait]
 impl ResponseStrategy for AsrLlmTtsStrategy {
     /// 一次性信号：读取即清除，避免下一轮被误收口。
-    fn end_of_conversation(&self) -> bool {
+    fn end_of_conversation(&self, _session_key: &str) -> bool {
         self.end_of_conversation.swap(false, Ordering::AcqRel)
     }
 
@@ -1648,7 +1648,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
     ///
     /// 如果 ASR 管道尚未初始化（惰性），第一帧音频到达时会自动创建。
     /// 这样确保 ASR WebSocket 连接只在用户真正说话时建立。
-    async fn on_audio_frame(&self, frame: &AudioFrame) -> Result<(), String> {
+    async fn on_audio_frame(&self, _session_key: &str, frame: &AudioFrame) -> Result<(), String> {
         if frame.data.is_empty() {
             return Ok(());
         }
@@ -1806,13 +1806,13 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
     // ────────── VAD 端点检测 ──────────
 
-    fn vad_completion(&self) -> Option<Arc<Notify>> {
+    fn vad_completion(&self, _session_key: &str) -> Option<Arc<Notify>> {
         self.vad_notify.lock().ok().map(|g| g.clone())
     }
 
     // ────────── 无语音超时 ──────────
 
-    fn no_speech_completion(&self) -> Option<Arc<Notify>> {
+    fn no_speech_completion(&self, _session_key: &str) -> Option<Arc<Notify>> {
         self.no_speech_notify.lock().ok().map(|g| g.clone())
     }
 
@@ -4555,7 +4555,7 @@ mod tests {
         let strategy = make_strategy_with_pipeline(300);
         for _ in 0..5 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }
@@ -4564,7 +4564,7 @@ mod tests {
             "初始静音达到阈值后应触发无语音超时并关闭管道"
         );
         let notify = strategy
-            .no_speech_completion()
+            .no_speech_completion("test")
             .expect("应暴露无语音超时 Notify");
         let fired = tokio::time::timeout(std::time::Duration::from_millis(1000), notify.notified())
             .await
@@ -4577,7 +4577,7 @@ mod tests {
         let strategy = make_strategy_with_pipeline(300); // 5 帧
         for _ in 0..4 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }
@@ -4586,7 +4586,7 @@ mod tests {
             "未达到阈值时不应触发无语音超时"
         );
         let notify = strategy
-            .no_speech_completion()
+            .no_speech_completion("test")
             .expect("应暴露无语音超时 Notify");
         let fired = tokio::time::timeout(std::time::Duration::from_millis(200), notify.notified())
             .await
@@ -4600,18 +4600,18 @@ mod tests {
         // 4 帧静音 + 1 帧响亮（检测到语音，无语音超时作废）
         for _ in 0..4 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }
         strategy
-            .on_audio_frame(&loud_frame())
+            .on_audio_frame("test", &loud_frame())
             .await
             .expect("喂帧应成功");
         // 之后大量静音帧：speech_detected=true，走 VAD 路径但 asr_received_text=false 不触发
         for _ in 0..40 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }
@@ -4620,7 +4620,7 @@ mod tests {
             "检测到语音后无语音超时应作废（交给 VAD 流程）"
         );
         let notify = strategy
-            .no_speech_completion()
+            .no_speech_completion("test")
             .expect("应暴露无语音超时 Notify");
         let fired = tokio::time::timeout(std::time::Duration::from_millis(200), notify.notified())
             .await
@@ -4633,7 +4633,7 @@ mod tests {
         let strategy = make_strategy_with_pipeline(0); // 0 = 禁用
         for _ in 0..30 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }

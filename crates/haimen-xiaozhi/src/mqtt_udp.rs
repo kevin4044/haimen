@@ -365,13 +365,42 @@ async fn run_loop(
           //
           // 每次循环都重新取一次 Notifier：策略在每次录音开始时可能换掉内部的
           // Arc，缓存旧 Arc 会永远收不到信号。
-          _ = async {
-            match shared.strategy.vad_completion() {
-              Some(notify) => notify.notified().await,
-              None => std::future::pending::<()>().await,
+          // 多个设备可能同时在录音，所以这里轮询【所有】Recording 会话各自的
+          // notifier，谁先完成就推进谁。用一个全局 notifier 会让 A 设备说完
+          // 把 B 设备也一起收口（多设备串台）。
+          done_key = async {
+            let keys: Vec<String> = {
+              let tables = shared.tables.lock().await;
+              tables
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.state == SessionState::Recording)
+                .map(|(client_id, _)| client_id.clone())
+                .collect()
+            };
+            if keys.is_empty() {
+              return std::future::pending::<String>().await;
             }
+            type KeyFuture = std::pin::Pin<
+              Box<dyn std::future::Future<Output = String> + Send>,
+            >;
+            let futures: Vec<KeyFuture> = keys
+              .into_iter()
+              .map(|key| {
+                let strategy = shared.strategy.clone();
+                let fut: KeyFuture = Box::pin(async move {
+                  match strategy.vad_completion(&key) {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending::<()>().await,
+                  }
+                  key
+                });
+                fut
+              })
+              .collect();
+            futures_util::future::select_all(futures).await.0
           } => {
-            finish_recording_by_vad(&shared).await;
+            finish_recording_by_vad(&shared, &done_key).await;
           }
           _ = tick.tick() => {
             prune_sessions(&shared).await;
@@ -786,7 +815,7 @@ async fn handle_udp(shared: &Arc<Shared>, audio: crate::udp_audio::UdpIncomingAu
         timestamp: audio.timestamp,
         data: audio.payload,
     };
-    let forward = {
+    let recording_client = {
         let mut tables = shared.tables.lock().await;
         let Some(client_id) = tables.udp_index.get(&audio.session_id).cloned() else {
             // 旧会话残留，或者 hello 已经轮换过 key。
@@ -813,10 +842,12 @@ async fn handle_udp(shared: &Arc<Shared>, audio: crate::udp_audio::UdpIncomingAu
         }
         session.last_activity = Instant::now();
         session.audio_buffer.push(frame.clone());
-        true
+        Some(client_id)
     };
-    if forward {
-        if let Err(err) = shared.strategy.on_audio_frame(&frame).await {
+    // 用 client_id 作为策略层的会话键：它在一个设备的整个连接周期内稳定，
+    // 不像 protocol_session_id 每次 hello 都会换。
+    if let Some(client_id) = recording_client {
+        if let Err(err) = shared.strategy.on_audio_frame(&client_id, &frame).await {
             tracing::warn!(%err, "on_audio_frame 失败，帧已留在缓冲里");
         }
     }
@@ -831,20 +862,20 @@ async fn handle_udp(shared: &Arc<Shared>, audio: crate::udp_audio::UdpIncomingAu
 ///
 /// 注意：该 Notifier 是策略级而非会话级的，多设备同时录音时会一起收口。
 /// M2' 是单设备场景可接受；多设备需要给策略加带 session 参数的版本。
-async fn finish_recording_by_vad(shared: &Arc<Shared>) {
-    let recording: Vec<String> = {
+async fn finish_recording_by_vad(shared: &Arc<Shared>, client_id: &str) {
+    let still_recording = {
         let tables = shared.tables.lock().await;
         tables
             .sessions
-            .iter()
-            .filter(|(_, session)| session.state == SessionState::Recording)
-            .map(|(client_id, _)| client_id.clone())
-            .collect()
+            .get(client_id)
+            .is_some_and(|session| session.state == SessionState::Recording)
     };
-    for client_id in recording {
-        tracing::warn!(%client_id, "策略侧 VAD 检测到语音结束，立即生成回复");
-        start_playback(shared, &client_id).await;
+    if !still_recording {
+        // 期间可能已被录音上限或 abort 收口，忽略这次信号。
+        return;
     }
+    tracing::warn!(%client_id, "策略侧 VAD 检测到语音结束，立即生成回复");
+    start_playback(shared, client_id).await;
 }
 
 async fn expire_recordings(shared: &Arc<Shared>) {
@@ -1171,7 +1202,7 @@ async fn finish_ready(shared: &Shared, job: &PlaybackJob) {
 
     // 用户说了告别语：回复已经播完，立刻收口让设备回待命。
     // 不能等 IDLE_CLOSE_LIMIT 超时 —— 那样设备会白听 15 秒并继续推麦克风音频。
-    if shared.strategy.end_of_conversation() {
+    if shared.strategy.end_of_conversation(&job.client_id) {
         tracing::warn!(
             client_id = %job.client_id,
             "用户说了告别语，回复播完立即结束会话"
@@ -1654,7 +1685,11 @@ mod tests {
             Ok(())
         }
 
-        async fn on_audio_frame(&self, frame: &AudioFrame) -> Result<(), String> {
+        async fn on_audio_frame(
+            &self,
+            _session_key: &str,
+            frame: &AudioFrame,
+        ) -> Result<(), String> {
             self.lock().audio_frames.push(frame.clone());
             Ok(())
         }
