@@ -137,7 +137,7 @@ async fn handle_ws_connection(
             let tokio_deadline = tokio::time::Instant::from_std(deadline);
 
             // 获取 VAD 完成信号（如果策略支持流式 ASR + VAD）
-            let vad_completion = session.strategy.vad_completion();
+            let vad_completion = session.strategy.vad_completion(&session.session_id);
             let has_vad = vad_completion.is_some();
 
             // VAD 等待 future（需在 select! 前 pin 住）
@@ -151,7 +151,7 @@ async fn handle_ws_connection(
             tokio::pin!(vad_fut);
 
             // 获取无语音超时信号（策略可选）
-            let no_speech_completion = session.strategy.no_speech_completion();
+            let no_speech_completion = session.strategy.no_speech_completion(&session.session_id);
             let has_no_speech = no_speech_completion.is_some();
 
             let no_speech_fut = async move {
@@ -370,7 +370,7 @@ async fn enter_recording(session: &mut Session) {
     if session.strategy.supports_streaming_asr() {
         if let Err(e) = session
             .strategy
-            .on_recording_start(&session.session_id)
+            .on_recording_start(&session.session_id, &session.session_id)
             .await
         {
             tracing::warn!(
@@ -429,7 +429,11 @@ async fn buffer_audio(data: &[u8], socket: &mut WebSocket, session: &mut Session
 
             // 如果策略支持流式 ASR，将帧实时喂入 ASR 管道
             if session.strategy.supports_streaming_asr() {
-                if let Err(e) = session.strategy.on_audio_frame(&frame).await {
+                if let Err(e) = session
+                    .strategy
+                    .on_audio_frame(&session.session_id, &frame)
+                    .await
+                {
                     tracing::warn!(
                         device_id = %session.device_id,
                         error = %e,
@@ -668,6 +672,15 @@ async fn strategy_playback(socket: &mut WebSocket, session: &mut Session) {
     }
 }
 
+/// 播放预缓冲帧数（60ms/帧）。
+///
+/// 5 帧 × 60ms = 300ms。云端复刻版（xinnan-tech/xiaozhi-esp32-server）用 5 帧，
+/// 实测 TTS 合成速率 ~7-8x 实时，300ms 已够。预缓冲直接决定"用户说完到开始出声"
+/// 的延迟，越小体验越好；但过小会在合成慢时断供。预缓冲也不宜过大——Tts::Start
+/// 后预缓冲帧是一次性连发的，若超出固件 jitter buffer 容量会溢出丢帧
+/// （同样表现为"半个字/语速压缩"）。
+const PREBUFFER_COUNT: usize = 5;
+
 /// 流式回放：从 channel 逐帧读取音频帧并发送给设备
 ///
 /// 与 [`playback_frames`] 功能相同（含中断处理），但帧是边生成边到达的。
@@ -704,17 +717,13 @@ async fn playback_frames_stream(
 
     // ── Phase 1: 预缓冲 ─────────────────────────────────────────
     // 在开始播放前先收集若干帧，给 TTS 生成足够的 head start。
-    // 10 帧 × 60ms = 600ms 预缓冲：实测 TTS 合成速率 ~7-8x 实时，
-    // 600ms 已足以覆盖网络抖动。预缓冲不宜过大——Tts::Start 后预缓冲帧
-    // 是一次性连发的，若超出固件 jitter buffer 容量会溢出丢帧
-    // （同样表现为"半个字/语速压缩"）。
+    // 帧数由模块级 [`PREBUFFER_COUNT`] 决定（当前 5 帧 = 300ms）。
     //
     // 文本事件不参与预缓冲计数：
     // - Stt 立即转发（固件对 stt 的处理不依赖状态机，任何状态都会写屏）
     // - LlmSentence 缓存到 pending_sentences，待 Tts::Start 后统一 flush，
     //   避免助手文本先于设备进入 Speaking 态上屏
 
-    const PREBUFFER_COUNT: usize = 10;
     let mut prebuffer: Vec<AudioFrame> = Vec::with_capacity(PREBUFFER_COUNT);
     let mut pending_sentences: Vec<String> = Vec::new();
     let mut gen_done = false;
@@ -848,7 +857,7 @@ async fn playback_frames_stream(
     );
 
     // ── Phase 3: 稳态播放 ──────────────────────────────────────
-    // 预缓冲帧已发出，设备有约 600ms 的音频可播放。
+    // 预缓冲帧已发出，设备有约 300ms 的音频可播放。
     // 后续帧按固定 60ms 间隔发送（由 next_send_at 发送时钟对齐），
     // 保持与设备播放节奏同步；合成慢导致帧断供时由预缓冲兜底。
     // 发送时钟避免 socket 有消息返回时 wait_frame_interrupt 提前结束、
@@ -1326,7 +1335,11 @@ mod tests {
             true
         }
 
-        async fn on_audio_frame(&self, _frame: &AudioFrame) -> Result<(), String> {
+        async fn on_audio_frame(
+            &self,
+            _session_key: &str,
+            _frame: &AudioFrame,
+        ) -> Result<(), String> {
             let count = self.frame_count.fetch_add(1, Ordering::SeqCst) + 1;
             if count >= self.frame_threshold {
                 self.notify.notify_one();
@@ -1334,7 +1347,7 @@ mod tests {
             Ok(())
         }
 
-        fn no_speech_completion(&self) -> Option<Arc<Notify>> {
+        fn no_speech_completion(&self, _session_key: &str) -> Option<Arc<Notify>> {
             Some(self.notify.clone())
         }
 
@@ -1493,7 +1506,7 @@ mod tests {
         use crate::add_routes;
 
         let strategy = Arc::new(GapResumeStrategy {
-            pre_frames: 10,
+            pre_frames: PREBUFFER_COUNT,
             gap: Duration::from_millis(1500),
             post_frames: 10,
         });
@@ -1531,7 +1544,7 @@ mod tests {
             .await
             .expect("发送 listen stop 失败");
 
-        // 读取消息：Tts::Start → 10 预缓冲帧 → [断档] → 10 恢复帧 → Tts::Stop
+        // 读取消息：Tts::Start → 5 预缓冲帧 → [断档] → 10 恢复帧 → Tts::Stop
         let mut frame_times: Vec<(usize, Instant)> = Vec::new();
         let mut saw_start = false;
         let mut saw_stop = false;
@@ -1562,13 +1575,19 @@ mod tests {
 
         assert!(saw_start, "应收到 TTS::Start");
         assert!(saw_stop, "应收到 TTS::Stop");
-        assert_eq!(frame_times.len(), 20, "应收到 10 预缓冲帧 + 10 断档恢复帧");
+        // 预缓冲帧数 + 断档恢复的 10 帧
+        const RESUME_FRAMES: usize = 10;
+        assert_eq!(
+            frame_times.len(),
+            PREBUFFER_COUNT + RESUME_FRAMES,
+            "应收到 {PREBUFFER_COUNT} 预缓冲帧 + {RESUME_FRAMES} 断档恢复帧"
+        );
 
-        // 恢复帧 = 索引 10..20。它们应保持 ~60ms 发送节奏，
-        // 而非断档恢复后瞬间连发。9 个 60ms 间隔 ≈ 540ms；
+        // 恢复帧 = 索引 PREBUFFER_COUNT..PREBUFFER_COUNT+RESUME_FRAMES。它们应保持 ~60ms
+        // 发送节奏，而非断档恢复后瞬间连发。9 个 60ms 间隔 ≈ 540ms；
         // 断言 >= 300ms 以容忍 CI 抖动，同时远大于突发连发（毫秒级）。
-        let first_resume = frame_times[10].1;
-        let last_resume = frame_times[19].1;
+        let first_resume = frame_times[PREBUFFER_COUNT].1;
+        let last_resume = frame_times[PREBUFFER_COUNT + RESUME_FRAMES - 1].1;
         let resume_span = last_resume.duration_since(first_resume);
 
         assert!(

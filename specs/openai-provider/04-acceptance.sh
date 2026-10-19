@@ -47,6 +47,7 @@ fi
 ALLOWED_FILES=(
     "Cargo.toml"
     "Cargo.lock"
+    "src/agents/registry.rs"
 )
 ALLOWED_PREFIXES=(
     "crates/haimen-openai/"

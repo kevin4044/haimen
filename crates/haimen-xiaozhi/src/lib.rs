@@ -1,9 +1,15 @@
+pub mod mqtt;
+pub mod mqtt_broker;
+pub mod mqtt_udp;
 mod ota;
 mod protocol;
+pub mod protocol_udp;
 pub mod strategy;
 pub mod types;
+pub mod udp_audio;
 mod ws;
 
+pub use mqtt_udp::{MqttUdpConfig, MqttUdpError, MqttUdpTransport};
 pub use protocol::*;
 pub use strategy::{EchoStrategy, ResponseStrategy};
 pub use types::*;
@@ -12,10 +18,26 @@ use std::sync::Arc;
 
 use axum::Router;
 
+/// 当配置为 mqtt 时，由根 crate 调用以启动 MQTT+UDP 传输层。
+/// websocket 模式下不需要调用。
+///
+/// M2' 不把这次调用接进根 crate 的启动流程，避免现有 WebSocket 部署多开端口。
+pub async fn start_mqtt_transport(
+    cfg: MqttUdpConfig,
+    strategy: Arc<dyn ResponseStrategy>,
+) -> Result<MqttUdpTransport, MqttUdpError> {
+    MqttUdpTransport::start(cfg, strategy).await
+}
+
+/// 安装 OTA 下发用的小智配置。未调用时默认为 websocket，响应里只有 `websocket` 段。
+pub fn set_xiaozhi_ota_config(cfg: XiaozhiConfig) {
+    ota::set_xiaozhi_ota_config(cfg);
+}
+
 /// 向 axum Router 注入 xiaozhi 设备通信端点
 ///
-/// 添加两条路由：
-/// - `POST /xiaozhi/ota/` — OTA 握手，返回 WebSocket URL 和音频参数
+/// 两条路由始终挂载（MQTT 模式下设备仍可能回退到 WebSocket）：
+/// - `POST /xiaozhi/ota/` — OTA 握手，按配置下发 websocket 或 mqtt 段
 /// - `GET  /xiaozhi/ws`   — WebSocket 升级端点
 ///
 /// # 参数

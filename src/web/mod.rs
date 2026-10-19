@@ -24,16 +24,23 @@ pub struct ServeConfig {
 /// - `asr_config`: 共享的 ASR 配置（Arc<RwLock>），Web API 保存时同步更新，实现运行时热加载
 /// - `tts_config`: 共享的 TTS 配置（Arc<RwLock>），Web API 保存时同步更新，实现运行时热加载
 /// - `cancel`: 共享取消令牌，收到取消信号时触发优雅关闭
+// 启动协调函数，参数都是互不相关的独立配置/句柄；打包成 struct 反而更晦涩。
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     config: ServeConfig,
     webhook_state: Option<WebhookState>,
     xiaozhi_strategy: Option<Arc<dyn haimen_xiaozhi::ResponseStrategy>>,
+    xiaozhi_config: haimen_xiaozhi::XiaozhiConfig,
     asr_config: Arc<RwLock<AsrConfig>>,
     tts_config: Arc<RwLock<TtsConfig>>,
     shared_agent: crate::gateway::agent_handle::SharedAgent,
     cancel: CancellationToken,
 ) -> Result<(), String> {
     use haimen_xiaozhi;
+
+    // 安装小智传输配置：决定 OTA 下发 websocket 还是 mqtt 段。
+    // 必须在挂载路由前调用 —— handle_ota 用的是全局槽，默认 websocket。
+    haimen_xiaozhi::set_xiaozhi_ota_config(xiaozhi_config);
 
     // 构建路由
     // ASR 路由使用 asr_config 作为 axum State（独立于 TTS 配置）
@@ -172,10 +179,14 @@ pub async fn start(
     // 优雅关闭：优先等待共享取消令牌，同时也响应 SIGINT/SIGTERM
     let graceful = graceful_shutdown(cancel);
 
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(graceful)
-        .await
-        .map_err(|e| format!("服务器错误: {}", e))
+    // 必须带 connect info：OTA handler 要按对端 IP 做来源校验。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(graceful)
+    .await
+    .map_err(|e| format!("服务器错误: {}", e))
 }
 
 /// 组合信号 + CancellationToken 的优雅关闭 Future

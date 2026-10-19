@@ -35,6 +35,7 @@
 //! 策略内部维护 LLM 的 `session_id`，每次 `generate_response` 调用后更新，
 //! 实现音色多轮对话的上下文连续性。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -110,7 +111,22 @@ const TTS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 
 /// 首个可播文本块的等待上限（与批处理路径 LLM 超时口径一致）。
 /// 超过该时长（模型思考/调用工具过久）则播放超时兜底提示，避免设备静默。
-const TTS_FIRST_TEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 首个文本的超时。超过这个时间还没拿到第一段文字就走兜底文案。
+///
+/// 从 60 秒降到 20 秒：思考反馈在 15 秒就会播「我正在处理，请稍后」，
+/// 再等 45 秒对语音交互没有意义，只会让用户干等。
+const TTS_FIRST_TEXT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Agent「建立流式连接 + 首字节」的超时。
+///
+/// 为什么单独加：`reqwest::Client::timeout`（haimen-openai/src/agent.rs:375）
+/// 覆盖【整个请求含读完 body】，用它压时间会把长回复的流切断。
+/// 而 `process_stream` 在收到响应头之后就返回，所以在这里加超时
+/// 只约束「连上并拿到首字节」，不影响后续流式输出。
+///
+/// 值取 15 秒：正常情况 0.9 秒就返回，15 秒足够覆盖 Hermes 起 agent 的开销；
+/// 超过 15 秒基本就是上游卡死（实测过 Hermes 的 DeepSeek 流式调用挂住不返回）。
+const AGENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// 聚合文本通道容量（有界，提供背压）
 const TTS_AGG_CHANNEL_CAPACITY: usize = 16;
@@ -503,6 +519,38 @@ struct LlmSession {
     session_id: String,
 }
 
+/// 单会话（单设备）的 ASR / 对话状态。
+///
+/// 为什么要按会话隔离：策略是全局单例，多设备同时说话时，
+/// 共享的 ASR 管道、VAD 信号和收口标记会互相覆盖 ——
+/// 表现为 A 的音频进 B 的管道、A 说「再见」把 B 的会话也关掉。
+struct SessionAsrState {
+    /// 最近一次被访问的时刻，用于回收长期不用、且没有活动 ASR 管道的会话。
+    last_used: std::time::Instant,
+    llm_session_id: Option<LlmSession>,
+    streaming_state: Option<AsrPipelineState>,
+    vad_notify: Arc<Notify>,
+    no_speech_notify: Arc<Notify>,
+    silence_closed: bool,
+    asr_received_text: Arc<AtomicBool>,
+    end_of_conversation: Arc<AtomicBool>,
+}
+
+impl SessionAsrState {
+    fn new() -> Self {
+        Self {
+            last_used: std::time::Instant::now(),
+            llm_session_id: None,
+            streaming_state: None,
+            vad_notify: Arc::new(Notify::new()),
+            no_speech_notify: Arc::new(Notify::new()),
+            silence_closed: false,
+            asr_received_text: Arc::new(AtomicBool::new(false)),
+            end_of_conversation: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 /// ASR → LLM → TTS 响应策略：将设备录制的语音识别为文字，
 /// 送 AI Agent 处理，再将回复合成为语音回传
 ///
@@ -527,19 +575,9 @@ pub struct AsrLlmTtsStrategy {
     agent: crate::gateway::agent_handle::SharedAgent,
     /// Agent 子进程工作目录
     work_dir: String,
-    /// LLM 会话（绑定创建时的 Agent 代数，换代后作废），用于多轮对话上下文连续
-    llm_session_id: Mutex<Option<LlmSession>>,
-    /// 流式 ASR 管道状态（录音期间启用，录音结束时消耗）
-    streaming_state: Mutex<Option<AsrPipelineState>>,
-    /// VAD 端点通知器：ASR 检测到用户说完时触发（每录音周期创建新 Notify）
-    vad_notify: Mutex<Arc<Notify>>,
-    /// 无语音超时通知器：录音开始后累计无有效语音达到阈值时触发（每录音周期创建新 Notify）
-    no_speech_notify: Mutex<Arc<Notify>>,
-    /// 本地能量检测标记：静音超阈值后关闭 ASR 流，阻止后续帧重新初始化
-    silence_closed: AtomicBool,
-    /// ASR 是否已返回非空文本（用于决定是否允许本地 VAD 提前关闭流）
-    /// 使用 Arc 以便在 ASR 后台任务中写入
-    asr_received_text: Arc<AtomicBool>,
+    /// 每个会话（设备）独立的 ASR / 对话状态。
+    /// 键是 session_key：MQTT 用 client_id，WS 用 session_id。
+    sessions: Mutex<HashMap<String, SessionAsrState>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -548,13 +586,19 @@ pub struct AsrLlmTtsStrategy {
 
 /// PCM16 mono 静音 RMS 阈值（低于此值视为静音）
 ///
-/// 经验值：PCM16 满幅 32768，正常语音 RMS ≈ 3000~15000，
-/// 环境底噪 RMS ≈ 100~800，阈值 1500 可区分底噪和轻声说话。
-const SILENCE_RMS_THRESHOLD: f64 = 1500.0;
+/// 真机实测（设备 84:c7:bb:59:93:64）：
+/// - 用户说话时 RMS ≈ 4000~15000
+/// - 环境静音时 RMS ≈ 1600~2200
+///
+/// 阈值 2000 会把环境噪音（实测 2019、2120）误判为"还在说话"，导致
+/// `silence_count` 始终归零、本地能量 VAD 永远不触发，只能干等服务端
+/// 1500ms 判停。取 3000 才能在实测数据上正确区分人声与环境噪音。
+const SILENCE_RMS_THRESHOLD: f64 = 3000.0;
 
-/// 连续静音帧数阈值（60ms/帧），约 2.4s 静音后触发本地 VAD。
-/// 中文口语中思考停顿/语气词后的迟疑常超 1.2s，故取较宽容的 2.4s。
-const MAX_SILENCE_FRAMES: u64 = 40;
+/// 连续静音帧数阈值（60ms/帧），触发本地 VAD。
+/// 15 帧 = 900ms，对齐小智云端判停量级（其 Silero VAD 为 1000ms）。
+/// 注意：这条路径只有 `SILENCE_RMS_THRESHOLD` 能正确区分人声与噪音时才生效。
+const MAX_SILENCE_FRAMES: u64 = 15;
 
 /// 无语音超时帧数阈值：按 60ms/帧向上取整，保证实际时长 ≥ 配置值
 fn no_speech_threshold_frames(timeout_ms: u64) -> u64 {
@@ -563,18 +607,36 @@ fn no_speech_threshold_frames(timeout_ms: u64) -> u64 {
 
 /// 计算 PCM16 mono 帧的 RMS 能量值
 fn compute_pcm_rms(pcm_bytes: &[u8]) -> f64 {
-    let samples = pcm_bytes.len() / 2;
-    if samples == 0 {
-        return 0.0;
-    }
-    let sum_sq: f64 = pcm_bytes
+    compute_pcm_stats(pcm_bytes).1
+}
+
+/// 返回 (直流均值, 去直流后的 RMS)
+///
+/// 为什么必须去直流：INMP441 这类 MEMS 麦克风常带固定直流偏置（实测本机
+/// 静音时偏置可达数千 LSB）。直接对采样平方求和会把偏置算进 RMS，
+/// 导致"静音时 RMS 也有 3000~12000"，静音阈值无论怎么调都区分不开人声与静音
+/// —— 本地能量 VAD 因此从不触发。
+///
+/// 先减去帧内均值再算 RMS，得到的才是真正的交流（声音）能量。
+fn compute_pcm_stats(pcm_bytes: &[u8]) -> (f64, f64) {
+    let samples: Vec<i16> = pcm_bytes
         .chunks_exact(2)
-        .map(|b| {
-            let sample = i16::from_le_bytes([b[0], b[1]]);
-            (sample as f64).powi(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let n = samples.len();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let nf = n as f64;
+    let mean = samples.iter().map(|&s| s as f64).sum::<f64>() / nf;
+    let sum_sq: f64 = samples
+        .iter()
+        .map(|&s| {
+            let centered = s as f64 - mean;
+            centered * centered
         })
         .sum();
-    (sum_sq / samples as f64).sqrt()
+    (mean, (sum_sq / nf).sqrt())
 }
 
 /// 根据配置创建 ASR 提供者实例
@@ -653,12 +715,18 @@ fn create_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>, String> 
             let api_key = cfg
                 .get_credential("api_key")
                 .ok_or_else(|| "ASR API Key 未配置（当前提供商: doubao）".to_string())?;
+            // 火山已下线 1.0 语音识别（volc.bigasr.sauc.duration 返回 403），
+            // 默认改用 2.0 小时版；允许通过配置覆盖（并发版为 volc.seedasr.sauc.concurrent）。
+            let resource_id = cfg
+                .get_credential("resource_id")
+                .unwrap_or_else(|| "volc.seedasr.sauc.duration".to_string());
             Ok(Box::new(DoubaoAsr::new(DoubaoAsrOption {
                 base: BaseProviderOption {
                     language: Some("zh-CN".into()),
                     ..Default::default()
                 },
                 api_key: Some(api_key),
+                resource_id: Some(resource_id),
                 mode: DoubaoAsrMode::Streaming,
                 ..Default::default()
             })))
@@ -725,28 +793,130 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
             let api_key = cfg
                 .get_credential("api_key")
                 .ok_or_else(|| "ASR API Key 未配置（当前提供商: doubao）".to_string())?;
+            // 火山已下线 1.0 语音识别（volc.bigasr.sauc.duration 返回 403），
+            // 默认改用 2.0 小时版；允许通过配置覆盖（并发版为 volc.seedasr.sauc.concurrent）。
+            let resource_id = cfg
+                .get_credential("resource_id")
+                .unwrap_or_else(|| "volc.seedasr.sauc.duration".to_string());
             Ok(Box::new(DoubaoAsr::new(DoubaoAsrOption {
                 base: BaseProviderOption {
                     language: Some("zh-CN".into()),
                     ..Default::default()
                 },
                 api_key: Some(api_key),
+                resource_id: Some(resource_id),
                 mode: DoubaoAsrMode::Streaming,
                 sample_rate: 16000,
                 bits: 16,
                 channel: 1,
-                // VAD 端点检测：1500ms 静音强制判停（与本地能量 VAD 的 2.4s 配合，
-                // 给中文口语停顿留出余地，避免说话中途被截断）
-                end_window_size: Some(1500),
-                // 至少 1s 音频后才允许判停（避免极短音频误判）
-                force_to_speech_time: Some(1000),
+                // 服务端 VAD 判停窗口：静音超过这么久就判定用户说完了。
+                //
+                // 演变过程（每次都有真机数据支撑）：
+                //   1500ms → 太保守，实测 ASR 阶段最长耗 4.1s
+                //    400ms → 太激进，豆包返回空结果 + code=45000081「等包超时」
+                //    800ms → 可用，但用户仍反馈比小智云端慢
+                //    500ms → 当前值。对齐小智云端「说停即判」的量级。
+                //
+                // 之所以现在敢降到 500ms：ASR 任务结束处已有 last_nonempty_text 兜底 ——
+                // 即使服务端来不及发 is_final（窗口太短导致），也能用最后一次累积的
+                // 中间结果作为完整转写，不会出现「识别结果为空」。
+                //
+                // 已知取舍：用户说话中间停顿超过 500ms 会被截断。若实测出现截断，
+                // 通过配置文件覆盖：[asr.providers.doubao] end_window_size = "800"
+                end_window_size: Some(
+                    cfg.get_credential("end_window_size")
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(500),
+                ),
+                // 至少累积这么多音频后才允许判停。200ms 太激进（大约只有 3 帧），
+                // 环境噪音抖动就可能触发误判；500ms 是折中值。
+                force_to_speech_time: Some(
+                    cfg.get_credential("force_to_speech_time")
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(500),
+                ),
                 ..Default::default()
             })))
         }
     }
 }
 
+/// 会话状态保留时长。超过且没有活动 ASR 管道就回收。
+const SESSION_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// 会话状态表上限。超出时按 last_used 淘汰最旧的。
+const SESSION_STATE_MAX: usize = 64;
+
+/// 回收长期不用的会话状态。
+///
+/// 为什么需要：`sessions` 是按需创建的 HashMap，从不删除的话 ——
+/// ESP32 每次重连 WS 都会换一个 session_id，条目会随进程存活时间无限增长，
+/// 而每条里可能还挂着 AsrPipelineState（含 PCM 发送端与云端 ASR 连接）。
+/// 删掉条目即 drop 管道，对应的 ASR 后台任务会因为流端关闭而自然退出。
+///
+/// 只回收 `streaming_state` 为 None 的条目：正在录音的会话不能被误删。
+fn prune_session_states(map: &mut std::collections::HashMap<String, SessionAsrState>) {
+    let now = std::time::Instant::now();
+    map.retain(|_, state| {
+        state.streaming_state.is_some() || now.duration_since(state.last_used) < SESSION_STATE_TTL
+    });
+    if map.len() <= SESSION_STATE_MAX {
+        return;
+    }
+    // 超上限：按 last_used 从旧到新淘汰到上限。
+    let mut order: Vec<(String, std::time::Instant)> = map
+        .iter()
+        .filter(|(_, state)| state.streaming_state.is_none())
+        .map(|(key, state)| (key.clone(), state.last_used))
+        .collect();
+    order.sort_by_key(|(_, used)| *used);
+    for (key, _) in order {
+        if map.len() <= SESSION_STATE_MAX {
+            break;
+        }
+        map.remove(&key);
+    }
+}
+
 impl AsrLlmTtsStrategy {
+    /// 在某会话的状态上执行闭包；会话不存在时按需创建。
+    ///
+    /// 只持锁执行闭包、不把 MutexGuard 返回到外面，避免跨 await 持有锁。
+    fn with_session<R>(
+        &self,
+        session_key: &str,
+        f: impl FnOnce(&mut SessionAsrState) -> R,
+    ) -> Result<R, String> {
+        let mut map = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("会话状态锁获取失败: {}", e))?;
+        {
+            let state = map
+                .entry(session_key.to_string())
+                .or_insert_with(SessionAsrState::new);
+            state.last_used = std::time::Instant::now();
+        }
+        // 先插入再回收：这样表大小严格不超过上限（先回收后插入会多出 1 条）。
+        // 刚插入的这条 last_used 最新，不会被淘汰。
+        prune_session_states(&mut map);
+        let state = map.get_mut(session_key).expect("刚插入的会话状态必然还在");
+        Ok(f(state))
+    }
+
+    /// 只读访问，不创建。
+    fn read_session<R>(
+        &self,
+        session_key: &str,
+        f: impl FnOnce(Option<&SessionAsrState>) -> R,
+    ) -> Result<R, String> {
+        let map = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("会话状态锁获取失败: {}", e))?;
+        Ok(f(map.get(session_key)))
+    }
+
     /// 记录一次 xiaozhi 路径的 Agent 调用日志
     ///
     /// `llm_session_id` 从共享态读取（记录时刻已是最新会话）。
@@ -762,10 +932,11 @@ impl AsrLlmTtsStrategy {
         events: Vec<AgentLogEvent>,
     ) {
         let llm_session = self
-            .llm_session_id
-            .lock()
+            .read_session(session_id, |state| {
+                state.and_then(|state| state.llm_session_id.as_ref().map(|e| e.session_id.clone()))
+            })
             .ok()
-            .and_then(|g| g.as_ref().map(|e| e.session_id.clone()));
+            .flatten();
         crate::agent_log::record(&crate::agent_log::AgentLogRecord {
             timestamp: crate::datetime::iso_timestamp_now(),
             source: "xiaozhi".to_string(),
@@ -861,25 +1032,23 @@ impl AsrLlmTtsStrategy {
     ///
     /// 会话绑定的代数与 `generation` 不一致（Agent 已切换）时返回 `None`，
     /// 强制开启新会话，避免把旧 Agent 的 session_id 传给新 Agent。
-    fn llm_session_at(&self, generation: u64) -> Result<Option<String>, String> {
-        let guard = self
-            .llm_session_id
-            .lock()
-            .map_err(|e| format!("LLM session_id 锁获取失败: {}", e))?;
-        match &*guard {
-            Some(entry) if entry.generation == generation => Ok(Some(entry.session_id.clone())),
-            _ => Ok(None),
-        }
+    fn llm_session_at(&self, session_key: &str, generation: u64) -> Result<Option<String>, String> {
+        self.read_session(session_key, |state| {
+            match state.and_then(|state| state.llm_session_id.as_ref()) {
+                Some(entry) if entry.generation == generation => Some(entry.session_id.clone()),
+                _ => None,
+            }
+        })
     }
 
     /// 以指定 Agent 代数记录 LLM 会话（与产生该会话的 Agent 保持一致）
-    fn store_llm_session_at(&self, session_id: String, generation: u64) {
-        if let Ok(mut guard) = self.llm_session_id.lock() {
-            *guard = Some(LlmSession {
+    fn store_llm_session_at(&self, session_key: &str, session_id: String, generation: u64) {
+        let _ = self.with_session(session_key, |state| {
+            state.llm_session_id = Some(LlmSession {
                 generation,
                 session_id,
             });
-        }
+        });
     }
 
     /// * `asr_config` — ASR 配置（Arc<RwLock>，支持运行时热加载）
@@ -899,12 +1068,7 @@ impl AsrLlmTtsStrategy {
             voice_override,
             agent,
             work_dir,
-            llm_session_id: Mutex::new(None),
-            streaming_state: Mutex::new(None),
-            vad_notify: Mutex::new(Arc::new(Notify::new())),
-            no_speech_notify: Mutex::new(Arc::new(Notify::new())),
-            silence_closed: AtomicBool::new(false),
-            asr_received_text: Arc::new(AtomicBool::new(false)),
+            sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -954,12 +1118,7 @@ impl AsrLlmTtsStrategy {
             voice_override,
             agent,
             work_dir,
-            llm_session_id: Mutex::new(None),
-            streaming_state: Mutex::new(None),
-            vad_notify: Mutex::new(Arc::new(Notify::new())),
-            no_speech_notify: Mutex::new(Arc::new(Notify::new())),
-            silence_closed: AtomicBool::new(false),
-            asr_received_text: Arc::new(AtomicBool::new(false)),
+            sessions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -981,11 +1140,10 @@ impl AsrLlmTtsStrategy {
     /// 1. 关闭 mpsc Sender（通知 ASR 音频流结束）
     /// 2. 等待后台任务完成，返回完整识别文本
     /// 3. 如果任何步骤失败，记录警告并返回 `None`（便于回退到批处理 ASR）
-    async fn try_get_streaming_asr_text(&self) -> Option<String> {
-        let state = {
-            let mut guard = self.streaming_state.lock().ok()?;
-            guard.take()?
-        };
+    async fn try_get_streaming_asr_text(&self, session_key: &str) -> Option<String> {
+        let state = self
+            .with_session(session_key, |state| state.streaming_state.take())
+            .ok()??;
 
         // 关闭 Sender → Receiver 端收到 None → 流结束 → 发送末帧
         drop(state.pcm_tx);
@@ -1020,7 +1178,7 @@ impl AsrLlmTtsStrategy {
         session_id: &str,
     ) -> Result<Option<String>, String> {
         // ── 尝试流式 ASR（录音期间已完成识别） ──
-        if let Some(text) = self.try_get_streaming_asr_text().await {
+        if let Some(text) = self.try_get_streaming_asr_text(session_id).await {
             if !text.is_empty() {
                 tracing::info!(
                     session_id = %session_id,
@@ -1077,7 +1235,7 @@ impl AsrLlmTtsStrategy {
     /// 创建 mpsc channel + Doubao ASR 实例 + Opus 解码器，
     /// 后台启动 `listen_stream` 消费 PCM 流并收集识别结果。
     /// 管道状态存入 `streaming_state` 供 `on_audio_frame` 喂入音频。
-    async fn init_asr_pipeline(&self) -> Result<(), String> {
+    async fn init_asr_pipeline(&self, session_key: &str) -> Result<(), String> {
         // 从共享配置读取最新 ASR 凭证，动态创建流式 ASR 提供商实例
         let asr = {
             let cfg = self.asr_config.read().unwrap();
@@ -1088,168 +1246,202 @@ impl AsrLlmTtsStrategy {
         let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<u8>>(32);
         let audio_stream: AudioStream = Box::pin(ReceiverStream::new(pcm_rx));
 
-        let vad_notify = self
-            .vad_notify
-            .lock()
-            .ok()
-            .map(|g| g.clone())
-            .unwrap_or_else(|| Arc::new(Notify::new()));
-
-        let asr_text_received = self.asr_received_text.clone();
+        // `self` 的借用活不过 tokio::spawn，所以提前把 Arc 克隆进来。
+        let (vad_notify, asr_text_received, end_of_conv) =
+            self.with_session(session_key, |state| {
+                (
+                    state.vad_notify.clone(),
+                    state.asr_received_text.clone(),
+                    state.end_of_conversation.clone(),
+                )
+            })?;
 
         let asr_handle: tokio::task::JoinHandle<Result<String, String>> = tokio::spawn(
             async move {
-                let mut stream = asr
-                    .listen_stream(audio_stream)
-                    .await
-                    .map_err(|e| format!("流式 ASR 启动失败: {}", e))?;
+                let result: Result<String, String> = async {
+                    let mut stream = asr
+                        .listen_stream(audio_stream)
+                        .await
+                        .map_err(|e| format!("流式 ASR 启动失败: {}", e))?;
 
-                let mut full_text = String::new();
-                let mut chunk_count = 0;
-                let mut vad_triggered = false;
-                // 记录最后一个非空 ASR 文本，用于判断是否已稳定
-                let mut last_nonempty_text = String::new();
-                const TEXT_STABLE_MS: u64 = 1500;
+                    let mut full_text = String::new();
+                    let mut chunk_count = 0;
+                    let mut vad_triggered = false;
+                    // 记录最后一个非空 ASR 文本，用于判断是否已稳定
+                    let mut last_nonempty_text = String::new();
+                    const TEXT_STABLE_MS: u64 = 1500;
 
-                loop {
-                    // 如果已识别到非空文本，增加文本稳定超时检测
-                    let needs_stability_check = !last_nonempty_text.is_empty();
+                    loop {
+                        // 如果已识别到非空文本，增加文本稳定超时检测
+                        let needs_stability_check = !last_nonempty_text.is_empty();
 
-                    if needs_stability_check {
-                        let stability_delay =
-                            tokio::time::sleep(std::time::Duration::from_millis(TEXT_STABLE_MS));
-                        tokio::pin!(stability_delay);
+                        if needs_stability_check {
+                            let stability_delay =
+                                tokio::time::sleep(std::time::Duration::from_millis(TEXT_STABLE_MS));
+                            tokio::pin!(stability_delay);
 
-                        tokio::select! {
-                            chunk_opt = stream.next() => {
-                                match chunk_opt {
-                                    Some(Ok(chunk)) => {
-                                        chunk_count += 1;
+                            tokio::select! {
+                                chunk_opt = stream.next() => {
+                                    match chunk_opt {
+                                        Some(Ok(chunk)) => {
+                                            chunk_count += 1;
 
-                                        let is_vad_endpoint = chunk
-                                            .segment
-                                            .as_ref()
-                                            .and_then(|s| s.confidence)
-                                            .map(|c| c >= 0.99)
-                                            .unwrap_or(false);
+                                            let is_vad_endpoint = chunk
+                                                .segment
+                                                .as_ref()
+                                                .and_then(|s| s.confidence)
+                                                .map(|c| c >= 0.99)
+                                                .unwrap_or(false);
 
-                                        let tag = match (chunk.is_final, is_vad_endpoint) {
-                                            (true, _) => "最终",
-                                            (false, true) => "VAD",
-                                            (false, false) => "中间",
-                                        };
-                                        let display_text = if chunk.text.is_empty() {
-                                            "(空)".to_string()
-                                        } else {
-                                            chunk.text.clone()
-                                        };
+                                            let tag = match (chunk.is_final, is_vad_endpoint) {
+                                                (true, _) => "最终",
+                                                (false, true) => "VAD",
+                                                (false, false) => "中间",
+                                            };
+                                            let display_text = if chunk.text.is_empty() {
+                                                "(空)".to_string()
+                                            } else {
+                                                chunk.text.clone()
+                                            };
+                                            tracing::info!(
+                                                "🎤 [ASR {}] #{}: \"{}\"",
+                                                tag,
+                                                chunk_count,
+                                                display_text,
+                                            );
+
+                                            if is_vad_endpoint && !vad_triggered {
+                                                vad_triggered = true;
+                                                tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
+                                                vad_notify.notify_one();
+                                            }
+
+                                            if chunk.is_final && !chunk.text.is_empty() {
+                                                full_text.push_str(&chunk.text);
+                                            }
+
+                                            if !chunk.text.is_empty() {
+                                                asr_text_received.store(true, Ordering::Release);
+                                                last_nonempty_text = chunk.text.clone();
+                                            }
+                                        }
+                                        Some(Err(e)) => {
+                                            tracing::warn!("🎤 [ASR 错误] {}", e);
+                                        }
+                                        None => {
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ = &mut stability_delay => {
+                                    if !vad_triggered {
                                         tracing::info!(
-                                            "🎤 [ASR {}] #{}: \"{}\"",
-                                            tag,
-                                            chunk_count,
-                                            display_text,
+                                            "🎤 [文本稳定 VAD] 文本 \"{}\" 已稳定 {}ms，通知 ws.rs 开始处理",
+                                            last_nonempty_text,
+                                            TEXT_STABLE_MS,
                                         );
-
-                                        if is_vad_endpoint && !vad_triggered {
-                                            vad_triggered = true;
-                                            tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
-                                            vad_notify.notify_one();
-                                        }
-
-                                        if chunk.is_final && !chunk.text.is_empty() {
-                                            full_text.push_str(&chunk.text);
-                                        }
-
-                                        if !chunk.text.is_empty() {
-                                            asr_text_received.store(true, Ordering::Release);
-                                            last_nonempty_text = chunk.text.clone();
-                                        }
+                                        vad_notify.notify_one();
                                     }
-                                    Some(Err(e)) => {
-                                        tracing::warn!("🎤 [ASR 错误] {}", e);
-                                    }
-                                    None => {
-                                        break;
-                                    }
+                                    break;
                                 }
                             }
-                            _ = &mut stability_delay => {
-                                if !vad_triggered {
+                        } else {
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    chunk_count += 1;
+
+                                    let is_vad_endpoint = chunk
+                                        .segment
+                                        .as_ref()
+                                        .and_then(|s| s.confidence)
+                                        .map(|c| c >= 0.99)
+                                        .unwrap_or(false);
+
+                                    let tag = match (chunk.is_final, is_vad_endpoint) {
+                                        (true, _) => "最终",
+                                        (false, true) => "VAD",
+                                        (false, false) => "中间",
+                                    };
+                                    let display_text = if chunk.text.is_empty() {
+                                        "(空)".to_string()
+                                    } else {
+                                        chunk.text.clone()
+                                    };
                                     tracing::info!(
-                                        "🎤 [文本稳定 VAD] 文本 \"{}\" 已稳定 {}ms，通知 ws.rs 开始处理",
-                                        last_nonempty_text,
-                                        TEXT_STABLE_MS,
+                                        "🎤 [ASR {}] #{}: \"{}\"",
+                                        tag,
+                                        chunk_count,
+                                        display_text,
                                     );
-                                    vad_notify.notify_one();
+
+                                    if is_vad_endpoint && !vad_triggered {
+                                        vad_triggered = true;
+                                        tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
+                                        vad_notify.notify_one();
+                                    }
+
+                                    if chunk.is_final && !chunk.text.is_empty() {
+                                        full_text.push_str(&chunk.text);
+                                    }
+
+                                    if !chunk.text.is_empty() {
+                                        asr_text_received.store(true, Ordering::Release);
+                                        last_nonempty_text = chunk.text.clone();
+                                    }
                                 }
-                                break;
-                            }
-                        }
-                    } else {
-                        match stream.next().await {
-                            Some(Ok(chunk)) => {
-                                chunk_count += 1;
-
-                                let is_vad_endpoint = chunk
-                                    .segment
-                                    .as_ref()
-                                    .and_then(|s| s.confidence)
-                                    .map(|c| c >= 0.99)
-                                    .unwrap_or(false);
-
-                                let tag = match (chunk.is_final, is_vad_endpoint) {
-                                    (true, _) => "最终",
-                                    (false, true) => "VAD",
-                                    (false, false) => "中间",
-                                };
-                                let display_text = if chunk.text.is_empty() {
-                                    "(空)".to_string()
-                                } else {
-                                    chunk.text.clone()
-                                };
-                                tracing::info!(
-                                    "🎤 [ASR {}] #{}: \"{}\"",
-                                    tag,
-                                    chunk_count,
-                                    display_text,
-                                );
-
-                                if is_vad_endpoint && !vad_triggered {
-                                    vad_triggered = true;
-                                    tracing::info!("🎤 [VAD] 检测到语音结束，通知 ws.rs 开始处理",);
-                                    vad_notify.notify_one();
+                                Some(Err(e)) => {
+                                    tracing::warn!("🎤 [ASR 错误] {}", e);
                                 }
-
-                                if chunk.is_final && !chunk.text.is_empty() {
-                                    full_text.push_str(&chunk.text);
+                                None => {
+                                    break;
                                 }
-
-                                if !chunk.text.is_empty() {
-                                    asr_text_received.store(true, Ordering::Release);
-                                    last_nonempty_text = chunk.text.clone();
-                                }
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!("🎤 [ASR 错误] {}", e);
-                            }
-                            None => {
-                                break;
                             }
                         }
                     }
-                }
 
-                tracing::info!(
-                    "🎤 [ASR 完成] 共收到 {} 个结果块，完整文本长度: {}",
-                    chunk_count,
-                    full_text.len(),
-                );
+                    // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+                    // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+                    tracing::warn!(
+                        "🎤 [ASR 完成] 共收到 {} 个结果块，完整文本长度: {}",
+                        chunk_count,
+                        full_text.len(),
+                    );
 
-                if full_text.is_empty() {
+                    if !full_text.is_empty() {
+                        mark_end_of_conversation(&end_of_conv, &full_text);
+                        return Ok(full_text);
+                    }
+
+                    // 没有收到 is_final 块时兜底。
+                    //
+                    // 什么时候会发生：本地能量 VAD（MAX_SILENCE_FRAMES × 60ms）
+                    // 与豆包服务端 VAD（end_window_size）在赛跑。本地先触发时
+                    // 会替换 pcm_tx 关闭音频流，服务端还没到自己的判停窗口，
+                    // 于是只发中间结果、不发 is_final，`full_text` 就一直是空的。
+                    //
+                    // 为什么可以兜底：univoice 的 `chunk.text` 是【累积文本】
+                    // 而非增量（同一句会反复推送 "关掉" → "关掉书房的" →
+                    // "关掉书房的灯。"），所以最后一次非空中间结果就是完整转写。
+                    if !last_nonempty_text.is_empty() {
+                        tracing::warn!(
+                            "🎤 [ASR 兜底] 未收到 is_final 块，使用最后中间结果（{} 字）: {:?}",
+                            last_nonempty_text.chars().count(),
+                            last_nonempty_text,
+                        );
+                        mark_end_of_conversation(&end_of_conv, &last_nonempty_text);
+                        return Ok(last_nonempty_text);
+                    }
+
                     Err("ASR 识别结果为空（可能为静音或无有效语音）".to_string())
-                } else {
-                    Ok(full_text)
                 }
+                .await;
+
+                // 任务异常退出时把原因打出来：调用方从不 await 这个 handle，
+                // 不打日志的话错误（如 403、鉴权失败、网络错误）会彻底静默。
+                if let Err(err) = &result {
+                    tracing::error!("流式 ASR 任务异常退出: {}", err);
+                }
+                result
             },
         );
 
@@ -1272,13 +1464,13 @@ impl AsrLlmTtsStrategy {
             no_speech_frames: 0,
         };
 
-        let mut guard = self
-            .streaming_state
-            .lock()
-            .map_err(|e| format!("锁获取失败: {}", e))?;
-        *guard = Some(state);
+        self.with_session(session_key, |session| {
+            session.streaming_state = Some(state);
+        })?;
 
-        tracing::info!("流式 ASR: 管道已就绪（惰性初始化）");
+        // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+        // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+        tracing::warn!("流式 ASR: 管道已就绪（惰性初始化）");
 
         Ok(())
     }
@@ -1441,8 +1633,44 @@ impl AsrLlmTtsStrategy {
     }
 }
 
+/// 用户在告别吗？
+///
+/// 小智官方云端就是这么识别「再见」并结束对话的：固件只认 `goodbye`
+/// 消息，自己不会回 Idle。所以意图判断必须在服务端做。
+///
+/// 匹配策略保守一些：宁可漏判（靠 15 秒空闲收口兜底），
+/// 也不要把「再见面」这类正常句子误判成告别。
+fn mark_end_of_conversation(flag: &AtomicBool, text: &str) {
+    const FAREWELL_WORDS: &[&str] = &[
+        "再见",
+        "拜拜",
+        "不聊了",
+        "不说了",
+        "结束对话",
+        "退出对话",
+        "关闭对话",
+        "goodbye",
+        "bye bye",
+    ];
+    let lowered = text.to_lowercase();
+    if FAREWELL_WORDS.iter().any(|w| lowered.contains(w)) {
+        flag.store(true, Ordering::Release);
+        tracing::warn!(text = %text, "识别到告别语，回复播完后将结束会话");
+    }
+}
+
 #[async_trait]
 impl ResponseStrategy for AsrLlmTtsStrategy {
+    /// 一次性信号：读取即清除，避免下一轮被误收口。
+    fn end_of_conversation(&self, session_key: &str) -> bool {
+        self.read_session(session_key, |state| {
+            state
+                .map(|state| state.end_of_conversation.swap(false, Ordering::AcqRel))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+    }
+
     fn name(&self) -> &'static str {
         "asr-llm-tts"
     }
@@ -1468,25 +1696,21 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
     /// ASR 管道不会在此处创建，而是延迟到 `on_audio_frame` 收到第一帧音频时
     /// 通过 `init_asr_pipeline` 惰性初始化。这样可以避免在用户尚未说话时
     /// 建立 ASR 连接导致服务端对空音频返回误判的 VAD 端点。
-    async fn on_recording_start(&self, session_id: &str) -> Result<(), String> {
-        tracing::info!(
+    async fn on_recording_start(&self, session_key: &str, session_id: &str) -> Result<(), String> {
+        // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+        // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+        tracing::warn!(
             session_id = %session_id,
             "流式 ASR: 清空管道状态（惰性初始化）",
         );
 
-        let mut guard = self
-            .streaming_state
-            .lock()
-            .map_err(|e| format!("锁获取失败: {}", e))?;
-        *guard = None;
-        // 创建全新 Notify 清除上一轮残留的通知信号
-        if let Ok(mut ng) = self.vad_notify.lock() {
-            *ng = Arc::new(Notify::new());
-        }
-        if let Ok(mut ng) = self.no_speech_notify.lock() {
-            *ng = Arc::new(Notify::new());
-        }
-        self.silence_closed.store(false, Ordering::Release);
+        self.with_session(session_key, |state| {
+            state.streaming_state = None;
+            // 创建全新 Notify 清除上一轮残留的通知信号
+            state.vad_notify = Arc::new(Notify::new());
+            state.no_speech_notify = Arc::new(Notify::new());
+            state.silence_closed = false;
+        })?;
 
         Ok(())
     }
@@ -1495,47 +1719,35 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
     ///
     /// 如果 ASR 管道尚未初始化（惰性），第一帧音频到达时会自动创建。
     /// 这样确保 ASR WebSocket 连接只在用户真正说话时建立。
-    async fn on_audio_frame(&self, frame: &AudioFrame) -> Result<(), String> {
+    async fn on_audio_frame(&self, session_key: &str, frame: &AudioFrame) -> Result<(), String> {
         if frame.data.is_empty() {
             return Ok(());
         }
 
         // 如果本地能量检测已关闭管道，跳过后续帧（不重新初始化）
-        if self.silence_closed.load(Ordering::Acquire) {
+        if self.read_session(session_key, |state| {
+            state.map(|state| state.silence_closed).unwrap_or(false)
+        })? {
             return Ok(());
         }
 
         // 惰性初始化：第一帧音频到达时才创建 ASR 管道
-        let needs_init = self
-            .streaming_state
-            .lock()
-            .map_err(|e| format!("锁获取失败: {}", e))?
-            .is_none();
+        let needs_init = self.with_session(session_key, |state| state.streaming_state.is_none())?;
         if needs_init {
-            tracing::info!("流式 ASR: 第一帧音频到达，惰性初始化管道");
-            self.init_asr_pipeline().await?;
+            // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+            // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+            tracing::warn!("流式 ASR: 第一帧音频到达，惰性初始化管道");
+            self.init_asr_pipeline(session_key).await?;
         }
 
         // ── Phase 1: 解码 + PCM 能量检测（锁内） ──
-        let (pcm_bytes, pcm_tx) = {
-            let mut guard = self
+        let pcm = self.with_session(session_key, |session| {
+            let state = session
                 .streaming_state
-                .lock()
-                .map_err(|e| format!("锁获取失败: {}", e))?;
-            let state = guard
                 .as_mut()
                 .ok_or_else(|| "流式 ASR 未启动".to_string())?;
 
             state.frame_count += 1;
-            // 每 50 帧（~3s）打印一次接收诊断日志
-            if state.frame_count - state.last_log_frame >= 50 {
-                state.last_log_frame = state.frame_count;
-                tracing::info!(
-                    "流式 ASR: 已接收 {} 帧 ({:.0}s 音频)",
-                    state.frame_count,
-                    state.frame_count as f64 * 60.0 / 1000.0,
-                );
-            }
 
             let mut pcm_buf = vec![0i16; state.frame_samples];
             let decoded_samples = state
@@ -1551,6 +1763,26 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
             // ── 本地 PCM 能量检测 ──
             let rms = compute_pcm_rms(&pcm_bytes);
+
+            // 临时诊断（找到合适阈值后可删除）：
+            // 用 warn 级绕开 info 被过滤的问题，每 50 帧（约 3 秒）打印一次实测能量，
+            // 用于判断 SILENCE_RMS_THRESHOLD 对当前麦克风是否过高。
+            if state.frame_count - state.last_log_frame >= 50 {
+                state.last_log_frame = state.frame_count;
+                let (dc_mean, _) = compute_pcm_stats(&pcm_bytes);
+                tracing::warn!(
+                    "ASR 诊断: 第 {} 帧, RMS={:.0}, 直流={:.0}, 阈值={:.0}, speech_detected={}, 已识别文字={}, 静音帧计数={}, 无语音帧={}",
+                    state.frame_count,
+                    rms,
+                    dc_mean,
+                    SILENCE_RMS_THRESHOLD,
+                    state.speech_detected,
+                    session.asr_received_text.load(Ordering::Acquire),
+                    state.silence_count,
+                    state.no_speech_frames,
+                );
+            }
+
             if rms >= SILENCE_RMS_THRESHOLD {
                 state.speech_detected = true;
                 state.silence_count = 0;
@@ -1573,42 +1805,56 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 // 关闭 ASR 流：替换 sender，令 ASR 后台任务感知流结束
                 let (new_tx, _) = mpsc::channel::<Vec<u8>>(1);
                 let _ = std::mem::replace(&mut state.pcm_tx, new_tx);
-                tracing::info!(
+                // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+                // 这行是判断 ASR 链路是否正常工作的关键证据，必须可见。
+                tracing::warn!(
                     "无语音超时: 录音开始后 {} 帧 ({}ms) 无有效语音，触发告别并关闭连接",
                     state.no_speech_frames,
                     state.no_speech_frames * 60,
                 );
-                self.silence_closed.store(true, Ordering::Release);
-                if let Ok(guard) = self.no_speech_notify.lock() {
-                    guard.notify_one();
-                }
+                session.silence_closed = true;
+                session.no_speech_notify.notify_one();
                 // 不发送此静音帧
-                return Ok(());
+                return Ok::<_, String>(None);
             }
 
             if state.silence_count >= MAX_SILENCE_FRAMES
-                && self.asr_received_text.load(Ordering::Acquire)
+                && session.asr_received_text.load(Ordering::Acquire)
             {
-                // 静音超阈值且 ASR 已经识别到过有效文本：关闭 ASR 流
-                // 如果 ASR 还未返回任何非空文本（用户还没说话），则不触发本地 VAD，
-                // 让系统继续等待（30s 安全超时兜底），避免用户正在思考时被提前中断
-                let (new_tx, _) = mpsc::channel::<Vec<u8>>(1);
-                let _ = std::mem::replace(&mut state.pcm_tx, new_tx);
-                tracing::info!(
-                    "本地能量 VAD: 检测到 {} 帧连续静音 ({:.0}s)，关闭 ASR 流",
-                    state.silence_count,
-                    state.silence_count as f64 * 60.0 / 1000.0,
-                );
-                self.silence_closed.store(true, Ordering::Release);
-                if let Ok(guard) = self.vad_notify.lock() {
-                    guard.notify_one();
+                // 只记录，不关流、不通知。
+                //
+                // 历史：这里原本会「关闭 ASR 流 + 立刻 vad_notify」，是个有两个
+                // 副作用的设计，实测同时造成两个症状：
+                //   ① 话没说完就开始返回 —— 900ms 静音就判停，比火山自己的
+                //      end_window_size(500ms) 之后还有文本稳定(1500ms) 都早，
+                //      等于我们自己抢了判停权
+                //   ② 识别率下降 —— 关流后 pcm_tx 被替换，后半句再也送不进 ASR，
+                //      只能靠 last_nonempty_text 兜底，必然丢字
+                //
+                // 现在的判停权威：
+                //   · 正常情况：火山的 is_vad_endpoint（服务端 definite，唯一权威）
+                //   · 火山始终不回 definite：上面的 TEXT_STABLE_MS 文本稳定兜底
+                //   · 用户一直没说话：no_speech_notify 的无语音超时
+                //   · 极端兜底：传输层的 RECORDING_LIMIT
+                //
+                // 任务不会因此泄漏：文本稳定分支会 break，且下次录音时
+                // init_asr_pipeline 会替换 streaming_state，旧任务随之退出。
+                // 只在刚跨过阈值那一帧打一次。否则每 60ms 一行，
+                // 一次说话停顿就能刷出几十行日志。
+                if state.silence_count == MAX_SILENCE_FRAMES {
+                    tracing::warn!(
+                        "本地能量 VAD: 连续 {} 帧静音 ({:.1}s)，仅记录（不再关流/判停）",
+                        state.silence_count,
+                        state.silence_count as f64 * 60.0 / 1000.0,
+                    );
                 }
-                // 不发送此帧（静音帧无意义）
-                return Ok(());
             }
 
-            (pcm_bytes, state.pcm_tx.clone())
-        }; // MutexGuard 在此处释放
+            Ok(Some((pcm_bytes, state.pcm_tx.clone())))
+        })??; // MutexGuard 在此处释放
+        let Some((pcm_bytes, pcm_tx)) = pcm else {
+            return Ok(());
+        };
 
         // ── Phase 2: 发送 PCM 到 ASR（锁外） ──
         pcm_tx
@@ -1627,14 +1873,16 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
 
     // ────────── VAD 端点检测 ──────────
 
-    fn vad_completion(&self) -> Option<Arc<Notify>> {
-        self.vad_notify.lock().ok().map(|g| g.clone())
+    fn vad_completion(&self, session_key: &str) -> Option<Arc<Notify>> {
+        self.with_session(session_key, |state| state.vad_notify.clone())
+            .ok()
     }
 
     // ────────── 无语音超时 ──────────
 
-    fn no_speech_completion(&self) -> Option<Arc<Notify>> {
-        self.no_speech_notify.lock().ok().map(|g| g.clone())
+    fn no_speech_completion(&self, session_key: &str) -> Option<Arc<Notify>> {
+        self.with_session(session_key, |state| state.no_speech_notify.clone())
+            .ok()
     }
 
     /// 无语音超时后的告别音频（如「拜拜」）：读配置文案，合成后返回帧
@@ -1749,23 +1997,51 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 // 快照一次当前 Agent（含代数），整段话语用同一个 agent/gen，
                 // 会话在换代后自动作废（避免把旧 Agent 的 session_id 传给新 Agent）
                 let agent_snap = crate::gateway::agent_handle::snapshot(&self.agent);
-                let current_llm_session = self.llm_session_at(agent_snap.generation)?;
+                let current_llm_session = self.llm_session_at(session_id, agent_snap.generation)?;
 
                 agent_mode = true;
                 agent_start = std::time::Instant::now();
-                let (text_stream_inner, new_llm_session_id, events_rx) = match agent_snap
-                    .agent
-                    .process_stream(&user_text, current_llm_session.as_deref(), &self.work_dir)
-                    .await
+                let (text_stream_inner, new_llm_session_id, events_rx) = match tokio::time::timeout(
+                    AGENT_CONNECT_TIMEOUT,
+                    agent_snap.agent.process_stream(
+                        &user_text,
+                        current_llm_session.as_deref(),
+                        &self.work_dir,
+                    ),
+                )
+                .await
                 {
-                    Ok(ok) => ok,
-                    Err(e) => {
+                    Ok(Ok(ok)) => ok,
+                    Ok(Err(e)) => {
                         let msg = format!("AI Agent 流式处理失败: {}", e);
                         self.record_agent_log(
                             &user_text,
                             session_id,
                             None,
                             "error",
+                            Some(&msg),
+                            agent_start.elapsed(),
+                            Vec::new(),
+                        );
+                        return Err(msg);
+                    }
+                    Err(_elapsed) => {
+                        // 上游卡死。打一条固定措辞的 warn，方便用 grep 统计发生频率：
+                        //   docker logs haimen-test | grep -c "Agent 首字节超时"
+                        let msg = format!(
+                            "AI Agent 建立流式连接超时（{}秒）",
+                            AGENT_CONNECT_TIMEOUT.as_secs()
+                        );
+                        tracing::warn!(
+                            session_id = %session_id,
+                            timeout_secs = AGENT_CONNECT_TIMEOUT.as_secs(),
+                            "Agent 首字节超时：上游 LLM 未在限期内返回响应头，放弃本轮"
+                        );
+                        self.record_agent_log(
+                            &user_text,
+                            session_id,
+                            None,
+                            "timeout",
                             Some(&msg),
                             agent_start.elapsed(),
                             Vec::new(),
@@ -1790,7 +2066,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 });
 
                 // 立即更新 LLM 会话 ID（绑定当前 Agent 代数，用于多轮对话）
-                self.store_llm_session_at(new_llm_session_id, agent_snap.generation);
+                self.store_llm_session_at(session_id, new_llm_session_id, agent_snap.generation);
 
                 tracing::info!(
                     session_id = %session_id,
@@ -2327,7 +2603,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             // 快照一次当前 Agent（含代数），整次处理用同一个 agent/gen，
             // 会话在换代后自动作废（避免把旧 Agent 的 session_id 传给新 Agent）
             let agent_snap = crate::gateway::agent_handle::snapshot(&self.agent);
-            let current_llm_session = self.llm_session_at(agent_snap.generation)?;
+            let current_llm_session = self.llm_session_at(session_id, agent_snap.generation)?;
 
             let start = std::time::Instant::now();
             let llm_response = tokio::time::timeout(
@@ -2384,7 +2660,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             }
 
             // 更新 LLM 会话 ID（绑定当前 Agent 代数，用于多轮对话）
-            self.store_llm_session_at(new_llm_session_id, agent_snap.generation);
+            self.store_llm_session_at(session_id, new_llm_session_id, agent_snap.generation);
 
             self.record_agent_log(
                 &user_text,
@@ -2837,7 +3113,18 @@ fn save_tts_audio_as_wav(pcm: &[u8], session_id: &str) {
         .unwrap_or_default()
         .as_micros();
 
-    let filename = format!("tts-{}-{}.wav", session_id, timestamp);
+    // 纵深防御：即使上游漏了校验，也不让 session_id 里的路径分隔符生效。
+    let safe_session: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let filename = format!("tts-{}-{}.wav", safe_session, timestamp);
     let path = dir.join(&filename);
 
     const SAMPLE_RATE: u32 = 24000;
@@ -3400,6 +3687,88 @@ mod tests {
         )
     }
 
+    /// 长期不用的会话状态必须被回收，否则 WS 每次重连换 session_id
+    /// 都会在 sessions 里留下一条（可能还挂着 ASR 管道）。
+    #[test]
+    fn idle_session_state_is_pruned() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy.with_session("old", |_s| {}).expect("创建 old");
+        {
+            let mut map = strategy.sessions.lock().expect("锁");
+            let state = map.get_mut("old").expect("old 应存在");
+            state.last_used =
+                std::time::Instant::now() - SESSION_STATE_TTL - std::time::Duration::from_secs(1);
+        }
+        strategy.with_session("fresh", |_s| {}).expect("创建 fresh");
+        let map = strategy.sessions.lock().expect("锁");
+        assert!(!map.contains_key("old"), "过期会话应被回收");
+        assert!(map.contains_key("fresh"), "新会话应保留");
+    }
+
+    /// 会话状态表有上限，避免异常客户端把内存撑爆。
+    #[test]
+    fn session_state_map_is_bounded() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        for i in 0..(SESSION_STATE_MAX + 20) {
+            strategy
+                .with_session(&format!("dev-{i}"), |_s| {})
+                .expect("创建");
+        }
+        let len = strategy.sessions.lock().expect("锁").len();
+        assert!(
+            len <= SESSION_STATE_MAX,
+            "会话状态表不应超过 {SESSION_STATE_MAX}，实际 {len}"
+        );
+    }
+
+    /// 会话级状态必须按 session_key 隔离。
+    ///
+    /// 这是多设备的基础：A 设备的静音标记 / 告别标记不能影响 B。
+    /// 改这段之前它们是 self 级字段，两个设备同时说话会互相覆盖。
+    #[test]
+    fn session_state_is_isolated_per_key() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+
+        // A：置静音关闭 + 告别标记
+        strategy
+            .with_session("dev-a", |state| {
+                state.silence_closed = true;
+                state
+                    .end_of_conversation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            })
+            .expect("写 A 状态");
+        // B：只触发创建，保持默认
+        strategy
+            .with_session("dev-b", |_state| {})
+            .expect("写 B 状态");
+
+        let a_silent = strategy
+            .read_session("dev-a", |state| state.map(|s| s.silence_closed))
+            .expect("读 A")
+            .expect("A 应存在");
+        let b_silent = strategy
+            .read_session("dev-b", |state| state.map(|s| s.silence_closed))
+            .expect("读 B")
+            .expect("B 应存在");
+        assert!(a_silent, "A 的静音标记应为 true");
+        assert!(!b_silent, "B 不应受 A 影响");
+
+        // 告别标记按 key 独立，且读一次就清
+        assert!(strategy.end_of_conversation("dev-a"), "A 应读到告别标记");
+        assert!(
+            !strategy.end_of_conversation("dev-a"),
+            "告别标记是一次性信号，读一次就应清除"
+        );
+        assert!(!strategy.end_of_conversation("dev-b"), "B 不应有告别标记");
+
+        // 未创建的 key 读出来是 None，不会误报
+        let unknown = strategy
+            .read_session("dev-never-seen", |state| state.is_some())
+            .expect("读未知 key");
+        assert!(!unknown, "未知会话不应被 read_session 创建");
+    }
+
     // ─── Opus 编解码往返测试 ───────────────────────────
 
     #[test]
@@ -3542,15 +3911,16 @@ mod tests {
     #[test]
     fn test_t17_llm_session_id_initial_none() {
         let strategy = make_strategy(Arc::new(MockAgent));
-        let session = strategy.llm_session_id.lock().unwrap();
+        let session = strategy.llm_session_at("test", 0).unwrap();
         assert!(session.is_none(), "初始 LLM session_id 应为 None");
     }
 
     #[test]
     fn test_t18_llm_session_id_update() {
         let strategy = make_strategy(Arc::new(MockAgent));
-        strategy.store_llm_session_at("test-session-123".to_string(), 0);
-        let session = strategy.llm_session_id.lock().unwrap();
+        strategy.store_llm_session_at("test", "test-session-123".to_string(), 0);
+        let sessions = strategy.sessions.lock().unwrap();
+        let session = &sessions.get("test").unwrap().llm_session_id;
         assert_eq!(
             session.as_ref().map(|e| e.session_id.as_str()),
             Some("test-session-123"),
@@ -3562,17 +3932,17 @@ mod tests {
     fn test_t18b_llm_session_invalidated_on_agent_switch() {
         let strategy = make_strategy(Arc::new(MockAgent));
         // 记录 gen0 的会话
-        strategy.store_llm_session_at("old-session".to_string(), 0);
+        strategy.store_llm_session_at("test", "old-session".to_string(), 0);
         // 同代数可复用
         assert_eq!(
-            strategy.llm_session_at(0).unwrap().as_deref(),
+            strategy.llm_session_at("test", 0).unwrap().as_deref(),
             Some("old-session"),
             "同代数应复用旧会话"
         );
         // 切换 Agent（换代 gen0 → gen1），旧会话作废
         strategy.agent.write().unwrap().swap(Arc::new(MockAgent));
         assert_eq!(
-            strategy.llm_session_at(1).unwrap(),
+            strategy.llm_session_at("test", 1).unwrap(),
             None,
             "Agent 换代后旧会话应作废，避免传给新 Agent"
         );
@@ -3654,14 +4024,15 @@ mod tests {
     #[test]
     fn test_t26_streaming_state_initial_none() {
         let strategy = make_strategy(Arc::new(MockAgent));
-        let guard = strategy.streaming_state.lock().unwrap();
+        let sessions = strategy.sessions.lock().unwrap();
+        let guard = sessions.get("test").map(|state| &state.streaming_state);
         assert!(guard.is_none(), "初始 streaming_state 应为 None");
     }
 
     #[tokio::test]
     async fn test_t27_try_get_streaming_asr_text_when_idle() {
         let strategy = make_strategy(Arc::new(MockAgent));
-        let result = strategy.try_get_streaming_asr_text().await;
+        let result = strategy.try_get_streaming_asr_text("test").await;
         assert!(result.is_none(), "未启动流式 ASR 时应返回 None");
     }
 
@@ -3684,7 +4055,8 @@ mod tests {
             Some("test-resource")
         );
         // streaming_state 不应受 with_resource_id 影响
-        let guard = strategy.streaming_state.lock().unwrap();
+        let sessions = strategy.sessions.lock().unwrap();
+        let guard = sessions.get("test").map(|state| &state.streaming_state);
         assert!(guard.is_none());
     }
 
@@ -4312,7 +4684,9 @@ mod tests {
             speech_detected: false,
             no_speech_frames: 0,
         };
-        *strategy.streaming_state.lock().unwrap() = Some(state);
+        strategy
+            .with_session("test", |session| session.streaming_state = Some(state))
+            .unwrap();
         strategy
     }
 
@@ -4348,16 +4722,22 @@ mod tests {
         let strategy = make_strategy_with_pipeline(300);
         for _ in 0..5 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }
         assert!(
-            strategy.silence_closed.load(Ordering::Acquire),
+            strategy
+                .sessions
+                .lock()
+                .unwrap()
+                .get("test")
+                .unwrap()
+                .silence_closed,
             "初始静音达到阈值后应触发无语音超时并关闭管道"
         );
         let notify = strategy
-            .no_speech_completion()
+            .no_speech_completion("test")
             .expect("应暴露无语音超时 Notify");
         let fired = tokio::time::timeout(std::time::Duration::from_millis(1000), notify.notified())
             .await
@@ -4370,16 +4750,22 @@ mod tests {
         let strategy = make_strategy_with_pipeline(300); // 5 帧
         for _ in 0..4 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }
         assert!(
-            !strategy.silence_closed.load(Ordering::Acquire),
+            !strategy
+                .sessions
+                .lock()
+                .unwrap()
+                .get("test")
+                .unwrap()
+                .silence_closed,
             "未达到阈值时不应触发无语音超时"
         );
         let notify = strategy
-            .no_speech_completion()
+            .no_speech_completion("test")
             .expect("应暴露无语音超时 Notify");
         let fired = tokio::time::timeout(std::time::Duration::from_millis(200), notify.notified())
             .await
@@ -4393,27 +4779,33 @@ mod tests {
         // 4 帧静音 + 1 帧响亮（检测到语音，无语音超时作废）
         for _ in 0..4 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }
         strategy
-            .on_audio_frame(&loud_frame())
+            .on_audio_frame("test", &loud_frame())
             .await
             .expect("喂帧应成功");
         // 之后大量静音帧：speech_detected=true，走 VAD 路径但 asr_received_text=false 不触发
         for _ in 0..40 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }
         assert!(
-            !strategy.silence_closed.load(Ordering::Acquire),
+            !strategy
+                .sessions
+                .lock()
+                .unwrap()
+                .get("test")
+                .unwrap()
+                .silence_closed,
             "检测到语音后无语音超时应作废（交给 VAD 流程）"
         );
         let notify = strategy
-            .no_speech_completion()
+            .no_speech_completion("test")
             .expect("应暴露无语音超时 Notify");
         let fired = tokio::time::timeout(std::time::Duration::from_millis(200), notify.notified())
             .await
@@ -4426,12 +4818,18 @@ mod tests {
         let strategy = make_strategy_with_pipeline(0); // 0 = 禁用
         for _ in 0..30 {
             strategy
-                .on_audio_frame(&silence_frame())
+                .on_audio_frame("test", &silence_frame())
                 .await
                 .expect("喂帧应成功");
         }
         assert!(
-            !strategy.silence_closed.load(Ordering::Acquire),
+            !strategy
+                .sessions
+                .lock()
+                .unwrap()
+                .get("test")
+                .unwrap()
+                .silence_closed,
             "timeout=0 应禁用无语音超时"
         );
     }

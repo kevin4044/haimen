@@ -86,15 +86,19 @@ case "$cmd" in
 
     clippy)
         require_docker
-        # 与上游 .github/workflows/ci.yml 保持一致（不加 --all-targets）
-        in_dev cargo clippy -- -D warnings "$@"
+        # workspace 级：覆盖 crates/ 下全部成员 crate 的 lib/bin
+        # （不加 --all-targets：test target 下存在既有的 cfg(test) 代码告警）
+        in_dev cargo clippy --workspace -- -D warnings "$@"
         fix_owner
         ;;
 
     test)
         require_docker
-        # 与上游 CI 一致：单线程，避免环境变量竞争
-        in_dev cargo test -- --test-threads=1 "$@"
+        # 单线程，避免环境变量竞争。
+        # 必须加 --workspace：之前只跑根 crate，导致 crates/ 下的测试
+        # （如 haimen-xiaozhi 的 protocol_udp / mqtt_broker）在 CI 里从未执行。
+        # 已确认全 workspace 测试可通过（585 passed / 0 failed）。
+        in_dev cargo test --workspace -- --test-threads=1 "$@"
         fix_owner
         ;;
 
@@ -103,9 +107,11 @@ case "$cmd" in
         echo "▶ fmt"
         in_dev cargo fmt --all -- --check
         echo "▶ clippy"
-        in_dev cargo clippy -- -D warnings
+        in_dev cargo clippy --workspace -- -D warnings
         echo "▶ test"
-        in_dev cargo test -- --test-threads=1
+        # 必须和 test 目标一致加 --workspace：否则 crates/ 下的测试
+        # （haimen-xiaozhi / haimen-openai 等）根本不跑，verify 却报"全部通过"。
+        in_dev cargo test --workspace -- --test-threads=1
         fix_owner
         echo "✅ 全部通过"
         ;;

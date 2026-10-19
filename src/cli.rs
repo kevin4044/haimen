@@ -485,16 +485,55 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 port,
                 auto_open: !no_browser,
             };
-            crate::web::start(
+
+            // ★ MQTT 模式下启动 MQTT+UDP 传输层（内置 broker + UDP 音频）。
+            // 必须在 web::start 之前完成：设备从 OTA 拿到 broker 地址后会立刻连接。
+            // 注意用 warn 级日志 —— 本项目的 INFO 会被日志过滤吞掉。
+            let mut xiaozhi_mqtt_transport = None;
+            if settings.xiaozhi.protocol == haimen_xiaozhi::XiaozhiProtocol::Mqtt {
+                let mqtt_cfg = crate::gateway::build_mqtt_udp_config(&settings.xiaozhi);
+                match haimen_xiaozhi::MqttUdpTransport::start(mqtt_cfg, xiaozhi_strategy.clone())
+                    .await
+                {
+                    Ok(t) => {
+                        tracing::warn!(
+                            broker = %t.broker_addr(),
+                            udp = %t.udp_addr(),
+                            "小智 MQTT+UDP 传输层已启动（protocol=mqtt）"
+                        );
+                        xiaozhi_mqtt_transport = Some(t);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "小智 MQTT+UDP 传输层启动失败 —— protocol=mqtt 时设备将无法连接"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    protocol = ?settings.xiaozhi.protocol,
+                    "小智传输协议（websocket 模式，不下发 mqtt 段）"
+                );
+            }
+
+            let result = crate::web::start(
                 serve_config,
                 webhook_state,
                 Some(xiaozhi_strategy),
+                settings.xiaozhi.clone(),
                 shared_asr_config,
                 shared_tts_config,
                 serve_agent,
                 CancellationToken::new(),
             )
-            .await
+            .await;
+
+            if let Some(t) = xiaozhi_mqtt_transport.take() {
+                t.shutdown().await;
+                tracing::warn!("小智 MQTT+UDP 传输层已关闭");
+            }
+            result
         }
         Some(Commands::Completion { shell }) => {
             cmd_completion(shell, &mut std::io::stdout());
