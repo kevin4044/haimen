@@ -52,6 +52,12 @@ pub struct MqttBrokerConfig {
     /// 不设的话，局域网内任何人都能发 `haimen/ctl/<client_id>` 注入任意播报，
     /// 也能用真设备的 client_id 把它顶掉。
     pub auth_key: Option<String>,
+    /// 迁移期兼容的旧密码。`None` = 严格模式。
+    ///
+    /// 为什么需要：设备只在**开机**时拉 OTA 拿新密码，MQTT 连不上也不会去重拉。
+    /// 直接开启鉴权会让在线设备立刻被拒，只能靠人手断电恢复。
+    /// 开启鉴权时先填上旧密码跑一阵，等所有设备都重启过再清空这个字段。
+    pub legacy_password: Option<String>,
 }
 
 impl Default for MqttBrokerConfig {
@@ -60,6 +66,7 @@ impl Default for MqttBrokerConfig {
             bind_addr: "0.0.0.0:1883".to_owned(),
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
             auth_key: None,
+            legacy_password: None,
         }
     }
 }
@@ -101,6 +108,7 @@ struct BrokerShared {
     max_packet_size: usize,
     conn_ids: AtomicU64,
     auth_key: Option<String>,
+    legacy_password: Option<String>,
 }
 
 struct ConnEntry {
@@ -164,6 +172,7 @@ impl MqttBrokerHandle {
             max_packet_size: cfg.max_packet_size,
             conn_ids: AtomicU64::new(1),
             auth_key: cfg.auth_key.clone(),
+            legacy_password: cfg.legacy_password.clone(),
         });
         let accept_shared = Arc::clone(&shared);
         tokio::spawn(async move {
@@ -287,12 +296,25 @@ async fn handle_connection(
             .unwrap_or_default();
         let expected = derive_mqtt_password(auth_key, &connect.client_id);
         // 常量时间比较：长度先对齐再逐字节异或，避免按字节提前返回。
-        let ok = supplied.len() == expected.len()
-            && supplied
-                .bytes()
-                .zip(expected.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0;
+        let matches = |candidate: &str| {
+            supplied.len() == candidate.len()
+                && supplied
+                    .bytes()
+                    .zip(candidate.bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0
+        };
+        let legacy_ok = shared
+            .legacy_password
+            .as_deref()
+            .is_some_and(|legacy| !legacy.is_empty() && matches(legacy));
+        let ok = matches(&expected) || legacy_ok;
+        if ok && legacy_ok {
+            tracing::warn!(
+              client_id = %connect.client_id,
+              "MQTT 用了迁移期旧密码连接，设备重启后会自动切到派生密码"
+            );
+        }
         if !ok {
             tracing::warn!(
               client_id = %connect.client_id,
@@ -943,6 +965,21 @@ mod tests {
             bind_addr: "127.0.0.1:0".to_owned(),
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
             auth_key,
+            legacy_password: None,
+        })
+        .await
+        .expect("启动 broker")
+    }
+
+    async fn start_broker_with_auth_and_legacy(
+        auth_key: String,
+        legacy_password: String,
+    ) -> MqttBrokerHandle {
+        MqttBrokerHandle::start(MqttBrokerConfig {
+            bind_addr: "127.0.0.1:0".to_owned(),
+            max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            auth_key: Some(auth_key),
+            legacy_password: Some(legacy_password),
         })
         .await
         .expect("启动 broker")
@@ -1129,6 +1166,30 @@ mod tests {
         stream.write_all(&packet).await.expect("写 CONNECT");
         let connack = read_frame(&mut stream).await;
         assert_eq!(connack.body, vec![0x00, 0x00], "应返回 0x00 接受");
+        wait_for_client(&handle, "dev-1", true).await;
+    }
+
+    /// 迁移期：开启了鉴权但 auth_grace 生效时，旧密码仍能连上。
+    ///
+    /// 这条保证「开启鉴权」不会让在线设备立刻失联 —— 设备只在开机时拉 OTA，
+    /// 必须先让它用旧密码连上、重启后再切到派生密码。
+    #[tokio::test]
+    async fn auth_grace_accepts_legacy_password() {
+        let handle = start_broker_with_auth_and_legacy("k".to_string(), "haimen".to_string()).await;
+        let mut stream = TcpStream::connect(handle.local_addr())
+            .await
+            .expect("连接 broker");
+        let body = connect_body(
+            "dev-1".as_bytes(),
+            60,
+            true,
+            Some(b"haimen"),
+            Some(b"haimen"),
+        );
+        let packet = finish_packet(0x10, &body);
+        stream.write_all(&packet).await.expect("写 CONNECT");
+        let connack = read_frame(&mut stream).await;
+        assert_eq!(connack.body, vec![0x00, 0x00], "迁移期应接受旧密码");
         wait_for_client(&handle, "dev-1", true).await;
     }
 

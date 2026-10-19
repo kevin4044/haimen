@@ -265,6 +265,12 @@ pub struct XiaozhiMqttConfig {
     /// `haimen-admin`。不设的话局域网内任何人都能注入播报或顶掉设备。
     #[serde(default)]
     pub auth_key: String,
+    /// 迁移期是否继续接受配置里的静态 `password`。
+    ///
+    /// 设备只在开机时拉 OTA，直接开鉴权会让在线设备失联。
+    /// 开启鉴权的步骤：auth_key + auth_grace=true → 重启设备 → auth_grace=false。
+    #[serde(default)]
+    pub auth_grace: bool,
     #[serde(default = "default_keepalive")]
     pub keepalive: u32,
     #[serde(default = "default_publish_topic")]
@@ -292,6 +298,7 @@ impl Default for XiaozhiMqttConfig {
             username: String::new(),
             password: String::new(),
             auth_key: String::new(),
+            auth_grace: false,
             keepalive: default_keepalive(),
             publish_topic_template: default_publish_topic(),
             downlink_topic_template: default_downlink_topic(),

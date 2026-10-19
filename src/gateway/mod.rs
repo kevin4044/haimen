@@ -506,6 +506,9 @@ pub(crate) fn build_mqtt_udp_config(
             max_packet_size: 256 * 1024,
             // 空 auth_key = 不校验（向后兼容）
             auth_key: (!x.mqtt.auth_key.is_empty()).then(|| x.mqtt.auth_key.clone()),
+            // 迁移期：auth_grace=true 时继续接受配置里的静态密码
+            legacy_password: (x.mqtt.auth_grace && !x.mqtt.auth_key.is_empty())
+                .then(|| x.mqtt.password.clone()),
         },
         udp: haimen_xiaozhi::udp_audio::UdpAudioConfig {
             bind_addr: x.udp.bind_addr.clone(),

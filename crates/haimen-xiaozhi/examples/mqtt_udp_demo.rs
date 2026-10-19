@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind_addr: broker_bind.clone(),
             max_packet_size: 256 * 1024,
             auth_key: None,
+            legacy_password: None,
         },
         udp: UdpAudioConfig {
             bind_addr: udp_bind.clone(),
