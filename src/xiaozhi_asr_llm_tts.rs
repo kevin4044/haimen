@@ -1742,22 +1742,29 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             if state.silence_count >= MAX_SILENCE_FRAMES
                 && self.asr_received_text.load(Ordering::Acquire)
             {
-                // 静音超阈值且 ASR 已经识别到过有效文本：关闭 ASR 流
-                // 如果 ASR 还未返回任何非空文本（用户还没说话），则不触发本地 VAD，
-                // 让系统继续等待（30s 安全超时兜底），避免用户正在思考时被提前中断
-                let (new_tx, _) = mpsc::channel::<Vec<u8>>(1);
-                let _ = std::mem::replace(&mut state.pcm_tx, new_tx);
-                tracing::info!(
-                    "本地能量 VAD: 检测到 {} 帧连续静音 ({:.0}s)，关闭 ASR 流",
+                // 只记录，不关流、不通知。
+                //
+                // 历史：这里原本会「关闭 ASR 流 + 立刻 vad_notify」，是个有两个
+                // 副作用的设计，实测同时造成两个症状：
+                //   ① 话没说完就开始返回 —— 900ms 静音就判停，比火山自己的
+                //      end_window_size(500ms) 之后还有文本稳定(1500ms) 都早，
+                //      等于我们自己抢了判停权
+                //   ② 识别率下降 —— 关流后 pcm_tx 被替换，后半句再也送不进 ASR，
+                //      只能靠 last_nonempty_text 兜底，必然丢字
+                //
+                // 现在的判停权威：
+                //   · 正常情况：火山的 is_vad_endpoint（服务端 definite，唯一权威）
+                //   · 火山始终不回 definite：上面的 TEXT_STABLE_MS 文本稳定兜底
+                //   · 用户一直没说话：no_speech_notify 的无语音超时
+                //   · 极端兜底：传输层的 RECORDING_LIMIT
+                //
+                // 任务不会因此泄漏：文本稳定分支会 break，且下次录音时
+                // init_asr_pipeline 会替换 streaming_state，旧任务随之退出。
+                tracing::warn!(
+                    "本地能量 VAD: 连续 {} 帧静音 ({:.1}s)，仅记录（不再关流/判停）",
                     state.silence_count,
                     state.silence_count as f64 * 60.0 / 1000.0,
                 );
-                self.silence_closed.store(true, Ordering::Release);
-                if let Ok(guard) = self.vad_notify.lock() {
-                    guard.notify_one();
-                }
-                // 不发送此帧（静音帧无意义）
-                return Ok(());
             }
 
             (pcm_bytes, state.pcm_tx.clone())
