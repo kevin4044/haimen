@@ -497,11 +497,9 @@ struct AsrPipelineState {
     frame_samples: usize,
     /// 诊断：已接收并处理的音频帧数（每帧 60ms）
     frame_count: u64,
-    /// 诊断：上一次打印帧计数日志的帧号
-    last_log_frame: u64,
-    /// 本地能量检测：连续静音帧数（60ms/帧），>= MAX_SILENCE_FRAMES 时触发 VAD
-    silence_count: u64,
-    /// 本地能量检测：是否检测到过有效语音（初始静音不计入 silence_count）
+    /// 上一帧的 VAD 判定。只在翻转时打日志，避免周期性刷屏。
+    last_vad_voice: bool,
+    /// 是否检测到过有效语音（初始静音不计入 no_speech_frames）
     speech_detected: bool,
     /// 无语音超时：录音开始后累计的初始静音帧数（60ms/帧，speech_detected 前才累计），
     /// 达到配置阈值时触发告别并关闭连接（不依赖 ASR 文本）
@@ -594,15 +592,16 @@ pub struct AsrLlmTtsStrategy {
 /// - 用户说话时 RMS ≈ 4000~15000
 /// - 环境静音时 RMS ≈ 1600~2200
 ///
-/// 阈值 2000 会把环境噪音（实测 2019、2120）误判为"还在说话"，导致
-/// `silence_count` 始终归零、本地能量 VAD 永远不触发，只能干等服务端
-/// 1500ms 判停。取 3000 才能在实测数据上正确区分人声与环境噪音。
+/// 阈值 2000 会把环境噪音（实测 2019、2120）误判为"还在说话"。
+/// 取 3000 才在当时的实测数据上分得开。
+///
+/// **现在这已经**不是**主判据**：`SileroVad` 才是（见下面的结构体注释）。
+/// 保留它只为两种情况兜底：
+///   1. Silero 模型加载失败
+///   2. Silero 尚未初始化（会话首帧）
+///
+/// 而且它本身也不可靠 —— 实测人说话时 RMS 只有 1510~2183，会被判成静音。
 const SILENCE_RMS_THRESHOLD: f64 = 3000.0;
-
-/// 连续静音帧数阈值（60ms/帧），触发本地 VAD。
-/// 15 帧 = 900ms，对齐小智云端判停量级（其 Silero VAD 为 1000ms）。
-/// 注意：这条路径只有 `SILENCE_RMS_THRESHOLD` 能正确区分人声与噪音时才生效。
-const MAX_SILENCE_FRAMES: u64 = 15;
 
 /// Silero VAD 要求 16kHz 下每块恰好 512 个样本（32ms）。
 /// 我们是 60ms（960 样本）一帧，所以要自己攒块、余数留到下一帧。
@@ -656,12 +655,14 @@ impl SileroVad {
     /// 喂一帧 16kHz i16 PCM，返回本帧是否检测到人声。
     ///
     /// 一帧 960 样本通常能凑出 1~2 块，只要有任一块判为人声就算本帧有人声。
-    fn push_frame(&mut self, samples: &[i16]) -> bool {
+    fn push_frame(&mut self, samples: &[i16]) -> (bool, f32) {
         self.pending.extend_from_slice(samples);
         let mut any_voice = false;
+        let mut last_prob = 0.0f32;
         while self.pending.len() >= VAD_CHUNK {
             let chunk: Vec<i16> = self.pending.drain(..VAD_CHUNK).collect();
             let prob = self.detector.predict(chunk);
+            last_prob = prob;
             let voice = if prob >= VAD_PROB_HIGH {
                 true
             } else if prob <= VAD_PROB_LOW {
@@ -672,7 +673,7 @@ impl SileroVad {
             self.last_voice = voice;
             any_voice |= voice;
         }
-        any_voice
+        (any_voice, last_prob)
     }
 }
 
@@ -1497,10 +1498,10 @@ impl AsrLlmTtsStrategy {
 
                     // 没有收到 is_final 块时兜底。
                     //
-                    // 什么时候会发生：本地能量 VAD（MAX_SILENCE_FRAMES × 60ms）
-                    // 与豆包服务端 VAD（end_window_size）在赛跑。本地先触发时
-                    // 会替换 pcm_tx 关闭音频流，服务端还没到自己的判停窗口，
-                    // 于是只发中间结果、不发 is_final，`full_text` 就一直是空的。
+                    // 什么时候会发生：火山在 end_window_size（当前 500ms）内
+                    // 还没到自己的判停窗口就结束了，于是只发中间结果、不发 is_final。
+                    // 历史上还有一条「本地能量 VAD 抢先关流」的路径会加剧这个现象，
+                    // 那个抢判停权已在 6bb434e 移除。
                     //
                     // 为什么可以兜底：univoice 的 `chunk.text` 是【累积文本】
                     // 而非增量（同一句会反复推送 "关掉" → "关掉书房的" →
@@ -1541,8 +1542,7 @@ impl AsrLlmTtsStrategy {
             decoder,
             frame_samples,
             frame_count: 0,
-            last_log_frame: 0,
-            silence_count: 0,
+            last_vad_voice: false,
             speech_detected: false,
             no_speech_frames: 0,
         };
@@ -1847,41 +1847,38 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             // ── 本地 PCM 能量检测 ──
             let rms = compute_pcm_rms(&pcm_bytes);
 
-            // 临时诊断（找到合适阈值后可删除）：
-            // 用 warn 级绕开 info 被过滤的问题，每 50 帧（约 3 秒）打印一次实测能量，
-            // 用于判断 SILENCE_RMS_THRESHOLD 对当前麦克风是否过高。
-            if state.frame_count - state.last_log_frame >= 50 {
-                state.last_log_frame = state.frame_count;
-                let (dc_mean, _) = compute_pcm_stats(&pcm_bytes);
-                tracing::warn!(
-                    "ASR 诊断: 第 {} 帧, RMS={:.0}, 直流={:.0}, 阈值={:.0}, speech_detected={}, 已识别文字={}, 静音帧计数={}, 无语音帧={}",
-                    state.frame_count,
-                    rms,
-                    dc_mean,
-                    SILENCE_RMS_THRESHOLD,
-                    state.speech_detected,
-                    session.asr_received_text.load(Ordering::Acquire),
-                    state.silence_count,
-                    state.no_speech_frames,
-                );
-            }
-
             // 判据：优先 Silero（神经网络），模型不可用时退回能量阈值。
             // 注意 silero 挂在 session（会话级）而不是 state（单次录音管道）：
             // 模型内部有跨帧状态，必须跟着会话走，不能每条录音重来。
-            let is_voice = match session.silero.as_mut() {
-                Some(vad) => vad.push_frame(&pcm_buf[..decoded_samples]),
-                None => rms >= SILENCE_RMS_THRESHOLD,
+            let (is_voice, vad_desc) = match session.silero.as_mut() {
+                Some(vad) => {
+                    let (voice, prob) = vad.push_frame(&pcm_buf[..decoded_samples]);
+                    (voice, format!("Silero p={prob:.2}"))
+                }
+                None => (
+                    rms >= SILENCE_RMS_THRESHOLD,
+                    format!("能量 RMS={rms:.0} 阈值={SILENCE_RMS_THRESHOLD:.0}"),
+                ),
             };
+
+            // 只在判定翻转时打日志。
+            //
+            // 之前是每 50 帧（3 秒）打一行 RMS/直流/静音计数，一次长对话能刷几十行；
+            // 而且判据换成 Silero 之后那行还写着「阈值=3000」，纯误导。
+            // 真正有用的是「什么时候开始说话、什么时候停」这两个时刻 —— 有界且可读。
+            if is_voice != state.last_vad_voice {
+                state.last_vad_voice = is_voice;
+                tracing::warn!(
+                    "VAD → {}（{vad_desc}，第 {} 帧）",
+                    if is_voice { "人声" } else { "静音" },
+                    state.frame_count,
+                );
+            }
 
             if is_voice {
                 state.speech_detected = true;
-                state.silence_count = 0;
                 state.no_speech_frames = 0; // 检测到有效语音，无语音超时作废
-            } else if state.speech_detected {
-                // 只在首次语音后的静音才累计
-                state.silence_count = state.silence_count.saturating_add(1);
-            } else {
+            } else if !state.speech_detected {
                 // 初始静音（从头到尾没说话）：累计无语音超时帧数
                 state.no_speech_frames = state.no_speech_frames.saturating_add(1);
             }
@@ -1909,37 +1906,14 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 return Ok::<_, String>(None);
             }
 
-            if state.silence_count >= MAX_SILENCE_FRAMES
-                && session.asr_received_text.load(Ordering::Acquire)
-            {
-                // 只记录，不关流、不通知。
-                //
-                // 历史：这里原本会「关闭 ASR 流 + 立刻 vad_notify」，是个有两个
-                // 副作用的设计，实测同时造成两个症状：
-                //   ① 话没说完就开始返回 —— 900ms 静音就判停，比火山自己的
-                //      end_window_size(500ms) 之后还有文本稳定(1500ms) 都早，
-                //      等于我们自己抢了判停权
-                //   ② 识别率下降 —— 关流后 pcm_tx 被替换，后半句再也送不进 ASR，
-                //      只能靠 last_nonempty_text 兜底，必然丢字
-                //
-                // 现在的判停权威：
-                //   · 正常情况：火山的 is_vad_endpoint（服务端 definite，唯一权威）
-                //   · 火山始终不回 definite：上面的 TEXT_STABLE_MS 文本稳定兜底
-                //   · 用户一直没说话：no_speech_notify 的无语音超时
-                //   · 极端兜底：传输层的 RECORDING_LIMIT
-                //
-                // 任务不会因此泄漏：文本稳定分支会 break，且下次录音时
-                // init_asr_pipeline 会替换 streaming_state，旧任务随之退出。
-                // 只在刚跨过阈值那一帧打一次。否则每 60ms 一行，
-                // 一次说话停顿就能刷出几十行日志。
-                if state.silence_count == MAX_SILENCE_FRAMES {
-                    tracing::warn!(
-                        "本地能量 VAD: 连续 {} 帧静音 ({:.1}s)，仅记录（不再关流/判停）",
-                        state.silence_count,
-                        state.silence_count as f64 * 60.0 / 1000.0,
-                    );
-                }
-            }
+            // 历史：这里原本还有一段「本地能量 VAD 连续 900ms 静音就关流 + vad_notify」。
+            // 实测它抢了火山服务端的判停权，造成「话没说完就返回」+「识别率下降」，
+            // 已在 6bb434e 移除判停副作用。现在判停权威是：
+            //   · 正常情况：火山 is_vad_endpoint（服务端 definite）
+            //   · 火山不回 definite：TEXT_STABLE_MS 文本稳定兜底
+            //   · 用户一直没说话：no_speech_notify 的无语音超时
+            //   · 极端兜底：传输层 RECORDING_LIMIT
+            // 它留下的周期性日志也一并删掉 —— 每次说话停顿都刷一行，纯噪音。
 
             Ok(Some((pcm_bytes, state.pcm_tx.clone())))
         })??; // MutexGuard 在此处释放
@@ -3839,8 +3813,13 @@ mod tests {
         let mut vad = SileroVad::new().expect("Silero VAD 应能加载内置模型");
         // 960 个 0 样本 = 一帧 60ms 静音（刚好凑出 1 块 512，余 448 留到下一帧）
         let silence = vec![0i16; 960];
-        assert!(!vad.push_frame(&silence), "纯静音不该判成人声");
-        assert!(!vad.push_frame(&silence), "纯静音不该判成人声");
+        // 多喂几帧：Silero 内部有 state/context，第一块未必立刻收敛到 0
+        let mut last = (true, 1.0f32);
+        for _ in 0..4 {
+            last = vad.push_frame(&silence);
+        }
+        assert!(!last.0, "纯静音不该判成人声");
+        assert!(last.1 < 0.3, "纯静音的概率应低于低阈值，实际 {}", last.1);
     }
 
     /// 会话级状态必须按 session_key 隔离。
@@ -4801,8 +4780,7 @@ mod tests {
             decoder,
             frame_samples: 960,
             frame_count: 0,
-            last_log_frame: 0,
-            silence_count: 0,
+            last_vad_voice: false,
             speech_detected: false,
             no_speech_frames: 0,
         };
