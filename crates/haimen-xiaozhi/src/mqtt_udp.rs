@@ -1017,16 +1017,19 @@ async fn run_playback(shared: Arc<Shared>, job: PlaybackJob) {
 async fn drive_playback(shared: &Arc<Shared>, job: &PlaybackJob, tts_started: &mut bool) {
     let (frame_tx, mut frame_rx) = mpsc::channel::<PlaybackEvent>(32);
     let strategy = Arc::clone(&shared.strategy);
-    let session_id = job.protocol_session_id.clone();
+    // 策略层的会话 key 必须和钩子一致（钩子收的是 client_id），
+    // 这里不能传 protocol_session_id —— 它每次 hello 都会变。
+    let strategy_session_key = job.client_id.clone();
+    let log_session_id = job.protocol_session_id.clone();
     let buffer = job.buffer.clone();
     // 任务单里的 is_streaming_capable 对应 trait 的 supports_streaming_playback。
     // 默认的 generate_response_stream 会再调用 generate_response，两条路径都从这里进。
     let generate = tokio::spawn(async move {
         if let Err(err) = strategy
-            .generate_response_stream(buffer, &session_id, frame_tx)
+            .generate_response_stream(buffer, &strategy_session_key, frame_tx)
             .await
         {
-            tracing::warn!(%err, %session_id, "生成语音回复失败");
+            tracing::warn!(%err, %log_session_id, "生成语音回复失败");
         }
     });
     let _abort_gen = AbortJoin(Some(generate));
