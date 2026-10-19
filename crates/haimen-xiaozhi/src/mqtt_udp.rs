@@ -30,6 +30,13 @@ const MAX_DOWNLINK_PAYLOAD: usize = 1484;
 /// 录音超过这个时间还没收到 listen stop，由服务器收口。设备自己不会回 Idle。
 const RECORDING_LIMIT: Duration = Duration::from_secs(30);
 
+/// 一轮对话结束后，这么久没有新的语音输入就发 goodbye 收口。
+///
+/// 不发的话设备会一直停在 Listening：持续把麦克风音频推上来（隐私问题），
+/// 我们的 ASR 管道也会不停重启（白烧火山额度），屏幕也回不到「待命」。
+/// 15 秒足够覆盖「说完一句再补一句」的自然停顿。
+const IDLE_CLOSE_LIMIT: Duration = Duration::from_secs(15);
+
 /// 上行 hello 没带采样率时用 16 kHz。这是设备麦克风的参数，不是下行 TTS 的 24 kHz。
 const fn default_uplink_rate() -> u32 {
     16_000
@@ -151,6 +158,10 @@ struct DeviceSession {
     downlink_ts: u32,
     recording_deadline: Option<TokioInstant>,
     last_activity: Instant,
+    /// 最近一次「一轮对话结束」的时刻（回复播完 / 主动播报播完）。
+    /// 不能用 last_activity 判断收口：设备在 Listening 时会不停推音频，
+    /// last_activity 永远在刷新，永远等不到超时。
+    last_speech_at: Instant,
     /// 每开一轮回放加一。旧回放任务靠它知道自己已经被替换。
     playback_gen: u64,
     cancel_tx: Option<watch::Sender<bool>>,
@@ -169,6 +180,7 @@ impl DeviceSession {
             downlink_ts: 1,
             recording_deadline: None,
             last_activity: Instant::now(),
+            last_speech_at: Instant::now(),
             playback_gen: 0,
             cancel_tx: None,
         }
@@ -463,6 +475,16 @@ async fn say_raw_frames(shared: &Arc<Shared>, client_id: &str, frames: Vec<Vec<u
         %client_id,
         "主动播报：已发送 tts stop，非手动模式下设备会自动进入聆听"
     );
+
+    // 主动播报也算一轮对话结束：设备进 Listening 后等用户回答，
+    // 超过 IDLE_CLOSE_LIMIT 没回应就由收口逻辑发 goodbye 回到待命。
+    {
+        let mut tables = shared.tables.lock().await;
+        if let Some(session) = tables.sessions.get_mut(client_id) {
+            session.last_speech_at = Instant::now();
+            session.last_activity = Instant::now();
+        }
+    }
 }
 
 async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
@@ -864,6 +886,47 @@ async fn prune_sessions(shared: &Shared) {
         tracing::warn!(%client_id, "MQTT 连接已断开，清理会话与 UDP 密钥");
         drop_client(shared, &client_id).await;
     }
+
+    // 对话收口：一轮结束后长时间没新语音，就发 goodbye 让设备回待命。
+    let idle: Vec<String> = {
+        let tables = shared.tables.lock().await;
+        tables
+            .sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.state == SessionState::Ready
+                    && s.udp_session_id.is_some()
+                    && s.last_speech_at.elapsed() > IDLE_CLOSE_LIMIT
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for client_id in idle {
+        close_idle_conversation(shared, &client_id).await;
+    }
+}
+
+/// 给设备发 goodbye 收口当前对话，让它关闭音频通道回到 Idle。
+///
+/// 固件的处理是：收到 goodbye 后只在 `session_id` 匹配时才
+/// `CloseAudioChannel(false)`，所以这里必须带上协议会话号。
+/// 不带或带错，设备会继续停在 Listening 一直推麦克风音频。
+async fn close_idle_conversation(shared: &Shared, client_id: &str) {
+    let session_id = {
+        let tables = shared.tables.lock().await;
+        let Some(session) = tables.sessions.get(client_id) else {
+            return;
+        };
+        session.protocol_session_id.clone()
+    };
+    if session_id.is_empty() {
+        return;
+    }
+    let body = format!("{{\"type\":\"goodbye\",\"session_id\":\"{session_id}\"}}");
+    if publish_body(shared, client_id, &body).await {
+        tracing::warn!(%client_id, "长时间无语音，发送 goodbye 收口对话，设备应回到待命");
+        release_udp(shared, client_id, "idle-close").await;
+    }
 }
 
 async fn start_playback(shared: &Arc<Shared>, client_id: &str) {
@@ -1096,6 +1159,8 @@ async fn finish_ready(shared: &Shared, job: &PlaybackJob) {
     }
     session.recording_deadline = None;
     session.last_activity = Instant::now();
+    // 一轮对话到此结束，开始计收口超时。
+    session.last_speech_at = Instant::now();
 }
 
 /// 注销 UDP 密钥并回到 Ready，但不把 MQTT 会话删掉。
