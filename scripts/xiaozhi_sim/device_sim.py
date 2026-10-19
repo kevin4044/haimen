@@ -33,7 +33,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from aes_ctr import backend as aes_backend
-from mqtt_link import MqttLink
+from mqtt_link import MqttLink, device_credentials
 from opus_codec import make_test_wav, wav_to_opus_frames
 from udp_packet import (
     UdpCrypto,
@@ -82,9 +82,14 @@ class DeviceSim:
 
     def connect_mqtt(self, timeout: float = 10.0) -> None:
         self.log(f"连接 broker {self.broker_host}:{self.broker_port} client_id={self.client_id}")
+        # broker 开启鉴权后必须用派生密码（HMAC(auth_key, client_id)），
+        # 否则会被 CONNACK 0x04 拒绝。
+        _user, _pwd = device_credentials(self.client_id)
         self.mqtt = MqttLink(
             host=self.broker_host,
             port=self.broker_port,
+            username=_user,
+            password=_pwd,
             client_id=self.client_id,
             keepalive=240,
         )

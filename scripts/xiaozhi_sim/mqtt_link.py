@@ -234,6 +234,44 @@ class MqttLink:
 SETTINGS_PATH = os.path.expanduser("~/works/haimen-data/settings.toml")
 
 
+def _read_auth_key(settings_path: str | None = None) -> str:
+    """从 settings.toml 的 [xiaozhi.mqtt] 读 auth_key（没有则空串）。"""
+    path = settings_path or SETTINGS_PATH
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    in_mqtt = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_mqtt = stripped == "[xiaozhi.mqtt]"
+            continue
+        if in_mqtt and stripped.startswith("auth_key"):
+            _, _, value = stripped.partition("=")
+            return value.strip().strip('"').strip("'")
+    return ""
+
+
+def device_credentials(
+    client_id: str, settings_path: str | None = None
+) -> tuple[str | None, str | None]:
+    """返回设备连接用的 (username, password)。
+
+    broker 开启鉴权后，设备密码是 HMAC-SHA256(auth_key, client_id)，
+    client_id 就是 OTA 下发的那个 `GID_haimen@@@<mac>@@@<mac>`。
+    未配置 auth_key 时返回 (None, None)，broker 不校验。
+    """
+    import hashlib
+    import hmac as _hmac
+
+    auth_key = _read_auth_key(settings_path)
+    if not auth_key:
+        return None, None
+    digest = _hmac.new(auth_key.encode(), client_id.encode(), hashlib.sha256).hexdigest()
+    return "haimen", digest
+
+
 def admin_credentials(settings_path: str | None = None) -> tuple[str, str | None, str | None]:
     """返回控制面连接用的 (client_id, username, password)。
 
