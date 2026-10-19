@@ -1403,6 +1403,17 @@ async fn release_udp(shared: &Shared, client_id: &str, reason: &str) {
             return;
         };
         session.end_round();
+        // 收回 Ready 之后必须再退回 AwaitingHello。
+        //
+        // 为什么：UDP 通道已经没了，设备此刻若还停在 Listening，会把之前
+        // tts stop 触发的 listen start 发上来。enter_recording 只挡 AwaitingHello，
+        // 于是这个杂散 listen start 会重新进录音 → 30 秒 RECORDING_LIMIT 到期
+        // → 生成空回复 → tts stop → 设备又回 Listening → 又 listen start……
+        // 实测形成每 30 秒一轮的死循环，用户看到的就是「设备自己不停进入聆听」。
+        //
+        // 退回 AwaitingHello 后，必须等设备重新 hello 才能再录音 —— 那时 UDP
+        // 密钥也才存在，否则录上来的音频根本解不了。
+        session.state = SessionState::AwaitingHello;
         let udp_id = session.udp_session_id.take();
         if let Some(id) = udp_id {
             tables.udp_index.remove(&id);
