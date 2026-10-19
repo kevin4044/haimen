@@ -109,7 +109,9 @@ case "$cmd" in
         echo "▶ clippy"
         in_dev cargo clippy --workspace -- -D warnings
         echo "▶ test"
-        in_dev cargo test -- --test-threads=1
+        # 必须和 test 目标一致加 --workspace：否则 crates/ 下的测试
+        # （haimen-xiaozhi / haimen-openai 等）根本不跑，verify 却报"全部通过"。
+        in_dev cargo test --workspace -- --test-threads=1
         fix_owner
         echo "✅ 全部通过"
         ;;
