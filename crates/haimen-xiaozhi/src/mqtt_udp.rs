@@ -37,6 +37,15 @@ const RECORDING_LIMIT: Duration = Duration::from_secs(30);
 /// 15 秒足够覆盖「说完一句再补一句」的自然停顿。
 const IDLE_CLOSE_LIMIT: Duration = Duration::from_secs(15);
 
+/// 单条 MQTT 下发的写队列超时。
+///
+/// 写队列容量 32，设备侧 TCP 卡住时 `publish_to` 会一直 await。
+/// 不设上限的话，一个坏设备能把整个传输层 run_loop 拖死。
+const MQTT_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 单帧喂入策略侧 ASR 的超时。下游积压时丢帧优于卡死全局循环。
+const ASR_FEED_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// 上行 hello 没带采样率时用 16 kHz。这是设备麦克风的参数，不是下行 TTS 的 24 kHz。
 const fn default_uplink_rate() -> u32 {
     16_000
@@ -533,7 +542,16 @@ async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
             if value.get("type").and_then(|v| v.as_str()) == Some("__say_audio") {
                 match parse_say_frames(&value) {
-                    Ok(frames) => say_raw_frames(shared, target, frames).await,
+                    Ok(frames) => {
+                        // 不能在这里直接 await：一次播报要按 60ms 的实时节奏
+                        // sleep 好几秒，会把整个传输层的 run_loop 卡住 —— 期间
+                        // 收不到设备的 listen / abort / 上行音频，多设备时全体停摆。
+                        let shared = Arc::clone(shared);
+                        let target = target.to_string();
+                        tokio::spawn(async move {
+                            say_raw_frames(&shared, &target, frames).await;
+                        });
+                    }
                     Err(err) => tracing::warn!(target, %err, "主动播报命令非法，丢弃"),
                 }
                 return;
@@ -851,8 +869,21 @@ async fn handle_udp(shared: &Arc<Shared>, audio: crate::udp_audio::UdpIncomingAu
     // 用 client_id 作为策略层的会话键：它在一个设备的整个连接周期内稳定，
     // 不像 protocol_session_id 每次 hello 都会换。
     if let Some(client_id) = recording_client {
-        if let Err(err) = shared.strategy.on_audio_frame(&client_id, &frame).await {
-            tracing::warn!(%err, "on_audio_frame 失败，帧已留在缓冲里");
+        // ASR 的 PCM 通道有界（32~64 帧 ≈ 2~4 秒）。下游积压时 send 会 await，
+        // 拖住整个 run_loop。这里给硬超时：宁可丢这一帧，也不能卡住所有设备。
+        match tokio::time::timeout(
+            ASR_FEED_TIMEOUT,
+            shared.strategy.on_audio_frame(&client_id, &frame),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(%err, "on_audio_frame 失败，帧已留在缓冲里"),
+            Err(_) => tracing::warn!(
+                %client_id,
+                timeout_ms = ASR_FEED_TIMEOUT.as_millis() as u64,
+                "喂入 ASR 超时（下游积压），本帧丢弃"
+            ),
         }
     }
 }
@@ -1380,23 +1411,34 @@ async fn publish_body(shared: &Shared, client_id: &str, body: &str) -> bool {
             .downlink_topic_template
             .replace("{mac}", &session.device_id)
     };
-    match shared
-        .broker
-        .publish_to(BrokerOutgoing {
+    // 写队列（容量 32）满时 publish_to 会 await。设备侧 TCP 卡住时
+    // 这会把整个 run_loop 拖死，所以这里加硬超时。
+    let published = tokio::time::timeout(
+        MQTT_WRITE_TIMEOUT,
+        shared.broker.publish_to(BrokerOutgoing {
             client_id: client_id.to_owned(),
             topic,
             payload: body.as_bytes().to_vec(),
-        })
-        .await
-    {
-        Ok(true) => true,
-        Ok(false) => {
+        }),
+    )
+    .await;
+    match published {
+        Ok(Ok(true)) => true,
+        Ok(Ok(false)) => {
             tracing::warn!(%client_id, "设备已掉线，清理会话");
             drop_client(shared, client_id).await;
             false
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             tracing::warn!(%client_id, %err, "下发 MQTT 失败");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                %client_id,
+                timeout_ms = MQTT_WRITE_TIMEOUT.as_millis() as u64,
+                "下发 MQTT 超时（设备侧写队列拥塞），放弃本条"
+            );
             false
         }
     }
