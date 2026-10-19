@@ -525,6 +525,8 @@ struct LlmSession {
 /// 共享的 ASR 管道、VAD 信号和收口标记会互相覆盖 ——
 /// 表现为 A 的音频进 B 的管道、A 说「再见」把 B 的会话也关掉。
 struct SessionAsrState {
+    /// 最近一次被访问的时刻，用于回收长期不用、且没有活动 ASR 管道的会话。
+    last_used: std::time::Instant,
     llm_session_id: Option<LlmSession>,
     streaming_state: Option<AsrPipelineState>,
     vad_notify: Arc<Notify>,
@@ -537,6 +539,7 @@ struct SessionAsrState {
 impl SessionAsrState {
     fn new() -> Self {
         Self {
+            last_used: std::time::Instant::now(),
             llm_session_id: None,
             streaming_state: None,
             vad_notify: Arc::new(Notify::new()),
@@ -838,6 +841,43 @@ fn create_streaming_asr_provider(cfg: &AsrConfig) -> Result<Box<dyn AsrProvider>
     }
 }
 
+/// 会话状态保留时长。超过且没有活动 ASR 管道就回收。
+const SESSION_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// 会话状态表上限。超出时按 last_used 淘汰最旧的。
+const SESSION_STATE_MAX: usize = 64;
+
+/// 回收长期不用的会话状态。
+///
+/// 为什么需要：`sessions` 是按需创建的 HashMap，从不删除的话 ——
+/// ESP32 每次重连 WS 都会换一个 session_id，条目会随进程存活时间无限增长，
+/// 而每条里可能还挂着 AsrPipelineState（含 PCM 发送端与云端 ASR 连接）。
+/// 删掉条目即 drop 管道，对应的 ASR 后台任务会因为流端关闭而自然退出。
+///
+/// 只回收 `streaming_state` 为 None 的条目：正在录音的会话不能被误删。
+fn prune_session_states(map: &mut std::collections::HashMap<String, SessionAsrState>) {
+    let now = std::time::Instant::now();
+    map.retain(|_, state| {
+        state.streaming_state.is_some() || now.duration_since(state.last_used) < SESSION_STATE_TTL
+    });
+    if map.len() <= SESSION_STATE_MAX {
+        return;
+    }
+    // 超上限：按 last_used 从旧到新淘汰到上限。
+    let mut order: Vec<(String, std::time::Instant)> = map
+        .iter()
+        .filter(|(_, state)| state.streaming_state.is_none())
+        .map(|(key, state)| (key.clone(), state.last_used))
+        .collect();
+    order.sort_by_key(|(_, used)| *used);
+    for (key, _) in order {
+        if map.len() <= SESSION_STATE_MAX {
+            break;
+        }
+        map.remove(&key);
+    }
+}
+
 impl AsrLlmTtsStrategy {
     /// 在某会话的状态上执行闭包；会话不存在时按需创建。
     ///
@@ -851,9 +891,16 @@ impl AsrLlmTtsStrategy {
             .sessions
             .lock()
             .map_err(|e| format!("会话状态锁获取失败: {}", e))?;
-        let state = map
-            .entry(session_key.to_string())
-            .or_insert_with(SessionAsrState::new);
+        {
+            let state = map
+                .entry(session_key.to_string())
+                .or_insert_with(SessionAsrState::new);
+            state.last_used = std::time::Instant::now();
+        }
+        // 先插入再回收：这样表大小严格不超过上限（先回收后插入会多出 1 条）。
+        // 刚插入的这条 last_used 最新，不会被淘汰。
+        prune_session_states(&mut map);
+        let state = map.get_mut(session_key).expect("刚插入的会话状态必然还在");
         Ok(f(state))
     }
 
@@ -3638,6 +3685,40 @@ mod tests {
             shared,
             "/tmp".to_string(),
         )
+    }
+
+    /// 长期不用的会话状态必须被回收，否则 WS 每次重连换 session_id
+    /// 都会在 sessions 里留下一条（可能还挂着 ASR 管道）。
+    #[test]
+    fn idle_session_state_is_pruned() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy.with_session("old", |_s| {}).expect("创建 old");
+        {
+            let mut map = strategy.sessions.lock().expect("锁");
+            let state = map.get_mut("old").expect("old 应存在");
+            state.last_used =
+                std::time::Instant::now() - SESSION_STATE_TTL - std::time::Duration::from_secs(1);
+        }
+        strategy.with_session("fresh", |_s| {}).expect("创建 fresh");
+        let map = strategy.sessions.lock().expect("锁");
+        assert!(!map.contains_key("old"), "过期会话应被回收");
+        assert!(map.contains_key("fresh"), "新会话应保留");
+    }
+
+    /// 会话状态表有上限，避免异常客户端把内存撑爆。
+    #[test]
+    fn session_state_map_is_bounded() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        for i in 0..(SESSION_STATE_MAX + 20) {
+            strategy
+                .with_session(&format!("dev-{i}"), |_s| {})
+                .expect("创建");
+        }
+        let len = strategy.sessions.lock().expect("锁").len();
+        assert!(
+            len <= SESSION_STATE_MAX,
+            "会话状态表不应超过 {SESSION_STATE_MAX}，实际 {len}"
+        );
     }
 
     /// 会话级状态必须按 session_key 隔离。
