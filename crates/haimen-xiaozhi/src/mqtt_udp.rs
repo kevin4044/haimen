@@ -63,6 +63,12 @@ const fn default_frame_ms() -> u32 {
     60
 }
 
+/// 发 `tts stop` 前额外等待的帧数，默认 2。
+/// 来历是参考实现的 `prebuffer + 2` 公式里那个 2，覆盖 UDP 抖动与固件调度延迟。
+const fn default_tail_extra_frames() -> u32 {
+    2
+}
+
 /// 传输层配置。`prebuffer_count` / `frame_duration_ms` 的默认值见 [`Default`]。
 #[derive(Debug, Clone)]
 pub struct MqttUdpConfig {
@@ -76,6 +82,9 @@ pub struct MqttUdpConfig {
     pub prebuffer_count: usize,
     /// 帧时长毫秒，默认 60。
     pub frame_duration_ms: u32,
+    /// 发 `tts stop` 前额外等待的帧数（乘 frame_duration）。
+    /// 默认 2（= 参考实现的 `prebuffer + 2` 里的那个 2）。
+    pub tail_extra_frames: u32,
     /// 下发 hello 时告诉设备的 UDP 服务器地址。
     ///
     /// 为什么需要显式指定：容器里 `local_ip()` 拿到的是容器 IP（如 192.168.215.2），
@@ -98,6 +107,7 @@ impl Default for MqttUdpConfig {
             downlink_topic_template: "devices/p2p/{mac}".to_owned(),
             prebuffer_count: 5,
             frame_duration_ms: 60,
+            tail_extra_frames: default_tail_extra_frames(),
             advertise_ip: None,
         }
     }
@@ -1083,6 +1093,10 @@ async fn run_playback(shared: Arc<Shared>, job: PlaybackJob) {
     drive_playback(&shared, &job, &mut tts_started).await;
     if tts_started && !cancelled(&job.cancel, &shared) {
         // 设备要求 start → 句子/音频 → stop。stop 放在所有帧之后。
+        // 先等设备把缓冲里的尾帧播完，再发 stop 收口；
+        // 等待被取消也要照常发 stop —— 设备不能停在 Speaking 状态。
+        let mut cancel = job.cancel.clone();
+        let _ = wait_tail_playback(&shared, &mut cancel).await;
         let _ = publish_tts(&shared, &job.client_id, TtsState::Stop, None).await;
         finish_ready(&shared, &job).await;
     }
@@ -1529,6 +1543,40 @@ async fn wait_until_send_slot(
     }
 }
 
+/// 发完最后一帧后，等设备把缓冲里的尾帧播完再发 `tts stop`。
+///
+/// 为什么需要：`drive_playback` 只保证帧「发出去」，设备解码队列里还压着
+/// `prebuffer_count` 帧（默认 5 ≈ 300ms）。紧接着发 stop 会让设备切出
+/// Speaking 状态、回收音频管道，尾帧被丢掉 —— 表现为句子末尾掉帧。
+///
+/// 公式照抄参考实现（sendAudioHandle.py:58-81）：
+///   (prebuffer_count + 2) × frame_duration
+/// 多出的 `tail_extra_frames`（默认 2）帧覆盖 UDP 抖动与固件调度延迟。
+///
+/// 取消信号触发时必须立刻返回，不能白等（用户插话时不能卡 420ms）。
+async fn wait_tail_playback(shared: &Shared, cancel: &mut watch::Receiver<bool>) -> bool {
+    if *cancel.borrow() {
+        return false;
+    }
+    let frames = u64::try_from(shared.cfg.prebuffer_count)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::from(shared.cfg.tail_extra_frames));
+    let wait = Duration::from_millis(frames.saturating_mul(u64::from(frame_step_ms(&shared.cfg))));
+    let sleep = tokio::time::sleep(wait);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+          _ = &mut sleep => return true,
+          changed = cancel.changed() => {
+            // sender 侧关闭（Err）视为取消；信号被复位（false）则继续等满
+            if changed.is_err() || *cancel.borrow() {
+              return false;
+            }
+          }
+        }
+    }
+}
+
 fn mac_from_client_id(client_id: &str) -> String {
     let mut parts = client_id.split("@@@").filter(|part| !part.is_empty());
     let _group = parts.next();
@@ -1876,6 +1924,7 @@ mod tests {
                 downlink_topic_template: "devices/p2p/{mac}".to_owned(),
                 prebuffer_count: 5,
                 frame_duration_ms: 60,
+                tail_extra_frames: 2,
                 advertise_ip: None,
             };
             let transport = MqttUdpTransport::start(cfg, mock.clone())
