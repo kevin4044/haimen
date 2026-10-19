@@ -561,6 +561,24 @@ async fn handle_hello(shared: &Arc<Shared>, client_id: &str, value: serde_json::
             return;
         }
     };
+    // 记录设备能力声明：排查「屏幕不显示文字」这类问题必须看这里 ——
+    // text_font.charset=basic 表示只加载了固件内置小字库，中文渲染不出来。
+    // 用 warn 级：本项目的 INFO 会被日志过滤。
+    tracing::warn!(
+        %client_id,
+        features = %hello
+            .features
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "{}".to_string()),
+        text_font = %hello
+            .text_font
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(缺失)".to_string()),
+        "设备 hello 能力声明"
+    );
+
     if let Some(transport) = hello.transport.as_deref() {
         if !transport.eq_ignore_ascii_case("udp") {
             tracing::warn!(%client_id, transport, "hello 的 transport 不是 udp，忽略");
@@ -1449,6 +1467,14 @@ struct HelloIn {
     transport: Option<String>,
     #[serde(default)]
     audio_params: Option<UplinkAudio>,
+    /// 设备能力声明。较新固件带 `glyph_push`（服务端补发本地字库缺失的位图）。
+    #[serde(default)]
+    features: Option<serde_json::Value>,
+    /// 设备实际安装的文字字库。
+    /// `charset = "basic"` 是链接进固件的小字库；`"common"` 是从 assets 分区
+    /// 加载的完整字库。中文显示依赖后者 —— 如果设备只报 basic，中文很可能渲染不出来。
+    #[serde(default)]
+    text_font: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
