@@ -383,3 +383,61 @@ if (cJSON_IsBool(hide_subtitle)) {
 | G | **收口 15s → 可配（如 60~120s）+ 关闭前说句告别语** | `receiveAudioHandle.py:110-136` | 半天 | 体验柔和；现在 15s 静默直接 goodbye 很生硬 |
 
 优先级判断：**A/B/D 各 1 小时，可以先做**；C/E 半天，配合 Silero VAD 一起做更划算；F 是稳定性隐患；G 属体验。
+
+---
+
+## KI-006 ASR 不可用时设备卡在「聆听中」没有反应
+
+**状态**：已修复（2026-10-20，`feature/multi-device-room`）
+**严重度**：高（用户感知为「说完话没反应」，且会一直卡住）
+
+### 现象
+
+完成一轮对话后，设备自动进入聆听；用户再说话时没有任何回复，设备
+一直保持「聆听中」，屏幕/指示灯都不回待命。
+
+### 日志证据
+
+2026-10-20 16:44:50（mini 本地时间）：
+
+```
+流式 ASR 任务异常退出: 流式 ASR 启动失败: Connection timeout after 10000ms
+流式 ASR 失败: ..., 回退到批处理模式
+生成语音回复失败 err=批处理 ASR 超时 (6s)
+```
+
+随后设备自动重听，`on_audio_frame` 每秒报一次
+
+```
+on_audio_frame 失败，帧已留在缓冲里 err=ASR 管道已关闭
+```
+
+并且下一轮流式 ASR 收到 500 个结果块、完整文本长度仍为 0，再次失败。
+
+### 根因（两处叠加）
+
+1. **外部**：火山流式 ASR 短时连接超时（10s），批处理兜底也超时（6s）——
+   ASR 服务短暂不可用。这是诱因，不是代码 bug。
+2. **代码**：
+   - `run_playback` 在「生成阶段失败、一帧 TTS 都没发出去」时直接 `return`，
+     既不 `finish_ready` 也不发 `goodbye` → 会话永远停在 `Playing`；
+     而 idle-close 只处理 `Ready`，永远收不了口。
+   - `on_audio_frame` 持续失败时，传输层仍要干等 30 秒 `RECORDING_LIMIT`
+     才收口，用户感知被放大。
+
+### 修复
+
+`crates/haimen-xiaozhi/src/mqtt_udp.rs`：
+
+- 生成任务记录失败标志；失败且零可播内容时不发 `tts start`，直接
+  `close_failed_round`：发 `goodbye` + 注销 UDP，设备立刻回待命。
+- 新增 ASR 喂入看门狗：`on_audio_frame` 连续失败超过 2 秒（`ASR_FEED_FAIL_LIMIT`）
+  就提前结束本轮录音，不等 30 秒上限；后续生成失败同样走 goodbye 收口。
+- 单测：`generation_failure_sends_goodbye_and_returns_to_idle`、
+  `asr_feed_failure_ends_recording_early`。
+
+### 遗留
+
+ASR 服务本身的短时超时无法从 haimen 侧消除；修复后最坏情况是「本轮失败 →
+设备回待命」，用户重新唤醒即可，不会再无限卡在聆听中。若 ASR 故障频繁，
+可考虑增加「没听清，请再说一次」的 TTS 兜底提示。

@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -46,6 +47,13 @@ const MQTT_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 单帧喂入策略侧 ASR 的超时。下游积压时丢帧优于卡死全局循环。
 const ASR_FEED_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// ASR 喂入连续失败的容忍时长。超过就提前结束本轮录音、转去生成回复。
+///
+/// 为什么需要：流式 ASR 连接失败/被关闭后，`on_audio_frame` 会一直报错，
+/// 但设备仍在推麦克风音频。不提前收口的话要干等 30 秒 RECORDING_LIMIT，
+/// 用户感知就是「说完话卡住没反应」。
+const ASR_FEED_FAIL_LIMIT: Duration = Duration::from_secs(2);
 
 /// 上行 hello 没带采样率时用 16 kHz。这是设备麦克风的参数，不是下行 TTS 的 24 kHz。
 const fn default_uplink_rate() -> u32 {
@@ -195,6 +203,9 @@ struct DeviceSession {
     hello_at: Option<Instant>,
     /// 本轮聆听开始时刻（设备 listen start）。用于记录聆听持续时长。
     listening_since: Option<Instant>,
+    /// ASR 喂入连续失败的起点。成功喂入一帧就清空；持续失败超过
+    /// [`ASR_FEED_FAIL_LIMIT`] 时提前结束本轮录音。
+    asr_feed_failed_at: Option<Instant>,
     /// 最近一次成功下发 `tts stop` 的时刻。
     /// auto 模式下固件收到 stop 会重新进入 Listening 并发 `listen start`（协议 4.3.2），
     /// 这个时间点是判断「下一次聆听是否由 tts stop 自动触发」的关键证据。
@@ -219,6 +230,7 @@ impl DeviceSession {
             cancel_tx: None,
             hello_at: None,
             listening_since: None,
+            asr_feed_failed_at: None,
             last_tts_stop_at: None,
         }
     }
@@ -234,6 +246,7 @@ impl DeviceSession {
         self.recording_deadline = None;
         self.next_send_at = None;
         self.listening_since = None;
+        self.asr_feed_failed_at = None;
         self.last_activity = Instant::now();
         // 收口计时也要重置。
         //
@@ -1080,6 +1093,7 @@ async fn enter_recording(shared: &Arc<Shared>, client_id: &str, listen: &ListenI
         session.recording_deadline = Some(TokioInstant::now() + RECORDING_LIMIT);
         session.next_send_at = None;
         session.listening_since = Some(Instant::now());
+        session.asr_feed_failed_at = None;
         session.last_activity = Instant::now();
         // 「进入聆听」必须留 INFO 日志：文件层过滤会吞掉 debug。
         // since_hello_ms / since_tts_stop_ms 能直接回答两个排查问题：
@@ -1185,19 +1199,53 @@ async fn handle_udp(shared: &Arc<Shared>, audio: crate::udp_audio::UdpIncomingAu
     if let Some(client_id) = recording_client {
         // ASR 的 PCM 通道有界（32~64 帧 ≈ 2~4 秒）。下游积压时 send 会 await，
         // 拖住整个 run_loop。这里给硬超时：宁可丢这一帧，也不能卡住所有设备。
-        match tokio::time::timeout(
+        let feed_failed = match tokio::time::timeout(
             ASR_FEED_TIMEOUT,
             shared.strategy.on_audio_frame(&client_id, &frame),
         )
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::warn!(%err, "on_audio_frame 失败，帧已留在缓冲里"),
-            Err(_) => tracing::warn!(
+            Ok(Ok(())) => false,
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "on_audio_frame 失败，帧已留在缓冲里");
+                true
+            }
+            Err(_) => {
+                tracing::warn!(
+                    %client_id,
+                    timeout_ms = ASR_FEED_TIMEOUT.as_millis() as u64,
+                    "喂入 ASR 超时（下游积压），本帧丢弃"
+                );
+                true
+            }
+        };
+
+        // ASR 管道死了（连接超时/被关闭）时不要干等 30 秒录音上限：
+        // 连续失败超过容忍时长就提前收口，进入「生成回复」流程，
+        // 由策略侧走批处理兜底；兜底也失败时会发 goodbye 让设备回到待命。
+        let mut end_early = false;
+        {
+            let mut tables = shared.tables.lock().await;
+            if let Some(session) = tables.sessions.get_mut(&client_id) {
+                if feed_failed {
+                    let started = *session.asr_feed_failed_at.get_or_insert_with(Instant::now);
+                    if session.state == SessionState::Recording
+                        && started.elapsed() > ASR_FEED_FAIL_LIMIT
+                    {
+                        end_early = true;
+                    }
+                } else {
+                    session.asr_feed_failed_at = None;
+                }
+            }
+        }
+        if end_early {
+            tracing::warn!(
                 %client_id,
-                timeout_ms = ASR_FEED_TIMEOUT.as_millis() as u64,
-                "喂入 ASR 超时（下游积压），本帧丢弃"
-            ),
+                limit_ms = ASR_FEED_FAIL_LIMIT.as_millis() as u64,
+                "ASR 连续失败，提前结束本轮录音（不等 30 秒录音上限）"
+            );
+            start_playback(shared, &client_id).await;
         }
     }
 }
@@ -1323,6 +1371,37 @@ async fn close_idle_conversation(shared: &Shared, client_id: &str) {
     }
 }
 
+/// 生成失败时的收口：发 goodbye + 注销 UDP，避免会话永远卡在 Playing。
+///
+/// 典型场景：流式 ASR 连接超时、批处理 ASR 兜底也超时、Agent 启动失败 ——
+/// 这一轮没有任何 TTS 音频，设备侧仍在 Listening 等回复。不发 goodbye 的话：
+/// - 服务端 `state = Playing`，而 idle-close 只处理 Ready，永远不会收口；
+/// - 设备会一直推麦克风音频，表现为「卡在聆听中没反应」。
+async fn close_failed_round(shared: &Shared, job: &PlaybackJob) {
+    let session_id = {
+        let tables = shared.tables.lock().await;
+        let Some(session) = tables.sessions.get(&job.client_id) else {
+            return;
+        };
+        // 期间可能已经被 listen start / 新 hello 接手，不能再往下一轮发 goodbye。
+        if session.playback_gen != job.generation || session.state != SessionState::Playing {
+            return;
+        }
+        session.protocol_session_id.clone()
+    };
+    if session_id.is_empty() {
+        return;
+    }
+    let body = format!("{{\"type\":\"goodbye\",\"session_id\":\"{session_id}\"}}");
+    if publish_body(shared, &job.client_id, &body).await {
+        tracing::warn!(
+            client_id = %job.client_id,
+            "本轮生成失败（ASR/Agent 无输出），已发送 goodbye 让设备回到待命"
+        );
+        release_udp(shared, &job.client_id, "reply-failed").await;
+    }
+}
+
 async fn start_playback(shared: &Arc<Shared>, client_id: &str) {
     let job = {
         let mut tables = shared.tables.lock().await;
@@ -1364,10 +1443,21 @@ async fn run_playback(shared: Arc<Shared>, job: PlaybackJob) {
     // 正常跑完的一轮，尾帧等待在 drive_playback 里做 —— 埋点要记录实际等待时长，
     // 等待发生在函数外就量不到。返回 true 表示等待完整走完，没有被取消。
     let tail_wait_done = drive_playback(&shared, &job, &mut tts_started).await;
+    // 生成阶段就失败了：一帧 TTS 都没发出去，设备侧从未收到 TTS Start。
+    // 这时不能发 tts stop（没有 start 可配），更不能直接 return —— 那会把
+    // 会话永远留在 Playing：prune_sessions 的 idle-close 只处理 Ready，
+    // 设备则会一直停在 Listening 推麦克风音频，用户看到的就是「卡在聆听中」。
+    // 处理：主动 goodbye + 注销 UDP，让设备回到待命，用户重新唤醒即可。
+    if !tts_started {
+        if !cancelled(&job.cancel, &shared) {
+            close_failed_round(&shared, &job).await;
+        }
+        return;
+    }
     // 打断、listen start、关停都会把 cancel 置上。这时不能再发 stop：
     // listen start 已经把会话推进 Recording，迟到的 stop 会让设备退出聆听。
     // Playing 上的 abort 由 handle_abort 自己发 stop。
-    if !tts_started || cancelled(&job.cancel, &shared) {
+    if cancelled(&job.cancel, &shared) {
         return;
     }
     if !tail_wait_done {
@@ -1459,6 +1549,10 @@ async fn drive_playback_inner(
     let strategy_session_key = job.client_id.clone();
     let log_session_id = job.protocol_session_id.clone();
     let buffer = job.buffer.clone();
+    // 生成任务是否失败：任务和消费循环并发，靠这个标志把「ASR/Agent 失败」
+    // 和「正常但没有内容」区分开 —— 前者要主动 goodbye，不能发 tts start。
+    let generation_failed = Arc::new(AtomicBool::new(false));
+    let generation_failed_flag = Arc::clone(&generation_failed);
     // 任务单里的 is_streaming_capable 对应 trait 的 supports_streaming_playback。
     // 默认的 generate_response_stream 会再调用 generate_response，两条路径都从这里进。
     let generate = tokio::spawn(async move {
@@ -1466,6 +1560,7 @@ async fn drive_playback_inner(
             .generate_response_stream(buffer, &strategy_session_key, frame_tx)
             .await
         {
+            generation_failed_flag.store(true, Ordering::SeqCst);
             tracing::warn!(%err, %log_session_id, "生成语音回复失败");
         }
     });
@@ -1493,6 +1588,13 @@ async fn drive_playback_inner(
         }
     }
     if cancelled(&job.cancel, shared) {
+        return false;
+    }
+
+    // 生成阶段就失败且没有任何可播内容：不发 tts start（没有内容可配 start），
+    // 直接返回 false，交给 run_playback 发 goodbye 收口。否则设备会收到
+    // start + stop 后自动重听，而 ASR 仍不可用，形成「一直聆听没反应」的循环。
+    if generation_failed.load(Ordering::SeqCst) && prebuffer.is_empty() && sentences.is_empty() {
         return false;
     }
 
@@ -2162,6 +2264,10 @@ mod tests {
         audio_frames: Vec<AudioFrame>,
         device_identifications: Vec<(String, String)>,
         generate_calls: usize,
+        /// 模拟生成阶段失败（ASR 超时/不可用）：generate_response 直接返回 Err。
+        fail_generation: bool,
+        /// 模拟流式 ASR 管道已关闭：on_audio_frame 直接返回 Err。
+        fail_audio_frames: bool,
         playback: Vec<AudioFrame>,
     }
 
@@ -2178,6 +2284,8 @@ mod tests {
                     audio_frames: Vec::new(),
                     device_identifications: Vec::new(),
                     generate_calls: 0,
+                    fail_generation: false,
+                    fail_audio_frames: false,
                     playback,
                 }),
             }
@@ -2210,6 +2318,9 @@ mod tests {
         ) -> Result<Vec<AudioFrame>, String> {
             let mut inner = self.lock();
             inner.generate_calls += 1;
+            if inner.fail_generation {
+                return Err("mock: ASR 超时，无识别文本".to_owned());
+            }
             Ok(inner.playback.clone())
         }
 
@@ -2227,7 +2338,11 @@ mod tests {
             _session_key: &str,
             frame: &AudioFrame,
         ) -> Result<(), String> {
-            self.lock().audio_frames.push(frame.clone());
+            let mut inner = self.lock();
+            if inner.fail_audio_frames {
+                return Err("ASR 管道已关闭".to_owned());
+            }
+            inner.audio_frames.push(frame.clone());
             Ok(())
         }
 
@@ -2611,6 +2726,103 @@ mod tests {
             env.mock.lock().device_identifications,
             vec![(CLIENT_ID.to_owned(), "84:c7:bb:59:93:64".to_owned())]
         );
+        env.shutdown().await;
+    }
+
+    /// 生成阶段失败（ASR 超时/不可用）时，必须主动给设备发 goodbye。
+    ///
+    /// 历史 bug：run_playback 在 `tts_started == false` 时直接 return，
+    /// 既不 finish_ready 也不 goodbye —— 会话永远停在 Playing，而 idle-close
+    /// 只处理 Ready，设备就卡在「聆听中」不停推麦克风音频。
+    #[tokio::test]
+    async fn generation_failure_sends_goodbye_and_returns_to_idle() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.mock.lock().fail_generation = true;
+        let hello = env.hello().await;
+        let crypto = crypto_from_hello(&hello);
+
+        // 进入录音 → listen stop 触发回放（策略在生成阶段直接返回 Err）
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while env.mock.lock().recording_starts.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listen start 没有生效"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 1_000, 1, b"up").await;
+        wait_frames(&env.mock, 1).await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+
+        // 应收到 goodbye（带上本轮协议 session_id），且 UDP 会话被注销。
+        let goodbye = env.link.wait_type("goodbye", Duration::from_secs(3)).await;
+        assert_eq!(
+            goodbye["session_id"].as_str(),
+            hello["session_id"].as_str(),
+            "goodbye 必须带本轮 session_id，否则设备不会关闭音频通道"
+        );
+
+        // 收口后回到 AwaitingHello：设备再发 listen start 不应重新进入录音。
+        let before = env.mock.lock().recording_starts.len();
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            env.mock.lock().recording_starts.len(),
+            before,
+            "失败收口后必须先重新 hello 才能录音"
+        );
+
+        // 设备重新 hello 后应能继续正常对话。
+        let again = env.hello().await;
+        assert_eq!(again["type"], "hello");
+        env.shutdown().await;
+    }
+
+    /// ASR 管道死了（on_audio_frame 持续报错）时不能干等 30 秒录音上限：
+    /// 连续失败超过容忍时长就提前生成回复；生成也失败时发 goodbye 收口。
+    #[tokio::test]
+    async fn asr_feed_failure_ends_recording_early() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.mock.lock().fail_audio_frames = true;
+        env.mock.lock().fail_generation = true;
+        let hello = env.hello().await;
+        let crypto = crypto_from_hello(&hello);
+
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while env.mock.lock().recording_starts.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listen start 没有生效"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 持续推帧：没有看门狗的话要等 30 秒 RECORDING_LIMIT。
+        let start = tokio::time::Instant::now();
+        let mut seq = 0u32;
+        while env.mock.lock().generate_calls == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(8),
+                "ASR 连续失败后没有提前收口（仍是 30 秒录音上限行为）"
+            );
+            seq += 1;
+            send_uplink(&env, &crypto, 1_000 + seq * 60, seq, b"up").await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+
+        // 生成失败后同样要 goodbye，不能让设备卡在聆听。
+        let goodbye = env.link.wait_type("goodbye", Duration::from_secs(3)).await;
+        assert_eq!(goodbye["session_id"].as_str(), hello["session_id"].as_str());
         env.shutdown().await;
     }
 
