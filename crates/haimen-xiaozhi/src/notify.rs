@@ -246,7 +246,6 @@ pub async fn handle_say(headers: HeaderMap, Json(req): Json<SayRequest>) -> Resp
         tracing::warn!("[say 诊断] say_hub() 为 None —— install_say_hub 没生效");
         return device_offline();
     };
-
     let target = match resolve_device(hub.online_devices().await, req.device.as_deref()) {
         Ok(info) => info,
         Err(err) => return err.into_response(),

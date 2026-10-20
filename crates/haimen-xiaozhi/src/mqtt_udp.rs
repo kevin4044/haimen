@@ -440,7 +440,43 @@ impl SayDeviceHub for SayHubImpl {
     }
 
     async fn publish_json(&self, client_id: &str, body: &str) -> bool {
-        publish_body(&self.shared, client_id, body).await
+        // ★ 不能复用 publish_body：它要求「会话」存在（tables.sessions），
+        // 而会话只在设备发 hello 时创建、goodbye 时删除。
+        // notify 的使用场景恰恰是设备「待命（Idle）」——那时没有会话。
+        // 用 publish_body 会导致设备明明在线却恒返回 device_offline。
+        //
+        // 所以这里直接按 client_id 推导 MAC 拼下行主题再下发，不依赖会话。
+        // device_id 的格式与 ConversationSession::device_id 一致（colon_mac）。
+        let topic = self
+            .shared
+            .cfg
+            .downlink_topic_template
+            .replace("{mac}", &mac_from_client_id(client_id));
+        let published = tokio::time::timeout(
+            MQTT_WRITE_TIMEOUT,
+            self.shared.broker.publish_to(BrokerOutgoing {
+                client_id: client_id.to_owned(),
+                topic,
+                payload: body.as_bytes().to_vec(),
+            }),
+        )
+        .await;
+        match published {
+            Ok(Ok(ok)) => {
+                if !ok {
+                    tracing::warn!(%client_id, "notify 下发失败：设备不在 MQTT 注册表");
+                }
+                ok
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(%client_id, %err, "notify 下发 MQTT 失败");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(%client_id, "notify 下发超时（写队列堵塞）");
+                false
+            }
+        }
     }
 }
 
