@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 
+use crate::devices::{device_directory, device_id_from_client_id};
 use crate::mqtt_broker::{
     BrokerIncoming, BrokerOutgoing, MqttBrokerConfig, MqttBrokerError, MqttBrokerHandle,
 };
@@ -204,7 +205,7 @@ impl DeviceSession {
     fn new(client_id: &str) -> Self {
         Self {
             client_id: client_id.to_owned(),
-            device_id: mac_from_client_id(client_id),
+            device_id: device_id_from_client_id(client_id),
             protocol_session_id: String::new(),
             state: SessionState::AwaitingHello,
             udp_session_id: None,
@@ -396,10 +397,15 @@ impl MqttUdpTransport {
     }
 }
 
-/// 一台 MQTT 在线设备的身份。`device_id` 是冒号 MAC（`mac_from_client_id` 归一化）。
+/// 一台 MQTT 在线设备的身份。`device_id` 是冒号 MAC（`device_id_from_client_id` 归一化）。
+///
+/// `name` / `room` 来自 `[xiaozhi.devices]` 设备目录；未配置时 `name` 回退为 MAC、
+/// `room` 为空串 —— 这样 notify 在没配置设备表的老部署上行为不变。
 pub struct SayDeviceInfo {
     pub client_id: String,
     pub device_id: String,
+    pub name: String,
+    pub room: String,
 }
 
 /// notify 通路看传输层的最小接口。
@@ -424,6 +430,7 @@ struct SayHubImpl {
 #[async_trait::async_trait]
 impl SayDeviceHub for SayHubImpl {
     async fn online_devices(&self) -> Vec<SayDeviceInfo> {
+        let directory = device_directory();
         self.shared
             .broker
             .connected_clients()
@@ -431,9 +438,21 @@ impl SayDeviceHub for SayHubImpl {
             .into_iter()
             // 控制面客户端（haimen-admin）不是设备，不能被选为 notify 目标
             .filter(|client_id| client_id != crate::mqtt_broker::ADMIN_CLIENT_ID)
-            .map(|client_id| SayDeviceInfo {
-                device_id: mac_from_client_id(&client_id),
-                client_id,
+            .map(|client_id| {
+                let device_id = device_id_from_client_id(&client_id);
+                let configured = directory
+                    .as_ref()
+                    .and_then(|dir| dir.for_client_id(&client_id).cloned());
+                let (name, room) = match configured {
+                    Some(device) => (device.display_name().to_string(), device.room),
+                    None => (device_id.clone(), String::new()),
+                };
+                SayDeviceInfo {
+                    client_id,
+                    device_id,
+                    name,
+                    room,
+                }
             })
             .collect()
     }
@@ -459,12 +478,12 @@ impl SayDeviceHub for SayHubImpl {
         // 用 publish_body 会导致设备明明在线却恒返回 device_offline。
         //
         // 所以这里直接按 client_id 推导 MAC 拼下行主题再下发，不依赖会话。
-        // device_id 的格式与 ConversationSession::device_id 一致（colon_mac）。
+        // device_id 的格式与 ConversationSession::device_id 一致（冒号 MAC）。
         let topic = self
             .shared
             .cfg
             .downlink_topic_template
-            .replace("{mac}", &mac_from_client_id(client_id));
+            .replace("{mac}", &device_id_from_client_id(client_id));
         let published = tokio::time::timeout(
             MQTT_WRITE_TIMEOUT,
             self.shared.broker.publish_to(BrokerOutgoing {
@@ -972,6 +991,20 @@ async fn handle_hello(shared: &Arc<Shared>, client_id: &str, value: serde_json::
             session.listening_since = None;
             session.last_tts_stop_at = None;
         }
+    }
+
+    // 把「连接会话」映射到物理设备身份：策略据此查设备目录里的房间/名字，
+    // 在把用户文本交给 LLM 之前注入房间上下文。必须在 hello 成功后、
+    // 首句音频进入策略之前完成。
+    let device_id = {
+        let tables = shared.tables.lock().await;
+        tables
+            .sessions
+            .get(client_id)
+            .map(|session| session.device_id.clone())
+    };
+    if let Some(device_id) = device_id {
+        shared.strategy.on_device_identified(client_id, &device_id);
     }
 
     // hello 下发成功 = 设备确实开始了一次新对话，这时才通知策略清掉上一轮的
@@ -1932,39 +1965,6 @@ async fn wait_tail_playback(shared: &Shared, cancel: &mut watch::Receiver<bool>)
     }
 }
 
-fn mac_from_client_id(client_id: &str) -> String {
-    let mut parts = client_id.split("@@@").filter(|part| !part.is_empty());
-    let _group = parts.next();
-    let mac = match parts.next() {
-        Some(mac) => mac,
-        None => client_id,
-    };
-    colon_mac(mac)
-}
-
-/// 统一成冒号小写形式。notify 的设备寻址按这个形式比较，
-/// 所以它是 `pub(crate)`（notify.rs 要用同一套归一化）。
-pub(crate) fn colon_mac(raw: &str) -> String {
-    let mac = raw.trim().to_ascii_lowercase();
-    if mac.contains(':') {
-        return mac;
-    }
-    if mac.contains('_') {
-        return mac.replace('_', ":");
-    }
-    if mac.len() == 12 && mac.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        let mut out = String::with_capacity(17);
-        for (idx, chunk) in mac.as_bytes().chunks(2).enumerate() {
-            if idx > 0 {
-                out.push(':');
-            }
-            out.push_str(&String::from_utf8_lossy(chunk));
-        }
-        return out;
-    }
-    mac
-}
-
 fn nonce_template(session_id: u32) -> [u8; 16] {
     let mut nonce = [0u8; 16];
     // 设备靠首字节 0x01 识别这是音频通道。session id 放在 [4..8)，大端。
@@ -2160,6 +2160,7 @@ mod tests {
         conversation_starts: Vec<String>,
         recording_starts: Vec<String>,
         audio_frames: Vec<AudioFrame>,
+        device_identifications: Vec<(String, String)>,
         generate_calls: usize,
         playback: Vec<AudioFrame>,
     }
@@ -2175,6 +2176,7 @@ mod tests {
                     conversation_starts: Vec::new(),
                     recording_starts: Vec::new(),
                     audio_frames: Vec::new(),
+                    device_identifications: Vec::new(),
                     generate_calls: 0,
                     playback,
                 }),
@@ -2232,6 +2234,12 @@ mod tests {
         async fn on_conversation_start(&self, session_key: &str) -> Result<(), String> {
             self.lock().conversation_starts.push(session_key.to_owned());
             Ok(())
+        }
+
+        fn on_device_identified(&self, session_key: &str, device_id: &str) {
+            self.lock()
+                .device_identifications
+                .push((session_key.to_owned(), device_id.to_owned()));
         }
     }
 
@@ -2578,6 +2586,30 @@ mod tests {
         assert_eq!(
             env.mock.lock().conversation_starts,
             vec![CLIENT_ID.to_owned()]
+        );
+        env.shutdown().await;
+    }
+
+    /// hello 成功下发之后必须把物理设备身份告诉策略，策略据此注入房间上下文。
+    /// 身份用 client_id + 归一化 MAC 传，保证 WS/MQTT 两条路径在策略侧一致。
+    #[tokio::test]
+    async fn hello_reports_device_identity_to_strategy() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.hello().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().device_identifications.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "on_device_identified 没有被调用"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            env.mock.lock().device_identifications,
+            vec![(CLIENT_ID.to_owned(), "84:c7:bb:59:93:64".to_owned())]
         );
         env.shutdown().await;
     }

@@ -226,3 +226,33 @@ export interface AgentLogsData {
   enabled: boolean;
   records: AgentLogRecord[];
 }
+
+// ── 小智设备 ──
+
+/** 一台已配置的小智设备（对应后端 `[[xiaozhi.devices]]`，device_id 已归一化 MAC） */
+export interface XiaozhiConfiguredDevice {
+  device_id: string;
+  name: string;
+  room: string;
+  configured: boolean;
+}
+
+/** 当前在线的小智设备（来自 MQTT/UDP 传输层实时状态） */
+export interface XiaozhiOnlineDevice {
+  client_id: string;
+  device_id: string;
+  name: string;
+  room: string;
+  online: boolean;
+  state: XiaozhiDeviceState;
+  configured: boolean;
+}
+
+/** 设备忙闲状态：idle = 可下发通知，listening/playing = 正在对话 */
+export type XiaozhiDeviceState = 'idle' | 'listening' | 'playing';
+
+/** `GET /api/v1/settings/xiaozhi/devices` 的 data */
+export interface XiaozhiDevicesData {
+  devices: XiaozhiConfiguredDevice[];
+  online: XiaozhiOnlineDevice[];
+}

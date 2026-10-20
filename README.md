@@ -74,6 +74,45 @@ curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/say \
 
 Home Assistant 集成见 [HA 集成指南](specs/notify-channel/HA-集成指南.md)，示例配置：[rest_command](specs/notify-channel/ha/xiaozhi_notify.yaml) 与 [门铃自动化](specs/notify-channel/ha/automation-doorbell.yaml)。
 
+### 多设备与房间
+
+家里有多台小智时，在配置里登记「设备身份 → 名字/房间」（`~/.haimen/settings.toml`，或数据目录里的 `settings.toml`）：
+
+```toml
+[[xiaozhi.devices]]
+device_id = "84:c7:bb:59:93:64"   # MAC 任意写法（冒号/下划线/12 位连写）或 MQTT client_id
+name = "客厅小智"                   # 可选，人读的名字；缺省回退为 MAC
+room = "客厅"                       # 房间名；空 = 未分配
+```
+
+| 能力 | 行为 |
+| --- | --- |
+| 房间上下文注入 | 该设备对话时，送给 LLM 的用户输入前会加一行 `【设备上下文】当前设备「客厅小智」位于「客厅」，用户就在这个房间和你说话；回答时可以结合这个房间的语境。`（每轮注入）；设备屏幕 ASR 文本与 agent 日志仍是原始识别文本 |
+| 定向通知 | `POST /api/v1/xiaozhi/say` 的 `device` 可填 MAC / client_id / 配置里的 `name`；新增 `room`，只发给该房间在线且唯一的设备（多台 → `409 multiple_devices`，不广播） |
+| 设备清单 | `GET /api/v1/xiaozhi/devices` 返回配置 + 在线 + 忙闲状态（鉴权同 `say_token`） |
+
+- 未配置设备或 `room` 为空 → 不注入，行为与旧版本一致；旧 `settings.toml` 零迁移。
+- `say` 不指定 `device`/`room` 时，恰好一台在线才下发，多台返回 `409`（不广播）；`device` 与 `room` 同时给时以 `device` 为准。
+- 房间上下文在 MQTT 与 WebSocket 两条传输都生效；`say`/设备在线状态只反映 MQTT 通路。
+- Web 控制台顶部「小智设备」页可维护设备与房间，保存后立即生效。
+
+```bash
+# 按房间播报（房间名来自配置里的 room）
+curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/say \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"开饭了","room":"客厅"}'
+
+# 按设备名播报（也可以填 MAC / client_id）
+curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/say \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"晚安","device":"客厅小智"}'
+
+# 看每台设备的房间与在线/忙闲状态
+curl -s http://127.0.0.1:9527/api/v1/xiaozhi/devices | python3 -m json.tool
+```
+
+详细设计、API 契约与限制见 [multi-device-room/02-design.md](specs/multi-device-room/02-design.md)，验收脚本：[04-acceptance.sh](specs/multi-device-room/04-acceptance.sh)。
+
 ### 3. 语音链路调优
 
 针对真机上的延迟、卡顿、识别率问题，本仓库对语音链路做了这些调整：
@@ -142,6 +181,7 @@ haimen serve --xiaozhi-llm-provider openai    # 小智语音路径（流式）
 | [mqtt-udp/实现方案.md](specs/mqtt-udp/实现方案.md) | 为什么做 MQTT+UDP、总体方案与取舍 |
 | [mqtt-udp/协议规格.md](specs/mqtt-udp/协议规格.md) | MQTT/UDP 协议逐字段规格 |
 | [notify-channel/HA-集成指南.md](specs/notify-channel/HA-集成指南.md) | Home Assistant 端到端集成 |
+| [multi-device-room/02-design.md](specs/multi-device-room/02-design.md) | 多设备/房间语义、房间上下文注入与定向通知 |
 | [openai-provider/02-design.md](specs/openai-provider/02-design.md) | OpenAI provider 设计与验收 |
 | [audio-pacing/02-design.md](specs/audio-pacing/02-design.md) | 下行音频尾帧收口 |
 | [asr-vad-fix/02-design.md](specs/asr-vad-fix/02-design.md) | ASR 空结果与 VAD 日志修复 |

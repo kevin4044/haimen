@@ -136,6 +136,10 @@ fn resolve_work_dir_from_config(config: &crate::config::settings::AppConfig) -> 
 pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
     let config = load_settings().ok().flatten().unwrap_or_default();
 
+    // 安装设备目录（设备身份 → 名字/房间）：策略注入房间上下文、notify 按
+    // 房间/设备名寻址都依赖它。目录为空时行为与旧版本一致。
+    haimen_xiaozhi::devices::install_devices_from_config(&config.xiaozhi.devices);
+
     // 清理过期 Agent 调用日志
     let removed = crate::agent_log::cleanup(config.agent_log.retention_days);
     if removed > 0 {

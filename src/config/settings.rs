@@ -1812,6 +1812,47 @@ app_key = "old-key"
     }
 
     #[test]
+    fn test_xiaozhi_devices_parse_with_aliases() {
+        // 多设备分房间配置：device_id/mac/client_id 三种写法等价。
+        let toml = r#"
+[xiaozhi]
+protocol = "mqtt"
+
+[[xiaozhi.devices]]
+device_id = "84:c7:bb:59:93:64"
+name = "客厅小智"
+room = "客厅"
+
+[[xiaozhi.devices]]
+mac = "aa_bb_cc_dd_ee_ff"
+room = "卧室"
+
+[[xiaozhi.devices]]
+client_id = "GID_haimen@@@11_22_33_44_55_66@@@11_22_33_44_55_66"
+name = "书房小智"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.xiaozhi.devices.len(), 3);
+        assert_eq!(cfg.xiaozhi.devices[0].device_id, "84:c7:bb:59:93:64");
+        assert_eq!(cfg.xiaozhi.devices[0].room, "客厅");
+        assert_eq!(cfg.xiaozhi.devices[1].device_id, "aa_bb_cc_dd_ee_ff");
+        assert_eq!(cfg.xiaozhi.devices[1].name, "");
+        assert_eq!(
+            cfg.xiaozhi.devices[2].device_id,
+            "GID_haimen@@@11_22_33_44_55_66@@@11_22_33_44_55_66"
+        );
+    }
+
+    #[test]
+    fn test_xiaozhi_devices_default_to_empty() {
+        let cfg = XiaozhiConfig::default();
+        assert!(cfg.devices.is_empty(), "默认不应有设备配置");
+        // 旧 settings.toml 没有 [[xiaozhi.devices]] 时也要能加载。
+        let cfg: AppConfig = toml::from_str("[xiaozhi]\nprotocol = \"mqtt\"\n").unwrap();
+        assert!(cfg.xiaozhi.devices.is_empty());
+    }
+
+    #[test]
     fn test_xiaozhi_protocol_rejects_unknown_value() {
         // 非法 protocol 反序列化失败，不静默退回 websocket。
         let err = toml::from_str::<XiaozhiConfig>("protocol = \"foo\"");

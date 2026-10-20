@@ -4,3 +4,4 @@ pub mod connectors;
 pub mod system;
 pub mod voice_settings;
 pub mod webhook;
+pub mod xiaozhi_devices;

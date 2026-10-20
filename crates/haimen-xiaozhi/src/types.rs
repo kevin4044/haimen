@@ -226,6 +226,26 @@ pub enum XiaozhiProtocol {
     Mqtt,
 }
 
+/// 一台小智设备的静态配置：把设备身份绑定到「名字 + 房间」。
+///
+/// 传输层本来就能按 `client_id` 区分多台设备；这张表补的是「人类语义」：
+/// - `room` 会作为上下文注入该设备对话的 LLM 输入；
+/// - notify 接口可以按 `name` 或 `room` 选目标设备。
+///
+/// `device_id` 支持 MAC（`84:c7:bb:59:93:64` / `84_c7_bb_59_93_64` /
+/// `84c7bb599364`）或 MQTT `client_id`。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct XiaozhiDeviceConfig {
+    #[serde(alias = "mac", alias = "client_id")]
+    pub device_id: String,
+    /// 便于人识别的名字；空串时回退为归一化 MAC。
+    #[serde(default)]
+    pub name: String,
+    /// 所在房间（如「客厅」）；空串 = 未分配，不注入房间上下文。
+    #[serde(default)]
+    pub room: String,
+}
+
 /// 小智传输配置。`protocol = "mqtt"` 时 OTA 才下发 `mqtt` 段。
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct XiaozhiConfig {
@@ -273,6 +293,16 @@ pub struct XiaozhiConfig {
     /// 非空时请求必须带 `Authorization: Bearer <say_token>`，不匹配返回 401。
     #[serde(default)]
     pub say_token: String,
+    /// 多设备登记表：设备身份 → 名字/房间。空表 = 不区分设备语义。
+    ///
+    /// ```toml
+    /// [[xiaozhi.devices]]
+    /// device_id = "84:c7:bb:59:93:64"
+    /// name = "客厅小智"
+    /// room = "客厅"
+    /// ```
+    #[serde(default)]
+    pub devices: Vec<XiaozhiDeviceConfig>,
 }
 
 impl Default for XiaozhiConfig {
@@ -285,6 +315,7 @@ impl Default for XiaozhiConfig {
             ota_token: String::new(),
             ota_trusted_proxies: Vec::new(),
             say_token: String::new(),
+            devices: Vec::new(),
         }
     }
 }

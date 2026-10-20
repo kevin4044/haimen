@@ -83,6 +83,72 @@ rest_command:
 ```
 `device` 传 MAC（`84:c7:bb:59:93:64`）或 haimen 的 client_id 都行。
 
+### 按房间/按设备名通知
+
+在 haimen 的 `[xiaozhi.devices]` 里给设备配好 `name` / `room`（Web 控制台顶部「小智设备」页也能改，保存后立即生效）：
+
+```toml
+[[xiaozhi.devices]]
+device_id = "84:c7:bb:59:93:64"
+name = "客厅小智"
+room = "客厅"
+```
+
+HA 侧加两个 `rest_command`：
+
+```yaml
+  xiaozhi_say_to_room:
+    url: "http://192.168.50.33:9527/api/v1/xiaozhi/say"
+    method: POST
+    content_type: "application/json"
+    payload: '{"text": {{ message | to_json }}, "room": {{ room | to_json }}}'
+    timeout: 20
+
+  xiaozhi_say_to_device:
+    url: "http://192.168.50.33:9527/api/v1/xiaozhi/say"
+    method: POST
+    content_type: "application/json"
+    payload: '{"text": {{ message | to_json }}, "device": {{ device | to_json }}}'
+    timeout: 20
+```
+
+- `device` 可以传 MAC、client_id，或配置里的 `name`（如「客厅小智」）。
+- `room` 传配置里的房间名（如「客厅」）。
+- 两个字段同时给时以 `device` 为准。
+
+门铃只响客厅（其他房间的小智不播）：
+
+```yaml
+alias: 门铃只响客厅小智
+trigger:
+  - platform: state
+    entity_id: binary_sensor.doorbell          # ← 换成你的门铃实体
+    to: "on"
+action:
+  - service: rest_command.xiaozhi_say_to_room
+    data:
+      message: "门铃响了喔，有人在门口等。"
+      room: "客厅"
+mode: single
+```
+
+**注意**：房间语义是「不广播」的 —— `room` 只在该房间**在线且唯一**的设备上播。
+房间内多台在线设备会返回 409，不会猜一台。
+
+排查 404 / 409：
+
+| 返回 | 含义 | 排查方式 |
+|---|---|---|
+| `404 device_offline`（响应体带 `"room":"厨房"`） | 该房间没有在线设备 | 房间名写错？设备离线？先看下面设备清单的 `room` / `online` |
+| `409 multiple_devices` | 房间内有多台在线设备 | 响应体 `devices` 里挑一台，用 `xiaozhi_say_to_device` 按 MAC/client_id/name 重发 |
+| `409 device_busy` | 目标设备正在聆听/播放中 | 同前文「处理设备正忙」：HA 侧重试或丢弃 |
+
+设备清单 / 房间名核对（`say_token` 非空时加 `-H "Authorization: Bearer <token>"`）：
+
+```bash
+curl -s http://192.168.50.33:9527/api/v1/xiaozhi/devices | python3 -m json.tool
+```
+
 ---
 
 ## 第二步：在开发者工具里手测

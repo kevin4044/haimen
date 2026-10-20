@@ -66,6 +66,18 @@ pub trait ResponseStrategy: Send + Sync {
         Ok(())
     }
 
+    /// 传输层识别出设备真实身份后调用（每个连接周期一次）。
+    ///
+    /// 用途：把「策略层会话键」映射到「物理设备」，让策略能查到设备目录里的
+    /// 名字/房间等静态信息。MQTT 路径在 hello 成功后用 client_id + 归一化 MAC
+    /// 调用；WebSocket 路径在 HELLO 握手后用会话号 + `Device-Id` 头调用。
+    ///
+    /// `session_key` 与其它策略钩子一致（MQTT=client_id，WS=会话号）；
+    /// `device_id` 是设备归一化 MAC（如 `84:c7:bb:59:93:64`）。
+    ///
+    /// 默认实现为 no-op，Echo 等不关心设备身份的现有策略不受影响。
+    fn on_device_identified(&self, _session_key: &str, _device_id: &str) {}
+
     /// 返回 HELLO 握手时应告知设备的音频参数
     ///
     /// 默认实现回传客户端发送的参数（Echo 模式适用）。

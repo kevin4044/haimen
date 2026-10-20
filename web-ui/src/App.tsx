@@ -2,9 +2,10 @@ import { useState } from 'react';
 import AgentLogs from '@/pages/AgentLogs';
 import AgentSettings from '@/pages/Settings/AgentSettings';
 import ConnectorSettings from '@/pages/Settings/ConnectorSettings';
+import DeviceSettings from '@/pages/Settings/DeviceSettings';
 import VoiceSettings from '@/pages/Settings/VoiceSettings';
 
-type Page = 'voice' | 'agent' | 'connectors' | 'logs';
+type Page = 'voice' | 'agent' | 'connectors' | 'devices' | 'logs';
 
 export default function App() {
   const [page, setPage] = useState<Page>('voice');
@@ -43,6 +44,15 @@ export default function App() {
           </button>
           <button
             type="button"
+            onClick={() => setPage('devices')}
+            className={`px-3 py-1 rounded text-sm cursor-pointer ${
+              page === 'devices' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'
+            }`}
+          >
+            小智设备
+          </button>
+          <button
+            type="button"
             onClick={() => setPage('logs')}
             className={`px-3 py-1 rounded text-sm cursor-pointer ${
               page === 'logs' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'
@@ -55,6 +65,7 @@ export default function App() {
       {page === 'voice' && <VoiceSettings />}
       {page === 'agent' && <AgentSettings />}
       {page === 'connectors' && <ConnectorSettings />}
+      {page === 'devices' && <DeviceSettings />}
       {page === 'logs' && <AgentLogs />}
     </div>
   );

@@ -260,6 +260,17 @@ pub async fn start(
             axum::routing::get(api::connectors::get_connectors_status),
         );
 
+    // 小智设备表：GET 已配置 + 在线设备，PUT 全量替换并立即生效
+    let xiaozhi_devices_routes = axum::Router::new()
+        .route(
+            "/api/v1/settings/xiaozhi/devices",
+            axum::routing::get(api::xiaozhi_devices::get_xiaozhi_devices),
+        )
+        .route(
+            "/api/v1/settings/xiaozhi/devices",
+            axum::routing::put(api::xiaozhi_devices::update_xiaozhi_devices),
+        );
+
     let app = if let Some(state) = webhook_state {
         let mut r = axum::Router::new()
             .route("/health", axum::routing::get(health_handler))
@@ -276,6 +287,7 @@ pub async fn start(
         r = r.merge(tts_routes);
         r = r.merge(agent_routes);
         r = r.merge(connectors_routes);
+        r = r.merge(xiaozhi_devices_routes);
         r.fallback(r#static::handle)
     } else {
         let mut r = axum::Router::new()
@@ -288,6 +300,7 @@ pub async fn start(
         r = r.merge(tts_routes);
         r = r.merge(agent_routes);
         r = r.merge(connectors_routes);
+        r = r.merge(xiaozhi_devices_routes);
         r.fallback(r#static::handle)
     };
 

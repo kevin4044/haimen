@@ -1,3 +1,4 @@
+pub mod devices;
 pub mod mqtt;
 pub mod mqtt_broker;
 pub mod mqtt_udp;
@@ -11,6 +12,7 @@ pub mod types;
 pub mod udp_audio;
 mod ws;
 
+pub use devices::{DeviceDirectory, install_device_directory, install_devices_from_config};
 pub use mqtt_udp::{MqttUdpConfig, MqttUdpError, MqttUdpTransport};
 pub use notify::SaySynthesizer;
 pub use protocol::*;
@@ -45,6 +47,7 @@ pub fn set_xiaozhi_ota_config(cfg: XiaozhiConfig) {
 /// - `GET  /xiaozhi/ws`            — WebSocket 升级端点
 /// - `GET  /xiaozhi/say/{id}`      — 一次性通知音频（实际 URL 带 `.ogg` 后缀，由 handler 剥掉）
 /// - `POST /api/v1/xiaozhi/say`    — 主动播报：文本 → Ogg Opus → 托管 → 下发 notify
+/// - `GET  /api/v1/xiaozhi/devices` — 设备清单：配置 + 在线/忙闲状态
 ///
 /// # 参数
 ///
@@ -74,5 +77,10 @@ pub fn add_routes<S: Clone + Send + Sync + 'static>(
         .route(
             "/api/v1/xiaozhi/say",
             axum::routing::post(notify::handle_say),
+        )
+        // 多设备运维：配置设备 + 在线状态 + 忙闲状态，供 Web UI / HA 选目标设备。
+        .route(
+            "/api/v1/xiaozhi/devices",
+            axum::routing::get(notify::handle_devices),
         )
 }

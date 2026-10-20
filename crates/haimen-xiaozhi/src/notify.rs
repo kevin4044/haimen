@@ -95,10 +95,15 @@ pub fn set_say_http_port(port: u16) {
 #[derive(Deserialize)]
 pub struct SayRequest {
     text: String,
-    /// 目标设备：MAC（任意写法，内部归一化）或 MQTT client_id。
+    /// 目标设备：MAC（任意写法）、MQTT client_id 或 `[xiaozhi.devices]` 里配置的名字。
     /// 不给 = 恰好一台在线时用那台，多台报 409。
     #[serde(default)]
     device: Option<String>,
+    /// 目标房间：`[xiaozhi.devices]` 里配置的 `room`（如「客厅」）。
+    /// 只匹配该房间内在线的设备；房间内恰好一台时下发，多台报 409。
+    /// `device` 与 `room` 同时给时以 `device` 为准。
+    #[serde(default)]
+    room: Option<String>,
     // 不加 deny_unknown_fields：多传的字段（如 voice）按 serde 默认行为忽略。
 }
 
@@ -164,46 +169,101 @@ fn check_auth(headers: &HeaderMap) -> bool {
 /// 设备解析的失败原因。不直接返回 `Response`：clippy 的 result_large_err
 /// 不允许把 128+ 字节的 Response 塞进 Result。
 enum ResolveError {
-    Offline,
-    Multiple,
+    /// `Option<String>` 是请求里的房间名：带房间时在 404 里回显，方便排查
+    /// 「房间名写错了」还是「设备真的不在线」。
+    Offline(Option<String>),
+    /// 命中多台设备；响应里回传候选列表，调用方可以直接选一台重试。
+    Multiple(Vec<SayDeviceInfo>),
 }
 
 impl ResolveError {
     fn into_response(self) -> Response {
         match self {
-            Self::Offline => device_offline(),
-            Self::Multiple => (
-                StatusCode::CONFLICT,
-                Json(err_body("multiple_devices", serde_json::json!({}))),
-            )
-                .into_response(),
+            Self::Offline(room) => {
+                let extra = match room {
+                    Some(room) => serde_json::json!({ "room": room }),
+                    None => serde_json::json!({}),
+                };
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(err_body("device_offline", extra)),
+                )
+                    .into_response()
+            }
+            Self::Multiple(devices) => {
+                let devices: Vec<serde_json::Value> = devices.iter().map(device_json).collect();
+                (
+                    StatusCode::CONFLICT,
+                    Json(err_body(
+                        "multiple_devices",
+                        serde_json::json!({ "devices": devices }),
+                    )),
+                )
+                    .into_response()
+            }
         }
     }
 }
 
-/// 在在线设备里解析目标：指定了按 client_id 精确匹配或按归一化 MAC 匹配；
-/// 没指定则要求恰好一台在线。
+/// 在线设备的对外 JSON 形态（notify 错误体与设备清单接口共用）。
+fn device_json(info: &SayDeviceInfo) -> serde_json::Value {
+    serde_json::json!({
+        "client_id": info.client_id,
+        "device_id": info.device_id,
+        "name": info.name,
+        "room": info.room,
+    })
+}
+
+/// 空列表 / 唯一 / 多台 三态收口。
+fn pick_one(mut devices: Vec<SayDeviceInfo>) -> Result<SayDeviceInfo, ResolveError> {
+    match devices.len() {
+        0 => Err(ResolveError::Offline(None)),
+        1 => Ok(devices.remove(0)),
+        _ => Err(ResolveError::Multiple(devices)),
+    }
+}
+
+/// 在在线设备里解析目标。
+///
+/// 优先级：`device` > `room` > 唯一在线设备。
+/// - `device`：按 client_id 精确、归一化 MAC、或配置的设备名匹配；
+/// - `room`：只保留配置房间等于该值的设备，再要求恰好一台；
+/// - 都不给：恰好一台在线时用那台，多台报 409。
 fn resolve_device(
     devices: Vec<SayDeviceInfo>,
     device: Option<&str>,
+    room: Option<&str>,
 ) -> Result<SayDeviceInfo, ResolveError> {
-    match device {
-        Some(want) => {
-            let want_mac = crate::mqtt_udp::colon_mac(want);
-            devices
-                .into_iter()
-                .find(|info| info.client_id == want || info.device_id == want_mac)
-                .ok_or(ResolveError::Offline)
-        }
-        None => {
-            let mut iter = devices.into_iter();
-            match (iter.next(), iter.next()) {
-                (None, _) => Err(ResolveError::Offline),
-                (Some(only), None) => Ok(only),
-                (Some(_), Some(_)) => Err(ResolveError::Multiple),
-            }
-        }
+    if let Some(want) = device.map(str::trim).filter(|want| !want.is_empty()) {
+        let want_mac = crate::devices::normalize_mac(want);
+        // 收集而不是 find：设备名可能被两台设备配成一样，此时应报 409
+        // 让调用方改用 MAC，而不是静默挑第一台。
+        let matched: Vec<SayDeviceInfo> = devices
+            .into_iter()
+            .filter(|info| {
+                info.client_id.eq_ignore_ascii_case(want)
+                    || info.device_id.eq_ignore_ascii_case(&want_mac)
+                    || (!info.name.trim().is_empty() && info.name.trim().eq_ignore_ascii_case(want))
+            })
+            .collect();
+        return pick_one(matched);
     }
+
+    if let Some(room) = room.map(str::trim).filter(|room| !room.is_empty()) {
+        let in_room: Vec<SayDeviceInfo> = devices
+            .into_iter()
+            .filter(|info| {
+                !info.room.trim().is_empty() && info.room.trim().eq_ignore_ascii_case(room)
+            })
+            .collect();
+        return match in_room.len() {
+            0 => Err(ResolveError::Offline(Some(room.to_string()))),
+            _ => pick_one(in_room),
+        };
+    }
+
+    pick_one(devices)
 }
 
 /// 从 Ogg Opus 字节里算时长（毫秒）。
@@ -246,7 +306,11 @@ pub async fn handle_say(headers: HeaderMap, Json(req): Json<SayRequest>) -> Resp
         tracing::warn!("[say 诊断] say_hub() 为 None —— install_say_hub 没生效");
         return device_offline();
     };
-    let target = match resolve_device(hub.online_devices().await, req.device.as_deref()) {
+    let target = match resolve_device(
+        hub.online_devices().await,
+        req.device.as_deref(),
+        req.room.as_deref(),
+    ) {
         Ok(info) => info,
         Err(err) => return err.into_response(),
     };
@@ -310,10 +374,103 @@ pub async fn handle_say(headers: HeaderMap, Json(req): Json<SayRequest>) -> Resp
         Json(serde_json::json!({
             "ok": true,
             "device": target.device_id,
+            "client_id": target.client_id,
+            "name": target.name,
+            "room": target.room,
             "mode": "notify",
             "audio_url": audio_url,
             "duration_ms": duration_ms,
         })),
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/xiaozhi/devices`：设备清单（配置 + 在线状态）。
+///
+/// 把三份信息合并成一个视图，供 Web UI / HA 选目标设备：
+/// 1. `[xiaozhi.devices]` 里配置的设备（可能离线）；
+/// 2. MQTT 当前在线的设备（可能还没配置名字/房间）；
+/// 3. 每台在线设备的忙闲状态（notify 只在 idle 生效）。
+///
+/// 响应示例：
+/// ```json
+/// {"ok":true,"devices":[
+///   {"device_id":"84:c7:bb:59:93:64","client_id":"GID_...","name":"客厅小智",
+///    "room":"客厅","online":true,"state":"idle"},
+///   {"device_id":"aa:bb:cc:dd:ee:ff","client_id":null,"name":"卧室小智",
+///    "room":"卧室","online":false,"state":null}
+/// ]}
+/// ```
+pub async fn handle_devices(headers: HeaderMap) -> Response {
+    if !check_auth(&headers) {
+        return unauthorized();
+    }
+
+    let hub = crate::mqtt_udp::say_hub();
+    let online = match hub.as_ref() {
+        Some(hub) => hub.online_devices().await,
+        None => Vec::new(),
+    };
+
+    // 在线设备 → 忙闲状态。hub 为 None（websocket 模式）时全部视为未知（null）。
+    // 名字/房间以设备目录为准（hub 的实现已经补过一层，这里再兜一次：
+    // 假 hub / 第三方 hub 可能不带目录信息，接口仍要能给出配置值）。
+    let directory = crate::devices::device_directory();
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut seen_macs: Vec<String> = Vec::new();
+    for info in &online {
+        seen_macs.push(info.device_id.clone());
+        let configured = directory
+            .as_ref()
+            .and_then(|dir| dir.for_client_id(&info.client_id));
+        let name = configured
+            .map(|device| device.display_name().to_string())
+            .unwrap_or_else(|| info.name.clone());
+        let room = configured
+            .map(|device| device.room.clone())
+            .unwrap_or_else(|| info.room.clone());
+        let state = match hub.as_ref() {
+            Some(hub) => match hub.busy_state(&info.client_id).await {
+                None => Some("idle"),
+                Some(state) => Some(state),
+            },
+            None => None,
+        };
+        entries.push(serde_json::json!({
+            "device_id": info.device_id,
+            "client_id": info.client_id,
+            "name": name,
+            "room": room,
+            "online": true,
+            "state": state,
+        }));
+    }
+
+    // 已配置但当前离线的设备也要列出来，否则 Web UI 会把配置项「弄丢」。
+    if let Some(directory) = directory {
+        for device in directory.entries() {
+            if seen_macs
+                .iter()
+                .any(|mac| mac.eq_ignore_ascii_case(&device.mac))
+            {
+                continue;
+            }
+            entries.push(serde_json::json!({
+                // 统一回显归一化 MAC：在线/离线两种条目形状一致，前端不必
+                // 处理「离线时是 client_id、在线时是 MAC」的差异。
+                "device_id": device.mac,
+                "client_id": null,
+                "name": device.display_name(),
+                "room": device.room,
+                "online": false,
+                "state": null,
+            }));
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "devices": entries })),
     )
         .into_response()
 }
@@ -345,9 +502,21 @@ mod tests {
 
     impl FakeHub {
         fn device(client_id: &str) -> SayDeviceInfo {
+            let mac = crate::devices::normalize_mac(client_id);
             SayDeviceInfo {
                 client_id: client_id.to_string(),
-                device_id: crate::mqtt_udp::colon_mac(client_id),
+                device_id: mac.clone(),
+                name: mac,
+                room: String::new(),
+            }
+        }
+
+        fn named(client_id: &str, name: &str, room: &str) -> SayDeviceInfo {
+            SayDeviceInfo {
+                client_id: client_id.to_string(),
+                device_id: crate::devices::normalize_mac(client_id),
+                name: name.to_string(),
+                room: room.to_string(),
             }
         }
 
@@ -370,6 +539,8 @@ mod tests {
                 .map(|info| SayDeviceInfo {
                     client_id: info.client_id.clone(),
                     device_id: info.device_id.clone(),
+                    name: info.name.clone(),
+                    room: info.room.clone(),
                 })
                 .collect()
         }
@@ -387,6 +558,13 @@ mod tests {
         }
     }
 
+    /// 串行化 notify 测试：say hub / 合成器 / say_token / 设备目录都是进程级
+    /// 全局槽，并行执行会互相覆盖（CI 用 `--test-threads=1`，本地默认并行）。
+    fn test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     struct Server {
         addr: std::net::SocketAddr,
     }
@@ -397,6 +575,10 @@ mod tests {
     /// say 设置槽 —— CI 单线程跑测试，全局槽没有并行竞争。
     async fn boot(hub: Arc<FakeHub>, token: &str) -> Server {
         install_say_hub(hub);
+        // 重置设备目录全局槽：每个用例只装自己需要的设备表，避免互相污染。
+        crate::devices::install_device_directory(Arc::new(
+            crate::devices::DeviceDirectory::default(),
+        ));
         set_say_synthesizer(Arc::new(FakeSynth));
         set_say_token(token.to_string());
         set_say_advertise_ip(Some("127.0.0.1".to_string()));
@@ -468,6 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn busy_device_returns_409_with_state() {
+        let _guard = test_lock().lock().await;
         let hub = FakeHub::one();
         hub.busy
             .lock()
@@ -488,6 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_devices_without_selector_returns_409() {
+        let _guard = test_lock().lock().await;
         let hub = Arc::new(FakeHub {
             devices: Mutex::new(vec![
                 FakeHub::device("aa:bb:cc:dd:ee:01"),
@@ -501,10 +685,148 @@ mod tests {
         let resp = post_say(server.addr, r#"{"text":"你好"}"#).await;
         assert_eq!(resp.status, 409, "{}", resp.body);
         assert!(resp.body.contains("\"multiple_devices\""), "{}", resp.body);
+        // 候选列表要带上 client_id/name/room，调用方可以直接选一台重试。
+        assert!(
+            resp.body.contains("\"client_id\":\"aa:bb:cc:dd:ee:01\""),
+            "{}",
+            resp.body
+        );
+    }
+
+    fn two_room_hub() -> Arc<FakeHub> {
+        Arc::new(FakeHub {
+            devices: Mutex::new(vec![
+                FakeHub::named("aa:bb:cc:dd:ee:01", "客厅小智", "客厅"),
+                FakeHub::named("aa:bb:cc:dd:ee:02", "卧室小智", "卧室"),
+            ]),
+            busy: Mutex::new(HashMap::new()),
+            published: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn device_selector_matches_device_name() {
+        let _guard = test_lock().lock().await;
+        let hub = two_room_hub();
+        let server = boot(hub.clone(), "").await;
+
+        let resp = post_say(server.addr, r#"{"text":"晚安","device":"卧室小智"}"#).await;
+        assert_eq!(resp.status, 200, "按设备名应命中：{}", resp.body);
+        assert!(resp.body.contains("\"room\":\"卧室\""), "{}", resp.body);
+
+        let published = hub.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, "aa:bb:cc:dd:ee:02", "应只下发给卧室设备");
+    }
+
+    #[tokio::test]
+    async fn room_selector_targets_the_only_online_device_in_room() {
+        let _guard = test_lock().lock().await;
+        let hub = two_room_hub();
+        let server = boot(hub.clone(), "").await;
+
+        let resp = post_say(server.addr, r#"{"text":"晚安","room":"客厅"}"#).await;
+        assert_eq!(resp.status, 200, "按房间应命中：{}", resp.body);
+        assert!(
+            resp.body.contains("\"device\":\"aa:bb:cc:dd:ee:01\""),
+            "{}",
+            resp.body
+        );
+
+        let published = hub.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, "aa:bb:cc:dd:ee:01");
+    }
+
+    #[tokio::test]
+    async fn room_selecting_multiple_devices_returns_409_with_candidates() {
+        let _guard = test_lock().lock().await;
+        let hub = Arc::new(FakeHub {
+            devices: Mutex::new(vec![
+                FakeHub::named("aa:bb:cc:dd:ee:01", "客厅一号", "客厅"),
+                FakeHub::named("aa:bb:cc:dd:ee:02", "客厅二号", "客厅"),
+                FakeHub::named("aa:bb:cc:dd:ee:03", "卧室小智", "卧室"),
+            ]),
+            busy: Mutex::new(HashMap::new()),
+            published: Mutex::new(Vec::new()),
+        });
+        let server = boot(hub.clone(), "").await;
+
+        let resp = post_say(server.addr, r#"{"text":"开饭了","room":"客厅"}"#).await;
+        assert_eq!(resp.status, 409, "{}", resp.body);
+        assert!(resp.body.contains("\"multiple_devices\""), "{}", resp.body);
+        assert!(
+            resp.body.contains("aa:bb:cc:dd:ee:01") && resp.body.contains("aa:bb:cc:dd:ee:02"),
+            "候选应同时包含客厅两台设备：{}",
+            resp.body
+        );
+        assert!(
+            !resp.body.contains("aa:bb:cc:dd:ee:03"),
+            "不应包含其它房间的设备：{}",
+            resp.body
+        );
+        assert!(hub.published.lock().unwrap().is_empty(), "歧义时不应下发");
+    }
+
+    #[tokio::test]
+    async fn unknown_room_returns_404_with_room_echo() {
+        let _guard = test_lock().lock().await;
+        let server = boot(two_room_hub(), "").await;
+
+        let resp = post_say(server.addr, r#"{"text":"开饭了","room":"厨房"}"#).await;
+        assert_eq!(resp.status, 404, "{}", resp.body);
+        assert!(resp.body.contains("\"device_offline\""), "{}", resp.body);
+        assert!(resp.body.contains("\"room\":\"厨房\""), "{}", resp.body);
+    }
+
+    /// `GET /api/v1/xiaozhi/devices` 要同时列出「已配置但离线」和「在线未配置」。
+    #[tokio::test]
+    async fn devices_endpoint_merges_configured_and_online() {
+        let _guard = test_lock().lock().await;
+        let hub = FakeHub::one(); // 只在线一台：84:c7:bb:59:93:64
+        let server = boot(hub, "").await;
+        crate::devices::install_device_directory(Arc::new(
+            crate::devices::DeviceDirectory::from_config(&[
+                crate::types::XiaozhiDeviceConfig {
+                    device_id: "84:c7:bb:59:93:64".to_string(),
+                    name: "客厅小智".to_string(),
+                    room: "客厅".to_string(),
+                },
+                // 已配置但不在线
+                crate::types::XiaozhiDeviceConfig {
+                    device_id: "11:22:33:44:55:66".to_string(),
+                    name: "书房小智".to_string(),
+                    room: "书房".to_string(),
+                },
+            ]),
+        ));
+
+        let raw = http_get(server.addr, "/api/v1/xiaozhi/devices").await;
+        let text = String::from_utf8_lossy(&raw);
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(&text);
+        let json: serde_json::Value = serde_json::from_str(body).expect("devices JSON");
+        let devices = json["devices"].as_array().expect("devices 数组");
+        assert_eq!(devices.len(), 2, "应合并在线与离线配置：{body}");
+
+        let living = devices
+            .iter()
+            .find(|d| d["device_id"] == "84:c7:bb:59:93:64")
+            .expect("在线设备");
+        assert_eq!(living["online"], true);
+        assert_eq!(living["state"], "idle");
+        assert_eq!(living["room"], "客厅");
+
+        let study = devices
+            .iter()
+            .find(|d| d["device_id"] == "11:22:33:44:55:66")
+            .expect("离线配置设备");
+        assert_eq!(study["online"], false);
+        assert_eq!(study["room"], "书房");
     }
 
     #[tokio::test]
     async fn empty_token_allows_request_without_authorization() {
+        let _guard = test_lock().lock().await;
         let server = boot(FakeHub::one(), "").await;
 
         let resp = post_say(server.addr, r#"{"text":"你好"}"#).await;
@@ -514,6 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_auth_required_missing_wrong_correct() {
+        let _guard = test_lock().lock().await;
         let server = boot(FakeHub::one(), "secret-token").await;
 
         let missing = post_say(server.addr, r#"{"text":"你好"}"#).await;
@@ -545,6 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_publishes_notify_and_audio_is_fetchable() {
+        let _guard = test_lock().lock().await;
         let hub = FakeHub::one();
         let server = boot(hub.clone(), "").await;
 
@@ -583,6 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn extra_fields_like_voice_are_ignored() {
+        let _guard = test_lock().lock().await;
         let server = boot(FakeHub::one(), "").await;
 
         let resp = post_say(server.addr, r#"{"text":"你好","voice":"xxx"}"#).await;
@@ -591,6 +916,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_or_too_long_text_returns_400() {
+        let _guard = test_lock().lock().await;
         let server = boot(FakeHub::one(), "").await;
 
         let empty = post_say(server.addr, r#"{"text":"   "}"#).await;
