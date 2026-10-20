@@ -673,17 +673,33 @@ const VAD_FLIP_CONFIRM_FRAMES: u8 = 3;
 /// 为什么必须包一层：
 /// 1. **有状态** —— Silero 内部维护 `state [2,1,128]` 与 `context [1,64]`，
 ///    两个设备共用一个实例会互相污染（和 SessionAsrState 隔离是同一个道理）。
+///    这份状态只在同一句的连续帧之间有效。新录音或新对话要
+///    [`SileroVad::reset_utterance`]，否则上一句的余数和迟滞会漏到下一句。
 /// 2. **块大小固定** —— 模型只接受 512 样本/块，而我们是 960 样本/帧，
-///    需要攒块并把余数留到下一帧。
+///    需要攒块并把余数留到下一帧。余数不能跨过录音边界。
 ///
 /// 为什么换成神经网络：实测（2026-10-19）能量阈值 SILENCE_RMS_THRESHOLD=3000
 /// 在本机麦克风上会把真实语音判成静音 —— 说话时 RMS 只有 1510~2183
 /// （见 examples/vad_probe.rs，同一段录音 Silero 给 0.88~0.99）。
 struct SileroVad {
     detector: VoiceActivityDetector,
-    /// 攒够 VAD_CHUNK 就推理，余数跨帧保留。
+    /// 攒够 VAD_CHUNK 就推理，余数只留到同一句的下一帧。
     pending: Vec<i16>,
     last_voice: bool,
+}
+
+/// 双阈值迟滞：带内保持上一判定。
+///
+/// 上一句若停在「人声」，带内概率会把下一句开头也判成人声。
+/// 所以每句开始时 `last_voice` 必须回到静音。
+fn vad_voice(prob: f32, last_voice: bool) -> bool {
+    if prob >= VAD_PROB_HIGH {
+        true
+    } else if prob <= VAD_PROB_LOW {
+        false
+    } else {
+        last_voice
+    }
 }
 
 impl SileroVad {
@@ -717,17 +733,28 @@ impl SileroVad {
             let chunk: Vec<i16> = self.pending.drain(..VAD_CHUNK).collect();
             let prob = self.detector.predict(chunk);
             last_prob = prob;
-            let voice = if prob >= VAD_PROB_HIGH {
-                true
-            } else if prob <= VAD_PROB_LOW {
-                false
-            } else {
-                self.last_voice
-            };
+            let voice = vad_voice(prob, self.last_voice);
             self.last_voice = voice;
             any_voice |= voice;
         }
         (any_voice, last_prob)
+    }
+
+    /// 丢掉上一句的余数、迟滞和模型隐状态。
+    ///
+    /// 新录音和新对话都是一条新的音频流。帧长与 512 不整除时，
+    /// `pending` 最多留下 511 个样本（约 32ms）。不丢的话它们会拼进
+    /// 下一句的第一块：第一窗是两句混音，起始检测被拖后，或者余数里的
+    /// 人声让第一窗直接判成人声。`last_voice` 若仍为人声，概率落在
+    /// 迟滞带时会沿用上一句的判定，立刻置上 `speech_detected`，
+    /// 无语音超时就不再计时。
+    ///
+    /// 模型的 LSTM state 只描述当前这句，用 [`VoiceActivityDetector::reset`]
+    /// 清掉。检测器本身不重建：ONNX session 是进程内共享的。
+    fn reset_utterance(&mut self) {
+        self.pending.clear();
+        self.last_voice = false;
+        self.detector.reset();
     }
 }
 
@@ -1862,6 +1889,11 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             state.vad_notify = Arc::new(Notify::new());
             state.no_speech_notify = Arc::new(Notify::new());
             state.silence_closed = false;
+            // 上一句的余数和迟滞不能带进这一句：第一块会变成混音，
+            // 或迟滞直接判成人声，无语音超时不再计时。
+            if let Some(vad) = state.silero.as_mut() {
+                vad.reset_utterance();
+            }
         })?;
 
         Ok(())
@@ -1880,9 +1912,16 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
     async fn on_conversation_start(&self, session_key: &str) -> Result<(), String> {
         // take() 而不是 clone()：旧 session 只能被消费一次，
         // 避免并发的 hello 看到同一个 id 重复清历史。
-        let old = self.with_session(session_key, |state| state.llm_session_id.take())?;
+        // VAD 余数和迟滞也在同一次加锁里清掉。没有旧 LLM 会话时
+        // 下面会提前返回，清 VAD 不能放到那次返回之后。
+        let old = self.with_session(session_key, |state| {
+            if let Some(vad) = state.silero.as_mut() {
+                vad.reset_utterance();
+            }
+            state.llm_session_id.take()
+        })?;
         let Some(old) = old else {
-            // 首次 hello（或刚被清过）时无事可做，安静返回。
+            // 没有旧 LLM 会话可丢。VAD 余数和迟滞已在上面清掉。
             return Ok(());
         };
         // 用当前生效的 Agent：热切换后旧会话本来就已按代数作废，
@@ -1949,8 +1988,8 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             let rms = compute_pcm_rms(&pcm_bytes);
 
             // 判据：优先 Silero（神经网络），模型不可用时退回能量阈值。
-            // 注意 silero 挂在 session（会话级）而不是 state（单次录音管道）：
-            // 模型内部有跨帧状态，必须跟着会话走，不能每条录音重来。
+            // 检测器挂在 session 上，是为了在同一句的连续帧之间保留模型状态，
+            // 并复用共享的 ONNX session。每句的余数和迟滞在录音开始时已经清掉。
             let (is_voice, vad_desc) = match session.silero.as_mut() {
                 Some(vad) => {
                     let (voice, prob) = vad.push_frame(&pcm_buf[..decoded_samples]);
@@ -3966,6 +4005,169 @@ mod tests {
         }
         assert!(!last.0, "纯静音不该判成人声");
         assert!(last.1 < 0.3, "纯静音的概率应低于低阈值，实际 {}", last.1);
+    }
+
+    /// 上一句没凑满 512 的余数会原样拼进下一块。
+    ///
+    /// 帧长 960 与窗口 512 不整除，余数最多 511（约 32ms）。录音边界若不丢掉
+    /// 这些样本，下一句的第一块就是两句混在一起的音频。
+    #[test]
+    fn silero_remainder_is_prepended_to_the_next_window() {
+        let mut vad = SileroVad::new().expect("Silero VAD 应能加载内置模型");
+        let marker = 9_000i16;
+        vad.push_frame(&[marker; 100]);
+        assert_eq!(vad.pending.len(), 100, "不足一块的样本应留在 pending");
+
+        vad.push_frame(&[0i16; 50]);
+        assert_eq!(vad.pending.len(), 150);
+        assert!(
+            vad.pending[..100].iter().all(|&s| s == marker),
+            "下一次喂入应接在上一句余数后面，而不是丢掉它"
+        );
+    }
+
+    /// 迟滞带 (0.3, 0.5) 沿用上一判定。上一句若停在「人声」，
+    /// 下一句开头落在带内会被立刻当成有人声，speech_detected 马上置位。
+    #[test]
+    fn silero_hysteresis_keeps_previous_voice_decision() {
+        assert!(vad_voice(0.4, true), "迟滞带应沿用上一句的人声判定");
+        assert!(
+            !vad_voice(0.4, false),
+            "上一判定为静音时，迟滞带不能判成人声"
+        );
+        assert!(vad_voice(VAD_PROB_HIGH, false), "达到高阈值应判成人声");
+        assert!(!vad_voice(VAD_PROB_LOW, true), "落到低阈值应判成静音");
+    }
+
+    /// reset 之后下一次喂入不能再看见上一句的样本，迟滞也回到静音。
+    #[test]
+    fn silero_reset_utterance_drops_remainder_before_next_window() {
+        let mut vad = SileroVad::new().expect("Silero VAD 应能加载内置模型");
+        let marker = 9_000i16;
+        vad.push_frame(&[marker; 400]);
+        assert_eq!(vad.pending.len(), 400);
+        vad.last_voice = true;
+
+        vad.reset_utterance();
+        assert!(vad.pending.is_empty(), "余数应被丢掉");
+        assert!(!vad.last_voice, "迟滞应回到静音");
+
+        vad.push_frame(&[0i16; 50]);
+        assert_eq!(
+            vad.pending,
+            vec![0i16; 50],
+            "下一句的样本不应再拼上上一句的余数"
+        );
+
+        // reset 清掉模型隐状态之后，纯静音仍应判成静音。
+        let silence = vec![0i16; 960];
+        let mut last = (true, 1.0f32);
+        for _ in 0..4 {
+            last = vad.push_frame(&silence);
+        }
+        assert!(!last.0, "reset 后的纯静音不该判成人声");
+        assert!(
+            last.1 < 0.3,
+            "reset 后静音概率应低于低阈值，实际 {}",
+            last.1
+        );
+    }
+
+    /// 新录音必须丢掉上一句的余数和迟滞，否则第一块是混音，
+    /// 或者迟滞直接置 speech_detected、废掉无语音超时。
+    #[tokio::test]
+    async fn recording_start_clears_silero_remainder_and_hysteresis() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy
+            .with_session("dev", |state| {
+                let vad = state.silero.as_mut().expect("Silero 应已初始化");
+                vad.pending.extend_from_slice(&[9_000i16; 400]);
+                vad.last_voice = true;
+            })
+            .expect("写入上一句的 VAD 残留");
+
+        strategy
+            .on_recording_start("dev", "sess-1")
+            .await
+            .expect("on_recording_start 不应失败");
+
+        strategy
+            .read_session("dev", |state| {
+                let vad = state.expect("会话应存在").silero.as_ref().expect("Silero");
+                assert!(
+                    vad.pending.is_empty(),
+                    "新录音不应再带上一句的余数，实际 {} 个样本",
+                    vad.pending.len()
+                );
+                assert!(
+                    !vad.last_voice,
+                    "新录音的迟滞应从静音开始，不能沿用上一句的人声判定"
+                );
+            })
+            .expect("读取 VAD 状态");
+    }
+
+    /// 新 hello 同样要清 VAD。没有旧 LLM 会话时函数会提前返回，
+    /// 清残留不能放在那次返回之后。
+    #[tokio::test]
+    async fn conversation_start_clears_silero_even_without_llm_session() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy
+            .with_session("dev", |state| {
+                let vad = state.silero.as_mut().expect("Silero 应已初始化");
+                vad.pending.extend_from_slice(&[9_000i16; 511]);
+                vad.last_voice = true;
+                assert!(state.llm_session_id.is_none());
+            })
+            .expect("写入上一轮的 VAD 残留");
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("没有旧 LLM 会话时 on_conversation_start 也应成功");
+
+        strategy
+            .read_session("dev", |state| {
+                let vad = state.expect("会话应存在").silero.as_ref().expect("Silero");
+                assert!(
+                    vad.pending.is_empty(),
+                    "新对话不应再带上一轮的余数，实际 {} 个样本",
+                    vad.pending.len()
+                );
+                assert!(!vad.last_voice, "新对话的迟滞应从静音开始");
+            })
+            .expect("读取 VAD 状态");
+    }
+
+    /// 有旧 LLM 会话时，清会话之外也要清 VAD 余数和迟滞。
+    #[tokio::test]
+    async fn conversation_start_clears_silero_along_with_llm_session() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy.store_llm_session_at("dev", "old-session".to_string(), 0);
+        strategy
+            .with_session("dev", |state| {
+                let vad = state.silero.as_mut().expect("Silero 应已初始化");
+                vad.pending.extend_from_slice(&[1i16; 64]);
+                vad.last_voice = true;
+            })
+            .expect("写入上一轮的 VAD 残留");
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("on_conversation_start 不应失败");
+
+        assert!(
+            strategy.llm_session_at("dev", 0).unwrap().is_none(),
+            "旧 LLM 会话仍应被清掉"
+        );
+        strategy
+            .read_session("dev", |state| {
+                let vad = state.expect("会话应存在").silero.as_ref().expect("Silero");
+                assert!(vad.pending.is_empty());
+                assert!(!vad.last_voice);
+            })
+            .expect("读取 VAD 状态");
     }
 
     /// 会话级状态必须按 session_key 隔离。
