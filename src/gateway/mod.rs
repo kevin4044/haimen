@@ -257,6 +257,8 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
                 xiaozhi_config,
                 shared_asr_config,
                 shared_tts_config,
+                // start_all 构建策略时 voice_override 就是 None（见上方），保持一致。
+                None,
                 http_shared_agent,
                 http_cancel,
             )

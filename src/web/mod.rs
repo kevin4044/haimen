@@ -21,6 +21,22 @@ pub struct ServeConfig {
 /// 为什么实现在根 crate 而不是 haimen-xiaozhi：合成要读共享的 TTS 配置、
 /// 走 `tts_factory`、调 Opus 编码器，这些都在根 crate。haimen-xiaozhi
 /// 只定义 `SaySynthesizer` trait 并在这里注入。
+/// 把 CLI 音色覆盖叠加到 TTS 配置上，返回新配置（不改原对象）。
+///
+/// 单独抽出来是为了可测：notify 播报和正常对话回复必须用同一个音色，
+/// 两边解析路径一旦分叉，用户就会听到「同一个人两种嗓子」。
+/// 正常回复侧对应 `AsrLlmTtsStrategy::synthesize_*` 里的同样处理。
+fn apply_voice_override(cfg: &TtsConfig, voice_override: Option<&str>) -> TtsConfig {
+    let mut work = cfg.clone();
+    if let Some(voice) = voice_override {
+        work.providers
+            .entry(work.active_provider.clone())
+            .or_default()
+            .insert("voice".to_string(), voice.to_string());
+    }
+    work
+}
+
 struct XiaozhiSaySynthesizer {
     tts_config: Arc<RwLock<TtsConfig>>,
     voice_override: Option<String>,
@@ -34,14 +50,7 @@ impl haimen_xiaozhi::notify::SaySynthesizer for XiaozhiSaySynthesizer {
         // 在单独的块里取放 RwLock，避免 guard 跨越 .await。
         let provider = {
             let cfg = self.tts_config.read().map_err(|e| e.to_string())?;
-            let mut work_cfg = cfg.clone();
-            if let Some(voice) = &self.voice_override {
-                work_cfg
-                    .providers
-                    .entry(work_cfg.active_provider.clone())
-                    .or_default()
-                    .insert("voice".to_string(), voice.clone());
-            }
+            let work_cfg = apply_voice_override(&cfg, self.voice_override.as_deref());
             crate::tts_factory::create_tts_provider(&work_cfg)?
         };
         let resp = provider
@@ -147,6 +156,11 @@ pub async fn start(
     xiaozhi_config: haimen_xiaozhi::XiaozhiConfig,
     asr_config: Arc<RwLock<AsrConfig>>,
     tts_config: Arc<RwLock<TtsConfig>>,
+    // CLI 音色覆盖（`--xiaozhi-tts-voice`），与正常对话回复走同一个值。
+    // 必须传进来而不是固定 None：notify 播报和对话回复必须是同一个声音，
+    // 否则用户会听到「同一个人一会儿一个嗓子」。`start_all` 那条路径
+    // 构建策略时 override 本来就是 None，所以传 None 与之一致。
+    voice_override: Option<String>,
     shared_agent: crate::gateway::agent_handle::SharedAgent,
     cancel: CancellationToken,
 ) -> Result<(), String> {
@@ -166,9 +180,8 @@ pub async fn start(
     haimen_xiaozhi::notify::set_say_http_port(config.port);
     haimen_xiaozhi::notify::set_say_synthesizer(Arc::new(XiaozhiSaySynthesizer {
         tts_config: tts_config.clone(),
-        // `start_all` 构建策略时 override 本来就是 None，这里与之一致；
-        // `serve` 命令的 --xiaozhi-tts-voice 在 cli.rs（本任务未改），后续如需支持再传入。
-        voice_override: None,
+        // 与正常对话回复用同一个音色解析结果（见 synthesize 里的注释）。
+        voice_override,
     }));
 
     // 构建路由
@@ -399,6 +412,45 @@ fn open_browser(host: &str, port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── notify 音色必须与正常回复一致（Cursor Bugbot 在 PR #9 上报过回归）──
+
+    fn tts_cfg_with_voice(voice: &str) -> TtsConfig {
+        let mut cfg = TtsConfig::default();
+        cfg.active_provider = "doubao".to_string();
+        cfg.providers.insert(
+            "doubao".to_string(),
+            std::collections::HashMap::from([("voice".to_string(), voice.to_string())]),
+        );
+        cfg
+    }
+
+    #[test]
+    fn apply_voice_override_replaces_active_provider_voice() {
+        let cfg = tts_cfg_with_voice("config-voice");
+        let out = apply_voice_override(&cfg, Some("cli-voice"));
+        assert_eq!(
+            out.providers["doubao"]["voice"], "cli-voice",
+            "CLI 覆盖必须作用到 notify 播报，否则和正常回复是两个声音"
+        );
+        // 原配置不能被改（共享配置是 Arc<RwLock>，就地改会污染正常回复）
+        assert_eq!(cfg.providers["doubao"]["voice"], "config-voice");
+    }
+
+    #[test]
+    fn apply_voice_override_none_keeps_configured_voice() {
+        let cfg = tts_cfg_with_voice("config-voice");
+        let out = apply_voice_override(&cfg, None);
+        assert_eq!(out.providers["doubao"]["voice"], "config-voice");
+    }
+
+    #[test]
+    fn apply_voice_override_creates_entry_when_provider_missing() {
+        let mut cfg = TtsConfig::default();
+        cfg.active_provider = "doubao".to_string(); // providers 为空
+        let out = apply_voice_override(&cfg, Some("cli-voice"));
+        assert_eq!(out.providers["doubao"]["voice"], "cli-voice");
+    }
 
     /// 编一段静音 PCM 走真实封装路径，再用 ogg 读端按序读回：
     /// OpusHead → OpusTags → 数据帧，且末包 granule 正确、带流结束标记。

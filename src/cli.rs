@@ -455,6 +455,10 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             // 创建共享 ASR 配置，Web API 保存时同步更新此对象，实现运行时热加载
             let shared_asr_config = Arc::new(RwLock::new(settings.asr.clone()));
 
+            // notify 播报也要拿到同一个音色覆盖，但下面构建策略时
+            // xiaozhi_tts_voice 会被 move 进去，所以先 clone 一份留给 web::start。
+            let say_voice_override = xiaozhi_tts_voice.clone();
+
             let xiaozhi_strategy: Arc<dyn haimen_xiaozhi::ResponseStrategy> = if xiaozhi_echo {
                 Arc::new(haimen_xiaozhi::EchoStrategy)
             } else if xiaozhi_asr_tts {
@@ -536,6 +540,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 settings.xiaozhi.clone(),
                 shared_asr_config,
                 shared_tts_config,
+                say_voice_override,
                 serve_agent,
                 CancellationToken::new(),
             )
