@@ -1126,43 +1126,65 @@ async fn start_playback(shared: &Arc<Shared>, client_id: &str) {
 async fn run_playback(shared: Arc<Shared>, job: PlaybackJob) {
     let mut tts_started = false;
     // 正常跑完的一轮，尾帧等待在 drive_playback 里做 —— 埋点要记录实际等待时长，
-    // 等待发生在函数外就量不到。返回的 tail_wait_done 表示它已经等过。
+    // 等待发生在函数外就量不到。返回 true 表示等待完整走完，没有被取消。
     let tail_wait_done = drive_playback(&shared, &job, &mut tts_started).await;
-    // tail_wait_done 为真时即使等待期间被取消也要照常发 stop（设备不能停在 Speaking）；
-    // 还没等过且已被取消的轮次不发，由 handle_abort 那边的 stop 收口。
-    if tts_started && (tail_wait_done || !cancelled(&job.cancel, &shared)) {
-        if !tail_wait_done {
-            // 中途异常退出（设备掉线等）的轮次没等尾帧，在这里补上，
-            // 行为与正常路径一致。
-            let mut cancel = job.cancel.clone();
-            let _ = wait_tail_playback(&shared, &mut cancel).await;
-        }
-        // 设备要求 start → 句子/音频 → stop。stop 放在所有帧之后。
-        let _ = publish_tts(&shared, &job.client_id, TtsState::Stop, None).await;
-        finish_ready(&shared, &job).await;
+    // 打断、listen start、关停都会把 cancel 置上。这时不能再发 stop：
+    // listen start 已经把会话推进 Recording，迟到的 stop 会让设备退出聆听。
+    // Playing 上的 abort 由 handle_abort 自己发 stop。
+    if !tts_started || cancelled(&job.cancel, &shared) {
+        return;
     }
+    if !tail_wait_done {
+        // 中途异常退出（发送失败等）的轮次没等尾帧，在这里补上。
+        // 补等期间被打断同样不能发 stop，返回值不能丢掉。
+        let mut cancel = job.cancel.clone();
+        let waited = wait_tail_playback(&shared, &mut cancel).await;
+        if !waited || cancelled(&job.cancel, &shared) {
+            return;
+        }
+    }
+    // 等待返回到发 stop 之间，listen start 可能已经换掉这一轮。
+    // 只在本轮仍占着 Playing 时收口。
+    if !playback_still_playing(&shared, &job).await {
+        return;
+    }
+    // 设备要求 start → 句子/音频 → stop。stop 放在所有帧之后。
+    let _ = publish_tts(&shared, &job.client_id, TtsState::Stop, None).await;
+    finish_ready(&shared, &job).await;
 }
 
-/// 驱动一轮下行播放，返回是否已在函数内做完尾帧等待（T1）。
+/// 本轮回放是否还占着 Playing。
+///
+/// listen start / abort / 新 hello 都会推进 `playback_gen` 或改掉状态。
+/// 对不上就说明打断已经接手，再发 `tts stop` 会打到下一轮。
+async fn playback_still_playing(shared: &Shared, job: &PlaybackJob) -> bool {
+    let tables = shared.tables.lock().await;
+    tables.sessions.get(&job.client_id).is_some_and(|session| {
+        session.playback_gen == job.generation && session.state == SessionState::Playing
+    })
+}
+
+/// 驱动一轮下行播放，返回尾帧等待是否完整走完（没被取消）。
 ///
 /// T2 埋点：统计本轮下发帧数与耗时，结束时打一条 warn!（INFO 会被过滤）。
 /// 尾帧等待放在这里而不是 run_playback，是因为 `tail_wait_ms` 要记录
 /// 实际等待时长 —— 等待发生在函数外就量不到。正常跑完的一轮在这里等；
 /// 中途异常退出的轮次由 run_playback 补等。
+/// 等待被取消时返回 false，调用方不能再发 `tts stop`。
 async fn drive_playback(shared: &Arc<Shared>, job: &PlaybackJob, tts_started: &mut bool) -> bool {
     let mut stats = PlaybackStats::default();
     let completed = drive_playback_inner(shared, job, tts_started, &mut stats).await;
 
-    // 正常跑完（流式循环自然结束）才在这里等尾帧；被取消时 wait_tail_playback
-    // 会立刻返回，用户插话不会白等。
+    // 正常跑完（流式循环自然结束）才在这里等尾帧。
+    // 等待中被取消时 `wait_tail_playback` 立刻返回 false，不能记成「已等完」——
+    // 否则 run_playback 会在 barge-in 把会话推进 Recording 之后补发 tts stop。
     let mut tail_wait_ms = 0u64;
     let mut tail_wait_done = false;
     if completed && !cancelled(&job.cancel, shared) {
         let mut cancel = job.cancel.clone();
         let wait_start = Instant::now();
-        wait_tail_playback(shared, &mut cancel).await;
+        tail_wait_done = wait_tail_playback(shared, &mut cancel).await;
         tail_wait_ms = wait_start.elapsed().as_millis() as u64;
-        tail_wait_done = true;
     }
 
     // frames == 0 的轮次（生成失败、被秒取消）不打，避免噪音。
@@ -2580,6 +2602,85 @@ mod tests {
         let again = collect_downlink(&env, &crypto, 1).await;
         assert_eq!(again[0].payload, vec![0xB0]);
         assert_eq!(env.mock.lock().generate_calls, 3);
+        env.shutdown().await;
+    }
+
+    /// 尾帧等待（默认 420ms）里收到 listen start 时，不能再补发 `tts stop`。
+    ///
+    /// listen start 已经把会话推进 Recording，设备也在采集。
+    /// 迟到的 stop 会把设备从聆听里拽出来。
+    #[tokio::test]
+    async fn listen_start_during_tail_wait_does_not_emit_late_tts_stop() {
+        // 一帧走预缓冲，发完立刻进入尾帧等待，窗口稳定。
+        let playback = vec![AudioFrame {
+            timestamp: 0,
+            data: vec![0xC1],
+        }];
+        let mut env = Env::boot(playback).await;
+        let hello = env.hello().await;
+        let crypto = crypto_from_hello(&hello);
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !env.mock.lock().recording_starts.is_empty() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 10, 1, b"hi").await;
+        wait_frames(&env.mock, 1).await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+        let tts = env.link.wait_type("tts", Duration::from_secs(2)).await;
+        assert_eq!(tts["state"], "start");
+        let down = collect_downlink(&env, &crypto, 1).await;
+        assert_eq!(down[0].payload, vec![0xC1]);
+
+        // 最后一帧已经到了，尾帧等待要么刚开始，要么马上开始。
+        // 留出缝，确保 cancel 落在 wait_tail_playback 里面，而不是等待开始之前。
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if env.mock.lock().recording_starts.len() >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "尾帧等待中的 listen start 没有生效"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 取消会让等待立刻返回。有 bug 时 stop 紧跟着就到，不用等满 420ms。
+        let stop_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while tokio::time::Instant::now() < stop_deadline {
+            let left = stop_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, env.link.rx.recv()).await {
+                Ok(Some(payload)) => {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                        let is_stop = value.get("type").and_then(|item| item.as_str())
+                            == Some("tts")
+                            && value.get("state").and_then(|item| item.as_str()) == Some("stop");
+                        assert!(!is_stop, "尾帧等待被 listen start 打断后仍发出了 tts stop");
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        send_uplink(&env, &crypto, 20, 2, b"still-listening").await;
+        wait_frames(&env.mock, 2).await;
+        assert_eq!(env.mock.lock().audio_frames[1].data, b"still-listening");
         env.shutdown().await;
     }
 
