@@ -50,6 +50,22 @@ pub trait ResponseStrategy: Send + Sync {
         false
     }
 
+    // ────────── 对话生命周期钩子（可选覆盖） ──────────
+
+    /// 设备打开新的音频通道（hello）时调用。
+    ///
+    /// 每次 hello → goodbye 是一次独立对话。实现方应清掉上一轮的会话级
+    /// 上下文（LLM session_id、对话历史），避免上一轮污染这一轮。
+    ///
+    /// 为什么要在 hello 清而不是 goodbye：设备可能异常断电、直接丢掉
+    /// goodbye，只在 goodbye 清就会漏；而且 hello 是「新对话确实开始」的
+    /// 唯一可靠信号，在这里清完，本轮后续无论多少轮都还能正常累积上下文。
+    ///
+    /// 默认实现为 no-op，Echo 等无状态策略不受影响。
+    async fn on_conversation_start(&self, _session_key: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// 返回 HELLO 握手时应告知设备的音频参数
     ///
     /// 默认实现回传客户端发送的参数（Echo 模式适用）。
@@ -473,5 +489,21 @@ mod tests {
             result.is_none(),
             "默认 goodbye_frames 应返回 None（不播告别）"
         );
+    }
+
+    // ─── 对话生命周期钩子默认行为（no-op） ───────────────
+
+    #[tokio::test]
+    async fn test_t19_on_conversation_start_noop() {
+        let strategy = EchoStrategy;
+        let result = strategy.on_conversation_start("test-key").await;
+        assert!(result.is_ok(), "默认 on_conversation_start 应为 Ok(())");
+    }
+
+    /// 通过 trait object 调用，确认 vtable 分发不会平白报错
+    #[tokio::test]
+    async fn test_t20_on_conversation_start_via_trait_object() {
+        let strategy: Arc<dyn ResponseStrategy> = Arc::new(EchoStrategy);
+        assert!(strategy.on_conversation_start("trait-object").await.is_ok());
     }
 }

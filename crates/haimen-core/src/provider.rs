@@ -95,6 +95,13 @@ pub trait AgentProvider: Send + Sync {
         Ok((stream, sid, rx))
     }
 
+    /// 丢弃某个会话的历史。
+    ///
+    /// 由策略层在「新对话开始」（设备 hello）时调用：一次 hello → goodbye
+    /// 是一次独立对话，上一轮的历史不能带进这一轮。默认空实现：不是所有
+    /// agent 都在本地维护对话历史（CLI 类 Agent 的历史由外部进程自己管）。
+    fn drop_session(&self, _session_id: &str) {}
+
     /// 检查是否可用（如 CLI 是否已安装、API key 是否有效）
     /// 返回 Err 时，chat_loop 应终止并报错
     async fn check_available(&self) -> Result<(), String>;

@@ -33,7 +33,12 @@
 //! # 多轮对话
 //!
 //! 策略内部维护 LLM 的 `session_id`，每次 `generate_response` 调用后更新，
-//! 实现音色多轮对话的上下文连续性。
+//! 实现一次对话内部的多轮上下文连续性。
+//!
+//! 上下文的边界是「设备 hello → goodbye」：hello 时
+//! [`ResponseStrategy::on_conversation_start`] 会清掉上一轮留下的 session_id，
+//! 并让 Agent 丢掉它本地存的历史。否则设备重连后仍会复用旧 session，上一轮
+//! 内容被整包带进新对话（改了 Agent 的提示词也不生效，因为模型在模仿旧对话）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +56,7 @@ use univoice::asr::{
     MimoAsrOption, QwenAsr, QwenAsrOption, XfyunAsr, XfyunAsrOption, adapt_audio_input,
 };
 use univoice::tts::TtsRequest;
+use voice_activity_detector::VoiceActivityDetector;
 
 use crate::config::settings::{AsrConfig, TtsConfig};
 use crate::gateway::provider::{AgentEventStream, AgentLogEvent};
@@ -66,14 +72,37 @@ pub type SharedAsrConfig = Arc<RwLock<AsrConfig>>;
 // 句切分工具
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// 首句额外认可的切分标点（逗号、顿号、逗号、波浪号）。
+///
+/// 参考实现（tts/base.py:94-105）给第一句单独一套更宽的标点集。
+/// 为什么只对首句放宽：首句决定「第一帧音频什么时候出声」，这段延迟用户最敏感；
+/// 但把「，」当句末会切出更多短句，后面每句都要重新起调，听起来会碎。
+/// 所以这个取舍只做在第一句上 —— 后面仍按完整句子切。
+const FIRST_SENTENCE_EXTRA_PUNCT: &[char] = &['，', '、', ',', '~'];
+
+/// 常规句末标点（含换行，用于切分行内列表）。
+fn is_sentence_boundary(ch: char, first_sentence: bool) -> bool {
+    matches!(ch, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n')
+        || (first_sentence && FIRST_SENTENCE_EXTRA_PUNCT.contains(&ch))
+}
+
 /// 从句子缓冲区提取一个完整句子（含结尾标点），并消费掉它。
 ///
 /// 找不到句末标点时返回 `None`（残句留在 `buf` 中，等待后续 chunk 累积）。
 /// ASCII `.` 不纳入句末标点，避免拆分 `Mr.` / `3.14` 等缩写与数字。
 fn take_sentence(buf: &mut String) -> Option<String> {
+    take_sentence_with(buf, false)
+}
+
+/// `first_sentence = true` 时用更宽的标点集（额外接受 `，、,~`）。
+///
+/// 场景：LLM 第一个 delta 就是完整一句「好的，我来帮你打开客厅的灯。」。
+/// 只认句末标点的话这一整句（14 字）都会塞给 TTS，首帧要等它合成完；
+/// 放宽后切成「好的，」，TTS 可以立刻开始出声。
+fn take_sentence_with(buf: &mut String, first_sentence: bool) -> Option<String> {
     let mut end = None;
     for (i, ch) in buf.char_indices() {
-        if matches!(ch, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n') {
+        if is_sentence_boundary(ch, first_sentence) {
             end = Some(i + ch.len_utf8());
             break;
         }
@@ -317,8 +346,14 @@ impl TtsTextAggregator {
         self.raw_buf.push_str(delta);
         let mut blocks = Vec::new();
 
-        // 切出完整句（take_sentence 消费掉含结尾标点，空残句天然被过滤）
-        while let Some(s) = take_sentence(&mut self.raw_buf) {
+        // 切出完整句（消费掉含结尾标点，空残句天然被过滤）。
+        // 首句用宽标点集（连「，」也算句末）：首帧音频能更早出声，
+        // 后续句子回到常规标点，避免整段回复被逗号切得太碎。
+        loop {
+            let first = !self.emitted_first;
+            let Some(s) = take_sentence_with(&mut self.raw_buf, first) else {
+                break;
+            };
             let cleaned = clean_markdown_for_tts(&s);
             if !cleaned.is_empty() {
                 blocks.push(cleaned);
@@ -372,6 +407,9 @@ async fn tts_aggregate_task(
     cleaned_full: Arc<Mutex<String>>,
 ) {
     let mut agg = TtsTextAggregator::new(TTS_AGGREGATE_THRESHOLD);
+    // 每条回复只打一次首块长度：它直接决定「第一帧音频多久后出声」。
+    // 一行/轮的代价，换来 E（首句宽标点切分）这类改动的可验证性。
+    let mut first_block_logged = false;
     let mut interval = tokio::time::interval(TTS_FLUSH_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = interval.tick().await; // 跳过首 tick
@@ -382,6 +420,14 @@ async fn tts_aggregate_task(
                 match chunk {
                     Some(delta) => {
                         for block in agg.push(&delta) {
+                            if !first_block_logged {
+                                first_block_logged = true;
+                                tracing::warn!(
+                                    chars = block.chars().count(),
+                                    text = %block,
+                                    "TTS 首块（长度决定首帧延迟）"
+                                );
+                            }
                             if !emit_block(&agg_tx, &cleaned_full, block).await {
                                 return;
                             }
@@ -496,11 +542,11 @@ struct AsrPipelineState {
     frame_samples: usize,
     /// 诊断：已接收并处理的音频帧数（每帧 60ms）
     frame_count: u64,
-    /// 诊断：上一次打印帧计数日志的帧号
-    last_log_frame: u64,
-    /// 本地能量检测：连续静音帧数（60ms/帧），>= MAX_SILENCE_FRAMES 时触发 VAD
-    silence_count: u64,
-    /// 本地能量检测：是否检测到过有效语音（初始静音不计入 silence_count）
+    /// 已确认的 VAD 判定（去抖后的）。只在它翻转时打日志。
+    last_vad_voice: bool,
+    /// 朝向相反判定的连续帧数，达到 VAD_FLIP_CONFIRM_FRAMES 才确认翻转。
+    vad_flip_run: u8,
+    /// 是否检测到过有效语音（初始静音不计入 no_speech_frames）
     speech_detected: bool,
     /// 无语音超时：录音开始后累计的初始静音帧数（60ms/帧，speech_detected 前才累计），
     /// 达到配置阈值时触发告别并关闭连接（不依赖 ASR 文本）
@@ -534,6 +580,8 @@ struct SessionAsrState {
     silence_closed: bool,
     asr_received_text: Arc<AtomicBool>,
     end_of_conversation: Arc<AtomicBool>,
+    /// Silero VAD（有状态，按会话隔离）；初始化失败时为 None，回退能量阈值。
+    silero: Option<SileroVad>,
 }
 
 impl SessionAsrState {
@@ -547,6 +595,7 @@ impl SessionAsrState {
             silence_closed: false,
             asr_received_text: Arc::new(AtomicBool::new(false)),
             end_of_conversation: Arc::new(AtomicBool::new(false)),
+            silero: SileroVad::new(),
         }
     }
 }
@@ -590,15 +639,134 @@ pub struct AsrLlmTtsStrategy {
 /// - 用户说话时 RMS ≈ 4000~15000
 /// - 环境静音时 RMS ≈ 1600~2200
 ///
-/// 阈值 2000 会把环境噪音（实测 2019、2120）误判为"还在说话"，导致
-/// `silence_count` 始终归零、本地能量 VAD 永远不触发，只能干等服务端
-/// 1500ms 判停。取 3000 才能在实测数据上正确区分人声与环境噪音。
+/// 阈值 2000 会把环境噪音（实测 2019、2120）误判为"还在说话"。
+/// 取 3000 才在当时的实测数据上分得开。
+///
+/// **现在这已经**不是**主判据**：`SileroVad` 才是（见下面的结构体注释）。
+/// 保留它只为两种情况兜底：
+///   1. Silero 模型加载失败
+///   2. Silero 尚未初始化（会话首帧）
+///
+/// 而且它本身也不可靠 —— 实测人说话时 RMS 只有 1510~2183，会被判成静音。
 const SILENCE_RMS_THRESHOLD: f64 = 3000.0;
 
-/// 连续静音帧数阈值（60ms/帧），触发本地 VAD。
-/// 15 帧 = 900ms，对齐小智云端判停量级（其 Silero VAD 为 1000ms）。
-/// 注意：这条路径只有 `SILENCE_RMS_THRESHOLD` 能正确区分人声与噪音时才生效。
-const MAX_SILENCE_FRAMES: u64 = 15;
+/// Silero VAD 要求 16kHz 下每块恰好 512 个样本（32ms）。
+/// 我们是 60ms（960 样本）一帧，所以要自己攒块、余数留到下一帧。
+const VAD_CHUNK: usize = 512;
+const VAD_SAMPLE_RATE: u32 = 16_000;
+/// 双阈值迟滞：>= HIGH 判人声、<= LOW 判静音，中间保持上一判定。
+///
+/// 为什么不用单阈值：模型输出在 0.3~0.5 之间会来回抖，单阈值会让
+/// speech_detected / 静音计数疯狂跳变。迟滞是参考实现（silero.py:88-97）的做法。
+const VAD_PROB_HIGH: f32 = 0.5;
+const VAD_PROB_LOW: f32 = 0.3;
+
+/// 判定翻转的去抖帧数：连续这么多帧都在新状态才确认并打日志。
+///
+/// 为什么需要：Silero 在语音起始/结束的过渡带会给出 0.3~0.6 的抖动值，
+/// 逐帧打日志的话 200ms 内能刷出 5 条，反而更难读。
+/// 3 帧 = 180ms，足够过滤过渡带抖动，又不至于吃掉真正的短停顿。
+const VAD_FLIP_CONFIRM_FRAMES: u8 = 3;
+
+/// 会话级的 Silero VAD 封装。
+///
+/// 为什么必须包一层：
+/// 1. **有状态** —— Silero 内部维护 `state [2,1,128]` 与 `context [1,64]`，
+///    两个设备共用一个实例会互相污染（和 SessionAsrState 隔离是同一个道理）。
+///    这份状态只在同一句的连续帧之间有效。新录音或新对话要
+///    [`SileroVad::reset_utterance`]，否则上一句的余数和迟滞会漏到下一句。
+/// 2. **块大小固定** —— 模型只接受 512 样本/块，而我们是 960 样本/帧，
+///    需要攒块并把余数留到下一帧。余数不能跨过录音边界。
+///
+/// 为什么换成神经网络：实测（2026-10-19）能量阈值 SILENCE_RMS_THRESHOLD=3000
+/// 在本机麦克风上会把真实语音判成静音 —— 说话时 RMS 只有 1510~2183
+/// （见 examples/vad_probe.rs，同一段录音 Silero 给 0.88~0.99）。
+struct SileroVad {
+    detector: VoiceActivityDetector,
+    /// 攒够 VAD_CHUNK 就推理，余数只留到同一句的下一帧。
+    pending: Vec<i16>,
+    last_voice: bool,
+}
+
+/// 双阈值迟滞：带内保持上一判定。
+///
+/// 上一句若停在「人声」，带内概率会把下一句开头也判成人声。
+/// 所以每句开始时 `last_voice` 必须回到静音。
+fn vad_voice(prob: f32, last_voice: bool) -> bool {
+    if prob >= VAD_PROB_HIGH {
+        true
+    } else if prob <= VAD_PROB_LOW {
+        false
+    } else {
+        last_voice
+    }
+}
+
+impl SileroVad {
+    fn new() -> Option<Self> {
+        match VoiceActivityDetector::builder()
+            .sample_rate(VAD_SAMPLE_RATE)
+            .chunk_size(VAD_CHUNK)
+            .build()
+        {
+            Ok(detector) => Some(Self {
+                detector,
+                pending: Vec::with_capacity(VAD_CHUNK * 2),
+                last_voice: false,
+            }),
+            Err(err) => {
+                // 模型加载失败不该让整条链路挂掉：回退到能量阈值继续跑。
+                tracing::warn!(%err, "Silero VAD 初始化失败，回退到能量阈值判据");
+                None
+            }
+        }
+    }
+
+    /// 喂一帧 16kHz i16 PCM，返回本帧是否检测到人声。
+    ///
+    /// 一帧 960 样本通常能凑出 1~2 块，只要有任一块判为人声就算本帧有人声。
+    fn push_frame(&mut self, samples: &[i16]) -> (bool, f32) {
+        self.pending.extend_from_slice(samples);
+        let mut any_voice = false;
+        let mut last_prob = 0.0f32;
+        while self.pending.len() >= VAD_CHUNK {
+            let chunk: Vec<i16> = self.pending.drain(..VAD_CHUNK).collect();
+            let prob = self.detector.predict(chunk);
+            last_prob = prob;
+            let voice = vad_voice(prob, self.last_voice);
+            self.last_voice = voice;
+            any_voice |= voice;
+        }
+        (any_voice, last_prob)
+    }
+
+    /// 丢掉上一句的余数、迟滞和模型隐状态。
+    ///
+    /// 新录音和新对话都是一条新的音频流。帧长与 512 不整除时，
+    /// `pending` 最多留下 511 个样本（约 32ms）。不丢的话它们会拼进
+    /// 下一句的第一块：第一窗是两句混音，起始检测被拖后，或者余数里的
+    /// 人声让第一窗直接判成人声。`last_voice` 若仍为人声，概率落在
+    /// 迟滞带时会沿用上一句的判定，立刻置上 `speech_detected`，
+    /// 无语音超时就不再计时。
+    ///
+    /// 模型的 LSTM state 只描述当前这句，用 [`VoiceActivityDetector::reset`]
+    /// 清掉。检测器本身不重建：ONNX session 是进程内共享的。
+    fn reset_utterance(&mut self) {
+        self.pending.clear();
+        self.last_voice = false;
+        self.detector.reset();
+    }
+}
+
+/// 批处理 ASR 兜底的超时。
+///
+/// 原来写死 30 秒。实测（2026-10-19）批处理路径 3 次触发 0 次成功，
+/// 最长的一次让用户干等了整整 30 秒 —— 现象就是「助手卡住了」。
+///
+/// 兜底的意义是「补救」，不是「让用户等半分钟」：一个几秒钟的音频，
+/// 正常 ASR 1~2 秒就该出结果，6 秒还没出就是没戏，不如早点回一句
+/// 「没听清」让用户重说。
+const BATCH_ASR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// 无语音超时帧数阈值：按 60ms/帧向上取整，保证实际时长 ≥ 配置值
 fn no_speech_threshold_frames(timeout_ms: u64) -> u64 {
@@ -984,6 +1152,20 @@ impl AsrLlmTtsStrategy {
         error: Option<&str>,
         started: std::time::Instant,
     ) {
+        // 记录 agent 的完整回复原文。
+        //
+        // 为什么需要：出过「模型只说了一句『我先帮你查一下』就结束回合」的事故，
+        // 而原来只记 TTS 首块（2 个字），事后完全看不出模型到底说了什么，
+        // 只能靠 Hermes 侧的 token 计数反推。一行/轮，不是噪音。
+        if let Some(text) = output {
+            tracing::warn!(
+                session_id = %session_id,
+                status,
+                chars = text.chars().count(),
+                text = %text,
+                "Agent 回复全文"
+            );
+        }
         let events = Self::take_agent_events(agent_events).await;
         self.record_agent_log(
             user_text,
@@ -1209,13 +1391,10 @@ impl AsrLlmTtsStrategy {
 
         let audio_stream = adapt_audio_input(AudioInput::Data(pcm_16k), DEFAULT_CHUNK_SIZE);
 
-        let text = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            asr_listen_to_text(&*asr, audio_stream),
-        )
-        .await
-        .map_err(|_| "ASR 识别超时 (30s)".to_string())?
-        .map_err(|e| format!("ASR 识别失败: {}", e))?;
+        let text = tokio::time::timeout(BATCH_ASR_TIMEOUT, asr_listen_to_text(&*asr, audio_stream))
+            .await
+            .map_err(|_| format!("批处理 ASR 超时 ({}s)", BATCH_ASR_TIMEOUT.as_secs()))?
+            .map_err(|e| format!("ASR 识别失败: {}", e))?;
 
         if text.is_empty() {
             return Ok(None);
@@ -1414,10 +1593,10 @@ impl AsrLlmTtsStrategy {
 
                     // 没有收到 is_final 块时兜底。
                     //
-                    // 什么时候会发生：本地能量 VAD（MAX_SILENCE_FRAMES × 60ms）
-                    // 与豆包服务端 VAD（end_window_size）在赛跑。本地先触发时
-                    // 会替换 pcm_tx 关闭音频流，服务端还没到自己的判停窗口，
-                    // 于是只发中间结果、不发 is_final，`full_text` 就一直是空的。
+                    // 什么时候会发生：火山在 end_window_size（当前 500ms）内
+                    // 还没到自己的判停窗口就结束了，于是只发中间结果、不发 is_final。
+                    // 历史上还有一条「本地能量 VAD 抢先关流」的路径会加剧这个现象，
+                    // 那个抢判停权已在 6bb434e 移除。
                     //
                     // 为什么可以兜底：univoice 的 `chunk.text` 是【累积文本】
                     // 而非增量（同一句会反复推送 "关掉" → "关掉书房的" →
@@ -1458,8 +1637,8 @@ impl AsrLlmTtsStrategy {
             decoder,
             frame_samples,
             frame_count: 0,
-            last_log_frame: 0,
-            silence_count: 0,
+            last_vad_voice: false,
+            vad_flip_run: 0,
             speech_detected: false,
             no_speech_frames: 0,
         };
@@ -1710,8 +1889,52 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             state.vad_notify = Arc::new(Notify::new());
             state.no_speech_notify = Arc::new(Notify::new());
             state.silence_closed = false;
+            // 上一句的余数和迟滞不能带进这一句：第一块会变成混音，
+            // 或迟滞直接判成人声，无语音超时不再计时。
+            if let Some(vad) = state.silero.as_mut() {
+                vad.reset_utterance();
+            }
         })?;
 
+        Ok(())
+    }
+
+    /// 设备 hello：新的 hello → goodbye 对话开始，丢掉上一轮留下的会话上下文。
+    ///
+    /// 为什么必须在这里清：`llm_session_id` 是按 session_key（client_id）存的，
+    /// 设备 goodbye 后通常不换 MQTT 连接就再发 hello，这条记录会一直留着，
+    /// 上一轮对话于是被整包带进下一轮 —— 表现就是改了 Agent 的 SOUL.md 却不生效，
+    /// 因为模型还在模仿旧对话的语气。只清 session_id 还不够：OpenAI 兼容 Agent
+    /// 在进程内另存了一份按 session_id 索引的历史，得让它一起丢掉。
+    ///
+    /// 失败只上报、不 panic：清理失败最多让这一轮多带点旧内容，
+    /// 不能反过来把设备已经成功的 hello 流程判死。
+    async fn on_conversation_start(&self, session_key: &str) -> Result<(), String> {
+        // take() 而不是 clone()：旧 session 只能被消费一次，
+        // 避免并发的 hello 看到同一个 id 重复清历史。
+        // VAD 余数和迟滞也在同一次加锁里清掉。没有旧 LLM 会话时
+        // 下面会提前返回，清 VAD 不能放到那次返回之后。
+        let old = self.with_session(session_key, |state| {
+            if let Some(vad) = state.silero.as_mut() {
+                vad.reset_utterance();
+            }
+            state.llm_session_id.take()
+        })?;
+        let Some(old) = old else {
+            // 没有旧 LLM 会话可丢。VAD 余数和迟滞已在上面清掉。
+            return Ok(());
+        };
+        // 用当前生效的 Agent：热切换后旧会话本来就已按代数作废，
+        // 这里 drop 只是尽力回收那份历史，不要求代数匹配。
+        let agent = crate::gateway::agent_handle::current_agent(&self.agent);
+        agent.drop_session(&old.session_id);
+        // 用 warn 而非 info：haimen 的日志过滤会吞掉 info，
+        // 这行是验证「新对话确实清掉了旧上下文」的关键证据，必须可见。
+        tracing::warn!(
+            session_key = %session_key,
+            old_llm_session = %old.session_id,
+            "新 hello：已清空上一轮 LLM 会话与对话历史"
+        );
         Ok(())
     }
 
@@ -1764,33 +1987,44 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             // ── 本地 PCM 能量检测 ──
             let rms = compute_pcm_rms(&pcm_bytes);
 
-            // 临时诊断（找到合适阈值后可删除）：
-            // 用 warn 级绕开 info 被过滤的问题，每 50 帧（约 3 秒）打印一次实测能量，
-            // 用于判断 SILENCE_RMS_THRESHOLD 对当前麦克风是否过高。
-            if state.frame_count - state.last_log_frame >= 50 {
-                state.last_log_frame = state.frame_count;
-                let (dc_mean, _) = compute_pcm_stats(&pcm_bytes);
-                tracing::warn!(
-                    "ASR 诊断: 第 {} 帧, RMS={:.0}, 直流={:.0}, 阈值={:.0}, speech_detected={}, 已识别文字={}, 静音帧计数={}, 无语音帧={}",
-                    state.frame_count,
-                    rms,
-                    dc_mean,
-                    SILENCE_RMS_THRESHOLD,
-                    state.speech_detected,
-                    session.asr_received_text.load(Ordering::Acquire),
-                    state.silence_count,
-                    state.no_speech_frames,
-                );
+            // 判据：优先 Silero（神经网络），模型不可用时退回能量阈值。
+            // 检测器挂在 session 上，是为了在同一句的连续帧之间保留模型状态，
+            // 并复用共享的 ONNX session。每句的余数和迟滞在录音开始时已经清掉。
+            let (is_voice, vad_desc) = match session.silero.as_mut() {
+                Some(vad) => {
+                    let (voice, prob) = vad.push_frame(&pcm_buf[..decoded_samples]);
+                    (voice, format!("Silero p={prob:.2}"))
+                }
+                None => (
+                    rms >= SILENCE_RMS_THRESHOLD,
+                    format!("能量 RMS={rms:.0} 阈值={SILENCE_RMS_THRESHOLD:.0}"),
+                ),
+            };
+
+            // 只在判定【确认翻转】时打日志，且先过 VAD_FLIP_CONFIRM_FRAMES 去抖。
+            //
+            // 之前是每 50 帧（3 秒）打一行 RMS/直流/静音计数，一次长对话能刷几十行；
+            // 换成翻转日志后又发现过渡带会逐帧抖（170ms 内 5 条）。所以：
+            // 单帧不算数，连续 3 帧都指向新状态才确认 —— 这才是有界且可读的。
+            if is_voice != state.last_vad_voice {
+                state.vad_flip_run = state.vad_flip_run.saturating_add(1);
+                if state.vad_flip_run >= VAD_FLIP_CONFIRM_FRAMES {
+                    state.vad_flip_run = 0;
+                    state.last_vad_voice = is_voice;
+                    tracing::warn!(
+                        "VAD → {}（{vad_desc}，第 {} 帧）",
+                        if is_voice { "人声" } else { "静音" },
+                        state.frame_count,
+                    );
+                }
+            } else {
+                state.vad_flip_run = 0;
             }
 
-            if rms >= SILENCE_RMS_THRESHOLD {
+            if is_voice {
                 state.speech_detected = true;
-                state.silence_count = 0;
                 state.no_speech_frames = 0; // 检测到有效语音，无语音超时作废
-            } else if state.speech_detected {
-                // 只在首次语音后的静音才累计
-                state.silence_count = state.silence_count.saturating_add(1);
-            } else {
+            } else if !state.speech_detected {
                 // 初始静音（从头到尾没说话）：累计无语音超时帧数
                 state.no_speech_frames = state.no_speech_frames.saturating_add(1);
             }
@@ -1818,37 +2052,14 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 return Ok::<_, String>(None);
             }
 
-            if state.silence_count >= MAX_SILENCE_FRAMES
-                && session.asr_received_text.load(Ordering::Acquire)
-            {
-                // 只记录，不关流、不通知。
-                //
-                // 历史：这里原本会「关闭 ASR 流 + 立刻 vad_notify」，是个有两个
-                // 副作用的设计，实测同时造成两个症状：
-                //   ① 话没说完就开始返回 —— 900ms 静音就判停，比火山自己的
-                //      end_window_size(500ms) 之后还有文本稳定(1500ms) 都早，
-                //      等于我们自己抢了判停权
-                //   ② 识别率下降 —— 关流后 pcm_tx 被替换，后半句再也送不进 ASR，
-                //      只能靠 last_nonempty_text 兜底，必然丢字
-                //
-                // 现在的判停权威：
-                //   · 正常情况：火山的 is_vad_endpoint（服务端 definite，唯一权威）
-                //   · 火山始终不回 definite：上面的 TEXT_STABLE_MS 文本稳定兜底
-                //   · 用户一直没说话：no_speech_notify 的无语音超时
-                //   · 极端兜底：传输层的 RECORDING_LIMIT
-                //
-                // 任务不会因此泄漏：文本稳定分支会 break，且下次录音时
-                // init_asr_pipeline 会替换 streaming_state，旧任务随之退出。
-                // 只在刚跨过阈值那一帧打一次。否则每 60ms 一行，
-                // 一次说话停顿就能刷出几十行日志。
-                if state.silence_count == MAX_SILENCE_FRAMES {
-                    tracing::warn!(
-                        "本地能量 VAD: 连续 {} 帧静音 ({:.1}s)，仅记录（不再关流/判停）",
-                        state.silence_count,
-                        state.silence_count as f64 * 60.0 / 1000.0,
-                    );
-                }
-            }
+            // 历史：这里原本还有一段「本地能量 VAD 连续 900ms 静音就关流 + vad_notify」。
+            // 实测它抢了火山服务端的判停权，造成「话没说完就返回」+「识别率下降」，
+            // 已在 6bb434e 移除判停副作用。现在判停权威是：
+            //   · 正常情况：火山 is_vad_endpoint（服务端 definite）
+            //   · 火山不回 definite：TEXT_STABLE_MS 文本稳定兜底
+            //   · 用户一直没说话：no_speech_notify 的无语音超时
+            //   · 极端兜底：传输层 RECORDING_LIMIT
+            // 它留下的周期性日志也一并删掉 —— 每次说话停顿都刷一行，纯噪音。
 
             Ok(Some((pcm_bytes, state.pcm_tx.clone())))
         })??; // MutexGuard 在此处释放
@@ -3066,12 +3277,21 @@ async fn asr_listen_to_text(
         .map_err(|e| format!("ASR 启动失败: {}", e))?;
 
     let mut full_text = String::new();
+    // 火山在 end_window_size 偏短时不会发 is_final，只发中间结果。
+    // 只认 is_final 的话这里会永远拿到空串 —— 实测批处理兜底 3 次触发 0 次成功，
+    // 而且流也结束不了，只能干等超时。
+    // 这里保留最后一次非空结果兜底，与流式路径的 last_nonempty_text 保持一致。
+    let mut last_nonempty_text = String::new();
     let mut chunk_count = 0;
 
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(chunk) => {
                 chunk_count += 1;
+                // univoice 的 chunk.text 是【累积文本】，整体替换即可，不用拼接。
+                if !chunk.text.is_empty() {
+                    last_nonempty_text.clone_from(&chunk.text);
+                }
                 if chunk.is_final && !chunk.text.is_empty() {
                     full_text.push_str(&chunk.text);
                 }
@@ -3080,6 +3300,15 @@ async fn asr_listen_to_text(
                 tracing::warn!("ASR 识别块错误: {}", e);
             }
         }
+    }
+
+    if full_text.is_empty() && !last_nonempty_text.is_empty() {
+        tracing::warn!(
+            chunk_count = chunk_count,
+            text_len = last_nonempty_text.len(),
+            "批处理 ASR: 未收到 is_final 块，使用最后中间结果兜底",
+        );
+        full_text = last_nonempty_text;
     }
 
     tracing::debug!(
@@ -3643,6 +3872,45 @@ mod tests {
         }
     }
 
+    /// 模拟 Agent：记录 drop_session 被调用的 session_id
+    ///
+    /// 用它验证「hello 时不仅清掉策略侧的 session_id，还让 Agent 丢掉本地历史」。
+    struct DropRecordingAgent {
+        dropped: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl AgentProvider for DropRecordingAgent {
+        fn name(&self) -> &str {
+            "drop-recording-agent"
+        }
+
+        async fn process(
+            &self,
+            message: &str,
+            _session_id: Option<&str>,
+            _work_dir: &str,
+        ) -> Result<(AgentOutput, String), String> {
+            Ok((
+                AgentOutput {
+                    text: message.to_string(),
+                    events: Vec::new(),
+                },
+                "drop-recording-session".to_string(),
+            ))
+        }
+
+        async fn check_available(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn drop_session(&self, session_id: &str) {
+            if let Ok(mut dropped) = self.dropped.lock() {
+                dropped.push(session_id.to_string());
+            }
+        }
+    }
+
     fn test_tts_config() -> crate::config::settings::TtsConfig {
         let mut providers = std::collections::HashMap::new();
         let mut creds = std::collections::HashMap::new();
@@ -3719,6 +3987,187 @@ mod tests {
             len <= SESSION_STATE_MAX,
             "会话状态表不应超过 {SESSION_STATE_MAX}，实际 {len}"
         );
+    }
+
+    /// Silero VAD 冒烟：模型能从 crate 内置资源加载，且对纯静音不误报。
+    ///
+    /// 这条测试同时保证 ONNX Runtime 在构建环境里可用 —— 它是整个
+    /// Silero 方案唯一的运行时依赖，加载失败会直接体现为这里 panic。
+    #[test]
+    fn silero_vad_loads_and_ignores_silence() {
+        let mut vad = SileroVad::new().expect("Silero VAD 应能加载内置模型");
+        // 960 个 0 样本 = 一帧 60ms 静音（刚好凑出 1 块 512，余 448 留到下一帧）
+        let silence = vec![0i16; 960];
+        // 多喂几帧：Silero 内部有 state/context，第一块未必立刻收敛到 0
+        let mut last = (true, 1.0f32);
+        for _ in 0..4 {
+            last = vad.push_frame(&silence);
+        }
+        assert!(!last.0, "纯静音不该判成人声");
+        assert!(last.1 < 0.3, "纯静音的概率应低于低阈值，实际 {}", last.1);
+    }
+
+    /// 上一句没凑满 512 的余数会原样拼进下一块。
+    ///
+    /// 帧长 960 与窗口 512 不整除，余数最多 511（约 32ms）。录音边界若不丢掉
+    /// 这些样本，下一句的第一块就是两句混在一起的音频。
+    #[test]
+    fn silero_remainder_is_prepended_to_the_next_window() {
+        let mut vad = SileroVad::new().expect("Silero VAD 应能加载内置模型");
+        let marker = 9_000i16;
+        vad.push_frame(&[marker; 100]);
+        assert_eq!(vad.pending.len(), 100, "不足一块的样本应留在 pending");
+
+        vad.push_frame(&[0i16; 50]);
+        assert_eq!(vad.pending.len(), 150);
+        assert!(
+            vad.pending[..100].iter().all(|&s| s == marker),
+            "下一次喂入应接在上一句余数后面，而不是丢掉它"
+        );
+    }
+
+    /// 迟滞带 (0.3, 0.5) 沿用上一判定。上一句若停在「人声」，
+    /// 下一句开头落在带内会被立刻当成有人声，speech_detected 马上置位。
+    #[test]
+    fn silero_hysteresis_keeps_previous_voice_decision() {
+        assert!(vad_voice(0.4, true), "迟滞带应沿用上一句的人声判定");
+        assert!(
+            !vad_voice(0.4, false),
+            "上一判定为静音时，迟滞带不能判成人声"
+        );
+        assert!(vad_voice(VAD_PROB_HIGH, false), "达到高阈值应判成人声");
+        assert!(!vad_voice(VAD_PROB_LOW, true), "落到低阈值应判成静音");
+    }
+
+    /// reset 之后下一次喂入不能再看见上一句的样本，迟滞也回到静音。
+    #[test]
+    fn silero_reset_utterance_drops_remainder_before_next_window() {
+        let mut vad = SileroVad::new().expect("Silero VAD 应能加载内置模型");
+        let marker = 9_000i16;
+        vad.push_frame(&[marker; 400]);
+        assert_eq!(vad.pending.len(), 400);
+        vad.last_voice = true;
+
+        vad.reset_utterance();
+        assert!(vad.pending.is_empty(), "余数应被丢掉");
+        assert!(!vad.last_voice, "迟滞应回到静音");
+
+        vad.push_frame(&[0i16; 50]);
+        assert_eq!(
+            vad.pending,
+            vec![0i16; 50],
+            "下一句的样本不应再拼上上一句的余数"
+        );
+
+        // reset 清掉模型隐状态之后，纯静音仍应判成静音。
+        let silence = vec![0i16; 960];
+        let mut last = (true, 1.0f32);
+        for _ in 0..4 {
+            last = vad.push_frame(&silence);
+        }
+        assert!(!last.0, "reset 后的纯静音不该判成人声");
+        assert!(
+            last.1 < 0.3,
+            "reset 后静音概率应低于低阈值，实际 {}",
+            last.1
+        );
+    }
+
+    /// 新录音必须丢掉上一句的余数和迟滞，否则第一块是混音，
+    /// 或者迟滞直接置 speech_detected、废掉无语音超时。
+    #[tokio::test]
+    async fn recording_start_clears_silero_remainder_and_hysteresis() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy
+            .with_session("dev", |state| {
+                let vad = state.silero.as_mut().expect("Silero 应已初始化");
+                vad.pending.extend_from_slice(&[9_000i16; 400]);
+                vad.last_voice = true;
+            })
+            .expect("写入上一句的 VAD 残留");
+
+        strategy
+            .on_recording_start("dev", "sess-1")
+            .await
+            .expect("on_recording_start 不应失败");
+
+        strategy
+            .read_session("dev", |state| {
+                let vad = state.expect("会话应存在").silero.as_ref().expect("Silero");
+                assert!(
+                    vad.pending.is_empty(),
+                    "新录音不应再带上一句的余数，实际 {} 个样本",
+                    vad.pending.len()
+                );
+                assert!(
+                    !vad.last_voice,
+                    "新录音的迟滞应从静音开始，不能沿用上一句的人声判定"
+                );
+            })
+            .expect("读取 VAD 状态");
+    }
+
+    /// 新 hello 同样要清 VAD。没有旧 LLM 会话时函数会提前返回，
+    /// 清残留不能放在那次返回之后。
+    #[tokio::test]
+    async fn conversation_start_clears_silero_even_without_llm_session() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy
+            .with_session("dev", |state| {
+                let vad = state.silero.as_mut().expect("Silero 应已初始化");
+                vad.pending.extend_from_slice(&[9_000i16; 511]);
+                vad.last_voice = true;
+                assert!(state.llm_session_id.is_none());
+            })
+            .expect("写入上一轮的 VAD 残留");
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("没有旧 LLM 会话时 on_conversation_start 也应成功");
+
+        strategy
+            .read_session("dev", |state| {
+                let vad = state.expect("会话应存在").silero.as_ref().expect("Silero");
+                assert!(
+                    vad.pending.is_empty(),
+                    "新对话不应再带上一轮的余数，实际 {} 个样本",
+                    vad.pending.len()
+                );
+                assert!(!vad.last_voice, "新对话的迟滞应从静音开始");
+            })
+            .expect("读取 VAD 状态");
+    }
+
+    /// 有旧 LLM 会话时，清会话之外也要清 VAD 余数和迟滞。
+    #[tokio::test]
+    async fn conversation_start_clears_silero_along_with_llm_session() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy.store_llm_session_at("dev", "old-session".to_string(), 0);
+        strategy
+            .with_session("dev", |state| {
+                let vad = state.silero.as_mut().expect("Silero 应已初始化");
+                vad.pending.extend_from_slice(&[1i16; 64]);
+                vad.last_voice = true;
+            })
+            .expect("写入上一轮的 VAD 残留");
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("on_conversation_start 不应失败");
+
+        assert!(
+            strategy.llm_session_at("dev", 0).unwrap().is_none(),
+            "旧 LLM 会话仍应被清掉"
+        );
+        strategy
+            .read_session("dev", |state| {
+                let vad = state.expect("会话应存在").silero.as_ref().expect("Silero");
+                assert!(vad.pending.is_empty());
+                assert!(!vad.last_voice);
+            })
+            .expect("读取 VAD 状态");
     }
 
     /// 会话级状态必须按 session_key 隔离。
@@ -3948,6 +4397,104 @@ mod tests {
         );
     }
 
+    /// 下一次 hello：上一轮残留的 LLM session_id 必须变成 None。
+    #[tokio::test]
+    async fn test_t18c_conversation_start_clears_llm_session() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        strategy.store_llm_session_at("dev", "old-session".to_string(), 0);
+        assert_eq!(
+            strategy.llm_session_at("dev", 0).unwrap().as_deref(),
+            Some("old-session")
+        );
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("on_conversation_start 不应失败");
+
+        assert!(
+            strategy.llm_session_at("dev", 0).unwrap().is_none(),
+            "新 hello 后 llm_session_id 应为 None"
+        );
+    }
+
+    /// 首次 hello（没有旧会话）也要安全返回，且不该调用 Agent 的 drop_session。
+    #[tokio::test]
+    async fn test_t18d_conversation_start_without_old_session() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let strategy = make_strategy(Arc::new(DropRecordingAgent {
+            dropped: Arc::clone(&dropped),
+        }));
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("没有旧会话时也应返回 Ok");
+
+        assert!(
+            dropped.lock().expect("锁").is_empty(),
+            "没有旧 session 时不应调用 drop_session"
+        );
+    }
+
+    /// 清 session_id 的同时必须让 Agent 丢掉对应历史，否则内存泄漏和
+    /// 「上一轮污染下一轮」都还在。
+    #[tokio::test]
+    async fn test_t18e_conversation_start_drops_agent_history() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let strategy = make_strategy(Arc::new(DropRecordingAgent {
+            dropped: Arc::clone(&dropped),
+        }));
+        strategy.store_llm_session_at("dev", "old-session".to_string(), 0);
+
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("on_conversation_start 不应失败");
+
+        assert_eq!(
+            dropped.lock().expect("锁").as_slice(),
+            ["old-session"],
+            "应把旧 session_id 交给 Agent 丢弃历史"
+        );
+
+        // 再 hello 一次：旧会话已清，不能重复 drop
+        strategy
+            .on_conversation_start("dev")
+            .await
+            .expect("重复调用不应失败");
+        assert_eq!(
+            dropped.lock().expect("锁").len(),
+            1,
+            "同一旧 session 只该被丢弃一次"
+        );
+    }
+
+    /// 一次 hello → goodbye 内部的多轮必须持续复用同一个 LLM 会话，
+    /// 只有下一次 hello 才清 —— 否则多轮对话会被误清成单轮。
+    #[test]
+    fn test_t18f_same_conversation_reuses_llm_session_across_turns() {
+        let strategy = make_strategy(Arc::new(MockAgent));
+        // 第一轮：没有旧会话，Agent 返回 session 后落盘
+        assert!(strategy.llm_session_at("dev", 0).unwrap().is_none());
+        strategy.store_llm_session_at("dev", "mock-session-id".to_string(), 0);
+
+        // 第二轮：应带上第一轮的 session_id 继续同一会话
+        assert_eq!(
+            strategy.llm_session_at("dev", 0).unwrap().as_deref(),
+            Some("mock-session-id"),
+            "同一对话的第二轮应复用第一轮的 session_id"
+        );
+        strategy.store_llm_session_at("dev", "mock-session-id".to_string(), 0);
+
+        // 第三轮：仍然复用，说明轮间没有误清
+        assert_eq!(
+            strategy.llm_session_at("dev", 0).unwrap().as_deref(),
+            Some("mock-session-id"),
+            "同一对话的第三轮仍应复用同一个 session_id"
+        );
+    }
+
     // ─── generate_response 行为测试（Mock Agent） ───────
 
     #[tokio::test]
@@ -4165,6 +4712,44 @@ mod tests {
         assert_eq!(provider.name(), "qwen");
     }
 
+    // ─── 首句宽标点切分（E：首帧更早出声）─────────────────
+
+    /// 首句遇到逗号就切。LLM 第一个 delta 常是「好的，我这就…」这种
+    /// 带逗号但没有句末标点的片段，不切的话整段都要等 TTS 合成完才出声。
+    #[test]
+    fn test_t48_first_sentence_splits_on_comma() {
+        let mut agg = TtsTextAggregator::new(180);
+        let blocks = agg.push("好的，我这就");
+        assert_eq!(blocks.len(), 1, "首句应切出一块");
+        assert_eq!(blocks[0], "好的，", "首句应在逗号处切开");
+    }
+
+    /// 首句整句带逗号：切成两块，第一块明显更短 —— TTS 可以先合成短的那块出声。
+    #[test]
+    fn test_t49_first_sentence_shorter_first_block() {
+        let mut agg = TtsTextAggregator::new(180);
+        let blocks = agg.push("好的，我这就帮你打开客厅的灯。");
+        assert_eq!(blocks.len(), 2, "首句应被逗号切成两块");
+        assert_eq!(blocks[0], "好的，");
+        assert!(
+            blocks[0].chars().count() < blocks[1].chars().count(),
+            "第一块应明显短于第二块"
+        );
+    }
+
+    /// 非首句不按逗号切 —— 否则整段回复会被逗号切碎，每小段都要重新起调。
+    #[test]
+    fn test_t50_later_sentences_ignore_comma() {
+        let mut agg = TtsTextAggregator::new(180);
+        let first = agg.push("第一句。");
+        assert_eq!(first, vec!["第一句。"]);
+        let blocks = agg.push("第二句有逗号，但不该在这里切开");
+        assert!(
+            blocks.is_empty(),
+            "非首句的逗号不该触发切分，残句应留在缓冲等句末标点"
+        );
+    }
+
     // ─── take_sentence 句切分测试 ──────────────────────────
 
     #[test]
@@ -4374,7 +4959,11 @@ mod tests {
     fn test_a5_clean_marks_in_aggregator() {
         let mut agg = TtsTextAggregator::new(100);
         let blocks = agg.push("**你好**，世界。");
-        assert_eq!(blocks, vec!["你好，世界。"]);
+        // 这条测试关心的是 markdown 清洗（`**` 被去掉），不是切分粒度。
+        // 首句现在会在逗号处切开（E：首帧更早出声），所以这里是两块；
+        // 拼起来比对，既验证清洗又不会被切分策略变动影响。
+        assert_eq!(blocks.concat(), "你好，世界。");
+        assert_eq!(blocks, vec!["你好，", "世界。"]);
     }
 
     #[tokio::test]
@@ -4679,8 +5268,8 @@ mod tests {
             decoder,
             frame_samples: 960,
             frame_count: 0,
-            last_log_frame: 0,
-            silence_count: 0,
+            last_vad_voice: false,
+            vad_flip_run: 0,
             speech_detected: false,
             no_speech_frames: 0,
         };
@@ -4776,6 +5365,13 @@ mod tests {
     #[tokio::test]
     async fn test_ns3_no_speech_resets_on_speech() {
         let strategy = make_strategy_with_pipeline(300); // 5 帧
+        // 这条测试验证的是「无语音超时计数」的逻辑，不是 VAD 实现本身。
+        // Silero 只认真实语音，会把下面这个合成正弦音判成非人声（这是对的），
+        // 所以这里强制回退到能量判据，让测试保持确定性。
+        // VAD 本身由 silero_vad_loads_and_ignores_silence 覆盖。
+        strategy
+            .with_session("test", |state| state.silero = None)
+            .expect("准备会话");
         // 4 帧静音 + 1 帧响亮（检测到语音，无语音超时作废）
         for _ in 0..4 {
             strategy

@@ -104,6 +104,9 @@ which = "8"
 
 
 [dependencies]
+# Silero VAD v5（ONNX 推理）：用神经网络判断人声，替代不可靠的能量阈值
+# 模型内置在 crate 里，运行时不需要额外文件
+voice_activity_detector = "0.2"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 tokio = { workspace = true }

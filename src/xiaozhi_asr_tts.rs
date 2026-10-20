@@ -209,12 +209,14 @@ impl ResponseStrategy for AsrTtsStrategy {
 
         let audio_stream = adapt_audio_input(AudioInput::Data(pcm_16k), DEFAULT_CHUNK_SIZE);
 
+        // 超时从 30s 降到 6s：批处理 ASR 正常 1~2 秒就出结果，
+        // 6 秒还没出就是没戏，不该让用户干等半分钟（同 mqtt 路径的处理）。
         let text = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(6),
             asr_listen_to_text(&*asr, audio_stream),
         )
         .await
-        .map_err(|_| "ASR 识别超时 (30s)".to_string())?
+        .map_err(|_| "批处理 ASR 超时 (6s)".to_string())?
         .map_err(|e| format!("ASR 识别失败: {}", e))?;
 
         if text.is_empty() {
