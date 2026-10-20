@@ -1,7 +1,10 @@
 pub mod agent_logs;
 pub mod agent_settings;
+pub mod common;
 pub mod connectors;
+pub mod logs;
 pub mod system;
 pub mod voice_settings;
 pub mod webhook;
 pub mod xiaozhi_devices;
+pub mod xiaozhi_settings;

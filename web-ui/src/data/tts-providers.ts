@@ -6,11 +6,17 @@ export interface ProviderField {
   /** 界面显示标签 */
   label: string;
   /** 输入类型 */
-  type: 'password' | 'text' | 'select';
+  type: 'password' | 'text' | 'number' | 'select';
   /** 空值时的占位提示 */
   placeholder?: string;
   /** select 类型的选项列表 */
   options?: string[];
+  /** number 类型的最小值 */
+  min?: number;
+  /** number 类型的最大值 */
+  max?: number;
+  /** number 类型的步长 */
+  step?: number;
 }
 
 export interface ProviderInfo {
@@ -34,6 +40,20 @@ export const TTS_PROVIDERS: ProviderInfo[] = [
         type: 'password',
         placeholder: '未设置，可用环境变量 DOUBAO_API_KEY',
       },
+      {
+        key: 'resource_id',
+        label: '资源 ID',
+        type: 'select',
+        placeholder: 'seed-tts-2.0',
+        options: ['seed-tts-2.0', 'seed-tts-1.0'],
+      },
+      {
+        key: 'cluster',
+        label: 'Cluster',
+        type: 'select',
+        placeholder: '未设置（默认使用 2.0 资源）',
+        options: ['volcano_icl'],
+      },
     ],
   },
   {
@@ -45,15 +65,18 @@ export const TTS_PROVIDERS: ProviderInfo[] = [
         key: 'model',
         label: '模型',
         type: 'select',
-        placeholder: 'cosyvoice-v3-flash',
-        options: ['cosyvoice-v1', 'cosyvoice-v2', 'cosyvoice-v3-flash', 'cosyvoice-v3-plus'],
+        placeholder: 'qwen3-tts-instruct-flash-realtime',
+        options: ['qwen3-tts-instruct-flash-realtime', 'qwen3-tts-flash-realtime'],
       },
     ],
   },
   {
     id: 'glm',
     name: '智谱AI',
-    fields: [{ key: 'api_key', label: 'API Key', type: 'password' }],
+    fields: [
+      { key: 'api_key', label: 'API Key', type: 'password' },
+      { key: 'model', label: '模型', type: 'text', placeholder: 'glm-tts' },
+    ],
   },
   {
     id: 'minimax',
@@ -76,6 +99,35 @@ export const TTS_PROVIDERS: ProviderInfo[] = [
           'speech-01',
         ],
       },
+      {
+        key: 'speed',
+        label: '语速',
+        type: 'number',
+        placeholder: '1.0',
+        min: 0.5,
+        max: 2,
+        step: 0.1,
+      },
+    ],
+  },
+  {
+    id: 'openai',
+    name: 'OpenAI',
+    fields: [
+      {
+        key: 'api_key',
+        label: 'API Key',
+        type: 'password',
+        placeholder: '未设置，可用环境变量 OPENAI_API_KEY',
+      },
+      {
+        key: 'base_url',
+        label: 'Base URL',
+        type: 'text',
+        placeholder: 'https://api.openai.com/v1',
+      },
+      { key: 'model', label: '模型', type: 'text', placeholder: 'gpt-4o-mini-tts' },
+      { key: 'voice', label: '音色', type: 'text', placeholder: 'alloy' },
     ],
   },
 ];

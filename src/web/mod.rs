@@ -271,6 +271,23 @@ pub async fn start(
             axum::routing::put(api::xiaozhi_devices::update_xiaozhi_devices),
         );
 
+    // 小智传输 / OTA / say 鉴权配置（设备目录仍由上面的 endpoint 管理）
+    let xiaozhi_settings_routes = axum::Router::new()
+        .route(
+            "/api/v1/settings/xiaozhi",
+            axum::routing::get(api::xiaozhi_settings::get_xiaozhi_settings),
+        )
+        .route(
+            "/api/v1/settings/xiaozhi",
+            axum::routing::put(api::xiaozhi_settings::update_xiaozhi_settings),
+        );
+
+    // 运行日志 SSE：实时 tail ~/.haimen/logs/app.log
+    let logs_routes = axum::Router::new().route(
+        "/api/v1/logs/stream",
+        axum::routing::get(api::logs::stream_logs),
+    );
+
     let app = if let Some(state) = webhook_state {
         let mut r = axum::Router::new()
             .route("/health", axum::routing::get(health_handler))
@@ -280,14 +297,20 @@ pub async fn start(
                 axum::routing::post(api::webhook::handle_github_webhook),
             )
             .with_state(state);
+        // 控制面（say / devices）即使没有 ASR 策略也要挂载：
+        // 小智配置页需要设备清单和播报测试，不能因为没配 ASR 就整组 404。
         if let Some(strategy) = xiaozhi_strategy {
             r = haimen_xiaozhi::add_routes(r, strategy);
+        } else {
+            r = haimen_xiaozhi::add_control_routes(r);
         }
         r = r.merge(asr_routes);
         r = r.merge(tts_routes);
         r = r.merge(agent_routes);
         r = r.merge(connectors_routes);
         r = r.merge(xiaozhi_devices_routes);
+        r = r.merge(xiaozhi_settings_routes);
+        r = r.merge(logs_routes);
         r.fallback(r#static::handle)
     } else {
         let mut r = axum::Router::new()
@@ -295,12 +318,16 @@ pub async fn start(
             .route("/api/v1/system/info", axum::routing::get(api::system::info));
         if let Some(strategy) = xiaozhi_strategy {
             r = haimen_xiaozhi::add_routes(r, strategy);
+        } else {
+            r = haimen_xiaozhi::add_control_routes(r);
         }
         r = r.merge(asr_routes);
         r = r.merge(tts_routes);
         r = r.merge(agent_routes);
         r = r.merge(connectors_routes);
         r = r.merge(xiaozhi_devices_routes);
+        r = r.merge(xiaozhi_settings_routes);
+        r = r.merge(logs_routes);
         r.fallback(r#static::handle)
     };
 

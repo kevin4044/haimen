@@ -40,34 +40,24 @@ pub fn set_xiaozhi_ota_config(cfg: XiaozhiConfig) {
     ota::set_xiaozhi_ota_config(cfg);
 }
 
-/// 向 axum Router 注入 xiaozhi 设备通信端点
+/// 注入 xiaozhi 控制面端点（不包含 OTA / WebSocket 设备通信入口）
 ///
-/// 路由始终挂载（MQTT 模式下设备仍可能回退到 WebSocket）：
-/// - `POST /xiaozhi/ota/`          — OTA 握手，按配置下发 websocket 或 mqtt 段
-/// - `GET  /xiaozhi/ws`            — WebSocket 升级端点
-/// - `GET  /xiaozhi/say/{id}`      — 一次性通知音频（实际 URL 带 `.ogg` 后缀，由 handler 剥掉）
-/// - `POST /api/v1/xiaozhi/say`    — 主动播报：文本 → Ogg Opus → 托管 → 下发 notify
+/// 这组路由不依赖 WebSocket 响应策略，因此**不要求**调用方先构造 strategy：
+/// - `POST /api/v1/xiaozhi/say`     — 主动播报：文本 → Ogg Opus → 托管 → 下发 notify
 /// - `GET  /api/v1/xiaozhi/devices` — 设备清单：配置 + 在线/忙闲状态
+/// - `GET  /xiaozhi/say/{id}`       — 一次性通知音频（实际 URL 带 `.ogg` 后缀，由 handler 剥掉）
+///
+/// 为什么和 [`add_routes`] 拆开：即使没有 `xiaozhi_strategy`（例如纯 REST /
+/// Web UI 场景），say 与 devices 端点也应该可用；OTA 与 WebSocket 才依赖策略。
 ///
 /// # 参数
 ///
 /// * `router` — 待扩展的 axum Router
-/// * `strategy` — WebSocket 响应策略，控制设备录音结束后的回放行为
 ///
 /// 接受任意 State 类型（`S: Clone + Send + Sync + 'static`），
-/// 因为 xiaozhi 处理器不依赖外部状态。
-pub fn add_routes<S: Clone + Send + Sync + 'static>(
-    router: Router<S>,
-    strategy: Arc<dyn ResponseStrategy>,
-) -> Router<S> {
+/// 因为 xiaozhi 处理器都走全局槽、不依赖外部状态。
+pub fn add_control_routes<S: Clone + Send + Sync + 'static>(router: Router<S>) -> Router<S> {
     router
-        .route("/xiaozhi/ota/", axum::routing::post(ota::handle_ota))
-        .route(
-            "/xiaozhi/ws",
-            axum::routing::get(move |ws, headers| {
-                ws::handle_ws_upgrade(ws, headers, strategy.clone())
-            }),
-        )
         // 通知音频和 say 接口都用全局槽（say_audio::say_audio_store /
         // notify 的设置槽），不污染 Router 的状态类型。
         .route(
@@ -83,4 +73,36 @@ pub fn add_routes<S: Clone + Send + Sync + 'static>(
             "/api/v1/xiaozhi/devices",
             axum::routing::get(notify::handle_devices),
         )
+}
+
+/// 向 axum Router 注入 xiaozhi 设备通信与控制面端点
+///
+/// 路由始终挂载（MQTT 模式下设备仍可能回退到 WebSocket）：
+/// - `POST /xiaozhi/ota/`          — OTA 握手，按配置下发 websocket 或 mqtt 段
+/// - `GET  /xiaozhi/ws`            — WebSocket 升级端点
+/// - 其余 say / devices 端点见 [`add_control_routes`]
+///
+/// 内部只调用一次 [`add_control_routes`]，避免同一路径被重复注册
+/// （axum 对同一路径重复 `route` 会 panic）。
+///
+/// # 参数
+///
+/// * `router` — 待扩展的 axum Router
+/// * `strategy` — WebSocket 响应策略，控制设备录音结束后的回放行为
+///
+/// 接受任意 State 类型（`S: Clone + Send + Sync + 'static`），
+/// 因为 xiaozhi 处理器不依赖外部状态。
+pub fn add_routes<S: Clone + Send + Sync + 'static>(
+    router: Router<S>,
+    strategy: Arc<dyn ResponseStrategy>,
+) -> Router<S> {
+    let router = router
+        .route("/xiaozhi/ota/", axum::routing::post(ota::handle_ota))
+        .route(
+            "/xiaozhi/ws",
+            axum::routing::get(move |ws, headers| {
+                ws::handle_ws_upgrade(ws, headers, strategy.clone())
+            }),
+        );
+    add_control_routes(router)
 }

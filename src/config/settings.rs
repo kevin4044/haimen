@@ -894,7 +894,9 @@ pub fn load_settings() -> Result<Option<AppConfig>, String> {
     let content = match std::fs::read_to_string(&file_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Ok(None),
+        // 权限/IO 错误不能被当成「没有配置文件」：否则 Web 保存会用默认值
+        // 覆盖掉用户现有配置。把错误交给调用方决定是否继续。
+        Err(e) => return Err(format!("读取配置文件失败: {}", e)),
     };
 
     let config: AppConfig =

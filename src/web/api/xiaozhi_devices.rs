@@ -166,16 +166,11 @@ pub async fn update_xiaozhi_devices(
         });
     }
 
-    let mut cfg = load_config();
-    cfg.xiaozhi.devices = devices;
-
-    if let Err(e) = crate::config::settings::save_settings(&cfg) {
-        tracing::warn!(error = %e, "保存小智设备配置到文件失败");
-        return Err(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("保存配置失败: {e}"),
-        ));
-    }
+    let (cfg, _) = crate::web::api::common::update_settings(|cfg| {
+        cfg.xiaozhi.devices = devices;
+        Ok(false)
+    })
+    .map_err(|e| error_response(e.status(), e.message()))?;
 
     // 立即生效：对话侧的房间上下文注入、notify 的按设备名/房间寻址都读这个全局槽。
     haimen_xiaozhi::devices::install_devices_from_config(&cfg.xiaozhi.devices);

@@ -392,9 +392,13 @@ pub async fn handle_say(headers: HeaderMap, Json(req): Json<SayRequest>) -> Resp
 /// 2. MQTT 当前在线的设备（可能还没配置名字/房间）；
 /// 3. 每台在线设备的忙闲状态（notify 只在 idle 生效）。
 ///
+/// `mqtt_running` 表示 MQTT 传输层是否真的在跑（`say_hub()` 是否已安装）。
+/// websocket 模式下为 `false`，此时 `devices` 里只会出现配置文件里的条目，
+/// `online` 恒为 false —— 前端据此提示「需要切到 MQTT 才能看到在线状态」。
+///
 /// 响应示例：
 /// ```json
-/// {"ok":true,"devices":[
+/// {"ok":true,"mqtt_running":true,"devices":[
 ///   {"device_id":"84:c7:bb:59:93:64","client_id":"GID_...","name":"客厅小智",
 ///    "room":"客厅","online":true,"state":"idle"},
 ///   {"device_id":"aa:bb:cc:dd:ee:ff","client_id":null,"name":"卧室小智",
@@ -407,6 +411,7 @@ pub async fn handle_devices(headers: HeaderMap) -> Response {
     }
 
     let hub = crate::mqtt_udp::say_hub();
+    let mqtt_running = hub.is_some();
     let online = match hub.as_ref() {
         Some(hub) => hub.online_devices().await,
         None => Vec::new(),
@@ -470,7 +475,13 @@ pub async fn handle_devices(headers: HeaderMap) -> Response {
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "devices": entries })),
+        Json(serde_json::json!({
+            "ok": true,
+            // websocket 模式（未安装 say hub）没有在线设备，前端据此区分
+            // 「设备都不在线」和「MQTT 传输层根本没启用」。
+            "mqtt_running": mqtt_running,
+            "devices": entries,
+        })),
     )
         .into_response()
 }
@@ -805,6 +816,8 @@ mod tests {
         let text = String::from_utf8_lossy(&raw);
         let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(&text);
         let json: serde_json::Value = serde_json::from_str(body).expect("devices JSON");
+        // boot() 装了假 hub，因此 MQTT 传输层应报告为运行中。
+        assert_eq!(json["mqtt_running"], true, "已安装 say hub：{body}");
         let devices = json["devices"].as_array().expect("devices 数组");
         assert_eq!(devices.len(), 2, "应合并在线与离线配置：{body}");
 

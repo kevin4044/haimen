@@ -24,14 +24,23 @@ fn default_voice(provider: &str) -> &'static str {
     }
 }
 
-/// 构建 BaseTtsOption 公共部分
+/// 构建 BaseTtsOption 公共部分。
+///
+/// 常见参数统一从 providers.<active> 读取，避免「UI 有字段但工厂不读」：
+/// - `model` / `base_url`：qwen、glm、openai、minimax 都走 BaseTtsOption；
+/// - `speed`：minimax/glm/openai 等支持语速的 provider 由各自实现决定是否使用。
 fn build_base_option(config: &TtsConfig, active: &str) -> BaseTtsOption {
     BaseTtsOption {
         api_key: config.get_credential("api_key"),
+        base_url: config.get_credential("base_url"),
+        model: config.get_credential("model"),
         voice: config
             .get_credential("voice")
             .or_else(|| Some(default_voice(active).into()))
             .map(|v| VoiceId::from(v.as_str())),
+        speed: config
+            .get_credential("speed")
+            .and_then(|value| value.trim().parse::<f32>().ok()),
         format: Some("pcm".into()),
         ..Default::default()
     }
@@ -123,14 +132,6 @@ pub fn create_tts_provider(config: &TtsConfig) -> Result<Box<dyn TtsProvider>, S
                 .ok_or_else(|| "缺少 MiniMax API Key".to_string())?;
             let mut base = build_base_option(config, "minimax");
             base.api_key = Some(api_key);
-            if let Some(model) = config.get_credential("model") {
-                base.model = Some(model);
-            }
-            if let Some(speed_str) = config.get_credential("speed") {
-                if let Ok(speed) = speed_str.parse::<f32>() {
-                    base.speed = Some(speed);
-                }
-            }
             Ok(Box::new(MinimaxTts::new(MinimaxTtsOption {
                 base,
                 sample_rate: Some(24000),
@@ -145,6 +146,42 @@ pub fn create_tts_provider(config: &TtsConfig) -> Result<Box<dyn TtsProvider>, S
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_build_base_option_reads_model_base_url_and_speed() {
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert("api_key".to_string(), "key".to_string());
+        creds.insert("model".to_string(), "custom-model".to_string());
+        creds.insert("base_url".to_string(), "http://example.test/v1".to_string());
+        creds.insert("speed".to_string(), "1.25".to_string());
+        providers.insert("openai".to_string(), creds);
+
+        let config = TtsConfig {
+            active_provider: "openai".to_string(),
+            providers,
+            ..Default::default()
+        };
+        let base = build_base_option(&config, "openai");
+        assert_eq!(base.api_key.as_deref(), Some("key"));
+        assert_eq!(base.model.as_deref(), Some("custom-model"));
+        assert_eq!(base.base_url.as_deref(), Some("http://example.test/v1"));
+        assert_eq!(base.speed, Some(1.25));
+    }
+
+    #[test]
+    fn test_build_base_option_ignores_invalid_speed() {
+        let mut providers = HashMap::new();
+        let mut creds = HashMap::new();
+        creds.insert("speed".to_string(), "fast".to_string());
+        providers.insert("minimax".to_string(), creds);
+        let config = TtsConfig {
+            active_provider: "minimax".to_string(),
+            providers,
+            ..Default::default()
+        };
+        assert_eq!(build_base_option(&config, "minimax").speed, None);
+    }
 
     #[test]
     fn test_create_doubao_provider() {

@@ -4,6 +4,9 @@ export interface ApiResponse<T = unknown> {
   success: boolean;
   data?: T;
   error?: string;
+  message?: string;
+  /** 保存成功但需要重启 haimen 才生效 */
+  restart_required?: boolean;
 }
 
 // ── 系统信息 ──
@@ -104,6 +107,14 @@ export interface TtsSettings {
   no_speech_goodbye: string | null;
   /** 录音开始后累计无有效语音达到该毫秒数时播报告别并关闭连接（0 禁用） */
   no_speech_timeout_ms: number;
+  /** 是否在等待 Agent 首个可播文本期间播报处理进度提示 */
+  thinking_feedback_enabled: boolean;
+  /** 进度提示播报间隔毫秒（0 = 仅保留超时兜底） */
+  thinking_feedback_interval_ms: number;
+  /** 周期进度提示文案（空串回退默认） */
+  thinking_feedback_text: string | null;
+  /** 等待超时的兜底文案（空串回退默认） */
+  thinking_feedback_timeout_text: string | null;
   /** 当前激活提供商的回退解析值 */
   resolved?: {
     api_key: string | null;
@@ -255,4 +266,65 @@ export type XiaozhiDeviceState = 'idle' | 'listening' | 'playing';
 export interface XiaozhiDevicesData {
   devices: XiaozhiConfiguredDevice[];
   online: XiaozhiOnlineDevice[];
+}
+
+// ── 小智传输 / OTA / 主动播报配置 ──
+
+export interface XiaozhiMqttSettings {
+  endpoint: string;
+  username: string;
+  password: string;
+  auth_key: string;
+  auth_grace: boolean;
+  keepalive: number;
+  publish_topic_template: string;
+  downlink_topic_template: string;
+}
+
+export interface XiaozhiUdpSettings {
+  bind_addr: string;
+}
+
+/** `GET/PUT /api/v1/settings/xiaozhi` 的 data（设备目录在单独接口） */
+export interface XiaozhiSettings {
+  protocol: 'websocket' | 'mqtt';
+  mqtt: XiaozhiMqttSettings;
+  udp: XiaozhiUdpSettings;
+  ota_allow_private_only: boolean;
+  ota_token: string;
+  ota_trusted_proxies: string[];
+  say_token: string;
+}
+
+/** `POST /api/v1/xiaozhi/say` 成功响应 */
+export interface XiaozhiSayResult {
+  ok: true;
+  device: string;
+  client_id: string;
+  name: string;
+  room: string;
+  mode: string;
+  audio_url: string;
+  duration_ms: number;
+}
+
+/** `POST /api/v1/xiaozhi/say` / devices 的失败响应 */
+export interface XiaozhiErrorBody {
+  ok: false;
+  error: string;
+  detail?: string;
+  state?: string;
+  room?: string;
+  devices?: XiaozhiOnlineDevice[];
+}
+
+// ── 运行日志 ──
+
+export interface RuntimeLogMeta {
+  path: string;
+  tail: number;
+}
+
+export interface RuntimeLogBatch {
+  lines: string[];
 }
