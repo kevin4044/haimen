@@ -269,6 +269,10 @@ pub struct XiaozhiConfig {
     /// 真实客户端。对端不在列表里时 **完全忽略** 该头（它可被伪造）。
     #[serde(default)]
     pub ota_trusted_proxies: Vec<std::net::IpAddr>,
+    /// `POST /api/v1/xiaozhi/say` 的 Bearer 令牌。空串 = 不校验（内网自用默认），
+    /// 非空时请求必须带 `Authorization: Bearer <say_token>`，不匹配返回 401。
+    #[serde(default)]
+    pub say_token: String,
 }
 
 impl Default for XiaozhiConfig {
@@ -280,6 +284,7 @@ impl Default for XiaozhiConfig {
             ota_allow_private_only: true,
             ota_token: String::new(),
             ota_trusted_proxies: Vec::new(),
+            say_token: String::new(),
         }
     }
 }

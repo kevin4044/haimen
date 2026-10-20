@@ -455,6 +455,10 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             // 创建共享 ASR 配置，Web API 保存时同步更新此对象，实现运行时热加载
             let shared_asr_config = Arc::new(RwLock::new(settings.asr.clone()));
 
+            // notify 播报也要拿到同一个音色覆盖，但下面构建策略时
+            // xiaozhi_tts_voice 会被 move 进去，所以先 clone 一份留给 web::start。
+            let say_voice_override = xiaozhi_tts_voice.clone();
+
             let xiaozhi_strategy: Arc<dyn haimen_xiaozhi::ResponseStrategy> = if xiaozhi_echo {
                 Arc::new(haimen_xiaozhi::EchoStrategy)
             } else if xiaozhi_asr_tts {
@@ -492,10 +496,22 @@ pub async fn run(cli: Cli) -> Result<(), String> {
             let mut xiaozhi_mqtt_transport = None;
             if settings.xiaozhi.protocol == haimen_xiaozhi::XiaozhiProtocol::Mqtt {
                 let mqtt_cfg = crate::gateway::build_mqtt_udp_config(&settings.xiaozhi);
+                // advertise_ip 就是 MQTT endpoint 的 host，notify 音频 URL 用它做基址。
+                // mqtt_cfg 随后被 move 进 start，先取出来。
+                let advertise_ip = mqtt_cfg.advertise_ip.clone();
                 match haimen_xiaozhi::MqttUdpTransport::start(mqtt_cfg, xiaozhi_strategy.clone())
                     .await
                 {
                     Ok(t) => {
+                        // 安装 notify 通路的设备门面与 URL 基址。
+                        //
+                        // ★ 这里必须和传输层 start 在同一个分支里：`haimen serve`
+                        // 走的是本文件这条路径，而 gateway/mod.rs 里那份是另一条
+                        // 入口（同款代码的另一副本）。只在 gateway 里装的话，
+                        // serve 时 say_hub() 永远是 None，/api/v1/xiaozhi/say
+                        // 会一直报 device_offline。
+                        haimen_xiaozhi::mqtt_udp::install_say_hub(t.say_hub());
+                        haimen_xiaozhi::notify::set_say_advertise_ip(advertise_ip);
                         tracing::warn!(
                             broker = %t.broker_addr(),
                             udp = %t.udp_addr(),
@@ -524,6 +540,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 settings.xiaozhi.clone(),
                 shared_asr_config,
                 shared_tts_config,
+                say_voice_override,
                 serve_agent,
                 CancellationToken::new(),
             )

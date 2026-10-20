@@ -371,6 +371,135 @@ impl MqttUdpTransport {
         }
         udp.shutdown().await;
     }
+
+    /// notify 通路的设备门面：在线列表 / 忙状态 / JSON 下行。
+    ///
+    /// 返回的是 trait 对象而不是把 `Shared` 暴露出去 —— notify.rs
+    /// 只需要这三个能力，不该看到传输层的内部表结构。
+    pub fn say_hub(&self) -> Arc<dyn SayDeviceHub> {
+        Arc::new(SayHubImpl {
+            shared: Arc::clone(&self.shared),
+        })
+    }
+}
+
+/// 一台 MQTT 在线设备的身份。`device_id` 是冒号 MAC（`mac_from_client_id` 归一化）。
+pub struct SayDeviceInfo {
+    pub client_id: String,
+    pub device_id: String,
+}
+
+/// notify 通路看传输层的最小接口。
+///
+/// 为什么单独抽 trait：notify.rs 的 HTTP handler 要走全局槽拿它，
+/// 测试时装假实现就能在没有真实 broker / 设备的情况下覆盖全部错误分支。
+#[async_trait::async_trait]
+pub trait SayDeviceHub: Send + Sync {
+    /// 当前 MQTT 在线的设备（排除控制面 `ADMIN_CLIENT_ID`，它不是设备）。
+    async fn online_devices(&self) -> Vec<SayDeviceInfo>;
+    /// `None` = 空闲可下发 notify；`Some(state)` = 忙，state ∈ "listening" | "playing"。
+    async fn busy_state(&self, client_id: &str) -> Option<&'static str>;
+    /// 给设备下行一段 JSON 文本（复用 `publish_body` 的 topic 模板/超时/掉线清理）。
+    /// 返回 `false` = 设备不在线。
+    async fn publish_json(&self, client_id: &str, body: &str) -> bool;
+}
+
+struct SayHubImpl {
+    shared: Arc<Shared>,
+}
+
+#[async_trait::async_trait]
+impl SayDeviceHub for SayHubImpl {
+    async fn online_devices(&self) -> Vec<SayDeviceInfo> {
+        self.shared
+            .broker
+            .connected_clients()
+            .await
+            .into_iter()
+            // 控制面客户端（haimen-admin）不是设备，不能被选为 notify 目标
+            .filter(|client_id| client_id != crate::mqtt_broker::ADMIN_CLIENT_ID)
+            .map(|client_id| SayDeviceInfo {
+                device_id: mac_from_client_id(&client_id),
+                client_id,
+            })
+            .collect()
+    }
+
+    async fn busy_state(&self, client_id: &str) -> Option<&'static str> {
+        let tables = self.shared.tables.lock().await;
+        match tables.sessions.get(client_id).map(|session| session.state) {
+            // MQTT 在线但没 hello 过 = 设备在 Idle，可以下发
+            None => None,
+            Some(SessionState::Playing) => Some("playing"),
+            // Ready / Recording 都有活着的 UDP 会话 = 正在录音或对话中，
+            // 此时 notify 会被设备静默丢弃，按忙处理
+            Some(SessionState::Recording | SessionState::Ready) => Some("listening"),
+            // UDP 会话已注销（goodbye / 空闲收口），设备已回 Idle
+            Some(SessionState::AwaitingHello) => None,
+        }
+    }
+
+    async fn publish_json(&self, client_id: &str, body: &str) -> bool {
+        // ★ 不能复用 publish_body：它要求「会话」存在（tables.sessions），
+        // 而会话只在设备发 hello 时创建、goodbye 时删除。
+        // notify 的使用场景恰恰是设备「待命（Idle）」——那时没有会话。
+        // 用 publish_body 会导致设备明明在线却恒返回 device_offline。
+        //
+        // 所以这里直接按 client_id 推导 MAC 拼下行主题再下发，不依赖会话。
+        // device_id 的格式与 ConversationSession::device_id 一致（colon_mac）。
+        let topic = self
+            .shared
+            .cfg
+            .downlink_topic_template
+            .replace("{mac}", &mac_from_client_id(client_id));
+        let published = tokio::time::timeout(
+            MQTT_WRITE_TIMEOUT,
+            self.shared.broker.publish_to(BrokerOutgoing {
+                client_id: client_id.to_owned(),
+                topic,
+                payload: body.as_bytes().to_vec(),
+            }),
+        )
+        .await;
+        match published {
+            Ok(Ok(ok)) => {
+                if !ok {
+                    tracing::warn!(%client_id, "notify 下发失败：设备不在 MQTT 注册表");
+                }
+                ok
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(%client_id, %err, "notify 下发 MQTT 失败");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(%client_id, "notify 下发超时（写队列堵塞）");
+                false
+            }
+        }
+    }
+}
+
+/// notify 全局槽。
+///
+/// 为什么用 RwLock 覆盖式而不是 OnceLock：mqtt_udp 的测试会反复 start
+/// 传输层，notify 的测试也要反复装假 hub —— 覆盖式安装让测试之间互不污染。
+/// 生产路径上 gateway 在传输层 start 成功后装一次，之后不会再写。
+static SAY_HUB: std::sync::RwLock<Option<Arc<dyn SayDeviceHub>>> = std::sync::RwLock::new(None);
+
+/// 由 gateway 在 MQTT 传输层 start 成功后显式安装。
+///
+/// 不在 `MqttUdpTransport::start` 里自动安装：传输层测试会反复 start，
+/// 自动安装会把真实 hub 泄漏进 notify 测试的全局槽。
+pub fn install_say_hub(hub: Arc<dyn SayDeviceHub>) {
+    let mut slot = SAY_HUB.write().unwrap_or_else(|err| err.into_inner());
+    *slot = Some(hub);
+}
+
+/// 取当前设备门面。`None` = MQTT 传输层没跑（websocket 模式）。
+pub fn say_hub() -> Option<Arc<dyn SayDeviceHub>> {
+    let slot = SAY_HUB.read().unwrap_or_else(|err| err.into_inner());
+    slot.clone()
 }
 
 async fn run_loop(
@@ -1714,7 +1843,9 @@ fn mac_from_client_id(client_id: &str) -> String {
     colon_mac(mac)
 }
 
-fn colon_mac(raw: &str) -> String {
+/// 统一成冒号小写形式。notify 的设备寻址按这个形式比较，
+/// 所以它是 `pub(crate)`（notify.rs 要用同一套归一化）。
+pub(crate) fn colon_mac(raw: &str) -> String {
     let mac = raw.trim().to_ascii_lowercase();
     if mac.contains(':') {
         return mac;
@@ -1794,7 +1925,9 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 /// `server` 必须是局域网地址。0.0.0.0 / 127.0.0.1 设备都访问不到。
-fn lan_ip() -> Option<String> {
+///
+/// `pub(crate)`：notify 音频 URL 在没配 advertise_ip 时也用它做基址。
+pub(crate) fn lan_ip() -> Option<String> {
     match local_ip_address::local_ip() {
         Ok(ip) if usable_v4(&ip) => return Some(ip.to_string()),
         Ok(ip) => tracing::warn!(%ip, "local_ip 不是可用的局域网地址，改为扫描网卡"),

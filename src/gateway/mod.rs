@@ -202,8 +202,15 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
             match xiaozhi_strategy.clone() {
                 Some(strategy) => {
                     let mqtt_cfg = build_mqtt_udp_config(&config.xiaozhi);
+                    // advertise_ip 就是 MQTT endpoint 的 host（设备能连 broker 就能连 HTTP），
+                    // notify 音频 URL 用它做基址。mqtt_cfg 随后被 move 进 start，先 clone。
+                    let advertise_ip = mqtt_cfg.advertise_ip.clone();
                     match haimen_xiaozhi::MqttUdpTransport::start(mqtt_cfg, strategy).await {
                         Ok(t) => {
+                            // 安装 notify 通路的设备门面与 URL 基址。
+                            // 必须在传输层 start 成功后装：say_hub 句柄依赖活着的 broker。
+                            haimen_xiaozhi::mqtt_udp::install_say_hub(t.say_hub());
+                            haimen_xiaozhi::notify::set_say_advertise_ip(advertise_ip);
                             tracing::warn!(
                                 broker = %t.broker_addr(),
                                 udp = %t.udp_addr(),
@@ -250,6 +257,8 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
                 xiaozhi_config,
                 shared_asr_config,
                 shared_tts_config,
+                // start_all 构建策略时 voice_override 就是 None（见上方），保持一致。
+                None,
                 http_shared_agent,
                 http_cancel,
             )
