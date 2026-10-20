@@ -189,6 +189,15 @@ struct DeviceSession {
     /// 每开一轮回放加一。旧回放任务靠它知道自己已经被替换。
     playback_gen: u64,
     cancel_tx: Option<watch::Sender<bool>>,
+    /// 本会话 hello 成功下发的时刻（≈ 设备本次唤醒/建链时间）。
+    /// 用来判断紧接着的 listen start 是「新唤醒」还是「同一会话内的自动重听」。
+    hello_at: Option<Instant>,
+    /// 本轮聆听开始时刻（设备 listen start）。用于记录聆听持续时长。
+    listening_since: Option<Instant>,
+    /// 最近一次成功下发 `tts stop` 的时刻。
+    /// auto 模式下固件收到 stop 会重新进入 Listening 并发 `listen start`（协议 4.3.2），
+    /// 这个时间点是判断「下一次聆听是否由 tts stop 自动触发」的关键证据。
+    last_tts_stop_at: Option<Instant>,
 }
 
 impl DeviceSession {
@@ -207,6 +216,9 @@ impl DeviceSession {
             last_speech_at: Instant::now(),
             playback_gen: 0,
             cancel_tx: None,
+            hello_at: None,
+            listening_since: None,
+            last_tts_stop_at: None,
         }
     }
 
@@ -220,6 +232,7 @@ impl DeviceSession {
         self.audio_buffer.clear();
         self.recording_deadline = None;
         self.next_send_at = None;
+        self.listening_since = None;
         self.last_activity = Instant::now();
         // 收口计时也要重置。
         //
@@ -695,7 +708,7 @@ async fn say_raw_frames(shared: &Arc<Shared>, client_id: &str, frames: Vec<Vec<u
 
     // 给最后几帧留播放时间再发 stop，避免掐掉尾巴。
     tokio::time::sleep(Duration::from_millis(step * 3)).await;
-    let _ = publish_tts(shared, client_id, TtsState::Stop, None).await;
+    publish_tts_stop(shared, client_id).await;
     tracing::warn!(
         %client_id,
         "主动播报：已发送 tts stop，非手动模式下设备会自动进入聆听"
@@ -802,14 +815,17 @@ async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
     match kind {
         "hello" => handle_hello(shared, &msg.client_id, value).await,
         "listen" => handle_listen(shared, &msg.client_id, value).await,
-        "abort" => handle_abort(shared, &msg.client_id).await,
+        "abort" => {
+            let reason = value.get("reason").and_then(|item| item.as_str());
+            handle_abort(shared, &msg.client_id, reason).await;
+        }
         "goodbye" => {
             // 不断开 MQTT。设备会在同一条连接上再发 hello。
             let playing =
                 session_state(shared, &msg.client_id).await == Some(SessionState::Playing);
             release_udp(shared, &msg.client_id, "goodbye").await;
             if playing {
-                let _ = publish_tts(shared, &msg.client_id, TtsState::Stop, None).await;
+                publish_tts_stop(shared, &msg.client_id).await;
             }
         }
         other => {
@@ -947,6 +963,17 @@ async fn handle_hello(shared: &Arc<Shared>, client_id: &str, value: serde_json::
     }
     tracing::info!(%client_id, %protocol_session_id, %server, port, "UDP hello 已下发");
 
+    // 记下 hello 时刻并重置聆听计时：hello 通常意味着设备重新唤醒/建链，
+    // 上一轮的「tts stop 自动重听」时间不能带进新会话。
+    {
+        let mut tables = shared.tables.lock().await;
+        if let Some(session) = tables.sessions.get_mut(client_id) {
+            session.hello_at = Some(Instant::now());
+            session.listening_since = None;
+            session.last_tts_stop_at = None;
+        }
+    }
+
     // hello 下发成功 = 设备确实开始了一次新对话，这时才通知策略清掉上一轮的
     // 会话级上下文（LLM session_id / 本地对话历史）。
     //
@@ -967,18 +994,28 @@ async fn handle_listen(shared: &Arc<Shared>, client_id: &str, value: serde_json:
             return;
         }
     };
+    // mode 是判断「为什么进入聆听」的直接线索：
+    // realtime/auto 通常是语音自动触发，manual 是按键。
+    let mode = listen.mode.as_deref().unwrap_or("(缺失)");
     match listen.state.as_str() {
-        "start" => enter_recording(shared, client_id).await,
+        "start" => enter_recording(shared, client_id, &listen, mode).await,
         "stop" => {
             let recording = session_state(shared, client_id).await == Some(SessionState::Recording);
             if recording {
+                let listening_ms = listening_elapsed_ms(shared, client_id).await;
+                tracing::info!(%client_id, mode, listening_ms = ?listening_ms, "设备结束聆听（listen stop）");
                 start_playback(shared, client_id).await;
             } else {
-                tracing::debug!(%client_id, "不在录音中，忽略 listen stop");
+                tracing::debug!(%client_id, mode, "不在录音中，忽略 listen stop");
             }
         }
         "detect" => {
-            tracing::debug!(%client_id, "忽略 listen detect");
+            // detect 是唤醒词命中的唯一证据（text = 唤醒词）。用 INFO 才会进文件日志。
+            tracing::info!(
+                %client_id,
+                text = listen.text.as_deref().unwrap_or(""),
+                "检测到唤醒词（listen detect）"
+            );
         }
         other => {
             tracing::warn!(%client_id, state = other, "忽略未知的 listen state");
@@ -986,7 +1023,7 @@ async fn handle_listen(shared: &Arc<Shared>, client_id: &str, value: serde_json:
     }
 }
 
-async fn enter_recording(shared: &Arc<Shared>, client_id: &str) {
+async fn enter_recording(shared: &Arc<Shared>, client_id: &str, listen: &ListenIn, mode: &str) {
     let session_id = {
         let mut tables = shared.tables.lock().await;
         let Some(session) = tables.sessions.get_mut(client_id) else {
@@ -998,7 +1035,8 @@ async fn enter_recording(shared: &Arc<Shared>, client_id: &str) {
             tracing::warn!(%client_id, "还没收到 hello 就收到 listen，忽略");
             return;
         }
-        if session.state == SessionState::Playing {
+        let barge_in = session.state == SessionState::Playing;
+        if barge_in {
             session.playback_gen = session.playback_gen.wrapping_add(1);
             if let Some(tx) = &session.cancel_tx {
                 let _ = tx.send(true);
@@ -1008,8 +1046,21 @@ async fn enter_recording(shared: &Arc<Shared>, client_id: &str) {
         session.state = SessionState::Recording;
         session.recording_deadline = Some(TokioInstant::now() + RECORDING_LIMIT);
         session.next_send_at = None;
+        session.listening_since = Some(Instant::now());
         session.last_activity = Instant::now();
-        tracing::debug!(client_id = %session.client_id, "进入录音");
+        // 「进入聆听」必须留 INFO 日志：文件层过滤会吞掉 debug。
+        // since_hello_ms / since_tts_stop_ms 能直接回答两个排查问题：
+        //   1) 是新唤醒还是同一会话内的自动重听；
+        //   2) 是否由服务端 tts stop 触发（auto 模式固件会立刻重听）。
+        tracing::info!(
+            %session.client_id,
+            mode,
+            device_session_id = listen.session_id.as_deref().unwrap_or(""),
+            since_hello_ms = ?session.hello_at.map(|t| t.elapsed().as_millis() as u64),
+            since_tts_stop_ms = ?session.last_tts_stop_at.map(|t| t.elapsed().as_millis() as u64),
+            barge_in,
+            "设备进入聆听（listen start）"
+        );
         session.protocol_session_id.clone()
     };
     if let Err(err) = shared
@@ -1021,21 +1072,25 @@ async fn enter_recording(shared: &Arc<Shared>, client_id: &str) {
     }
 }
 
-async fn handle_abort(shared: &Arc<Shared>, client_id: &str) {
+async fn handle_abort(shared: &Arc<Shared>, client_id: &str, reason: Option<&str>) {
     let state = session_state(shared, client_id).await;
+    let reason = reason.unwrap_or("");
     match state {
         Some(SessionState::Recording) => {
             // 录音中的 abort 和 listen stop 一样，表示这句说完了，要生成回复。
             // 这里不能注销 UDP：回复的音频还得用这把 key 发出去。
+            let listening_ms = listening_elapsed_ms(shared, client_id).await;
+            tracing::info!(%client_id, reason, listening_ms = ?listening_ms, "设备打断聆听（abort），开始生成回复");
             start_playback(shared, client_id).await;
         }
         Some(SessionState::AwaitingHello) | None => {
-            tracing::warn!(%client_id, "还没 hello 就收到 abort，忽略");
+            tracing::warn!(%client_id, reason, "还没 hello 就收到 abort，忽略");
         }
         Some(SessionState::Playing) | Some(SessionState::Ready) => {
             // 打断只结束这一轮。小智接着发 listen start，并继续用同一条 UDP 通道。
             // 密钥和对端地址必须留着：注销之后上行会被当成未知会话丢掉，
             // 下一轮回复也发不出去，直到设备再发一次 hello。
+            tracing::info!(%client_id, reason, "设备打断播放（abort）");
             {
                 let mut tables = shared.tables.lock().await;
                 if let Some(session) = tables.sessions.get_mut(client_id) {
@@ -1043,7 +1098,7 @@ async fn handle_abort(shared: &Arc<Shared>, client_id: &str) {
                 }
             }
             if state == Some(SessionState::Playing) {
-                let _ = publish_tts(shared, client_id, TtsState::Stop, None).await;
+                publish_tts_stop(shared, client_id).await;
             }
         }
     }
@@ -1080,6 +1135,15 @@ async fn handle_udp(shared: &Arc<Shared>, audio: crate::udp_audio::UdpIncomingAu
             return;
         }
         session.last_activity = Instant::now();
+        // 每轮聆听只在第一帧打一次：配合 listen start 日志，
+        // 「有 start 没有这一行」就是「设备进了聆听但没送音频」的直接证据。
+        if session.audio_buffer.is_empty() {
+            tracing::info!(
+                %client_id,
+                since_listen_ms = ?session.listening_since.map(|t| t.elapsed().as_millis() as u64),
+                "本轮聆听收到第一帧音频"
+            );
+        }
         session.audio_buffer.push(frame.clone());
         Some(client_id)
     };
@@ -1115,24 +1179,28 @@ async fn handle_udp(shared: &Arc<Shared>, audio: crate::udp_audio::UdpIncomingAu
 /// 注意：该 Notifier 是策略级而非会话级的，多设备同时录音时会一起收口。
 /// M2' 是单设备场景可接受；多设备需要给策略加带 session 参数的版本。
 async fn finish_recording_by_vad(shared: &Arc<Shared>, client_id: &str) {
-    let still_recording = {
+    let listening_ms = {
         let tables = shared.tables.lock().await;
-        tables
-            .sessions
-            .get(client_id)
-            .is_some_and(|session| session.state == SessionState::Recording)
+        match tables.sessions.get(client_id) {
+            Some(session) if session.state == SessionState::Recording => Some(
+                session
+                    .listening_since
+                    .map(|t| t.elapsed().as_millis() as u64),
+            ),
+            // 期间可能已被录音上限或 abort 收口，忽略这次信号。
+            _ => None,
+        }
     };
-    if !still_recording {
-        // 期间可能已被录音上限或 abort 收口，忽略这次信号。
+    let Some(listening_ms) = listening_ms else {
         return;
-    }
-    tracing::warn!(%client_id, "策略侧 VAD 检测到语音结束，立即生成回复");
+    };
+    tracing::warn!(%client_id, listening_ms = ?listening_ms, "策略侧 VAD 检测到语音结束，立即生成回复");
     start_playback(shared, client_id).await;
 }
 
 async fn expire_recordings(shared: &Arc<Shared>) {
     let now = TokioInstant::now();
-    let due: Vec<String> = {
+    let due: Vec<(String, Option<u64>)> = {
         let tables = shared.tables.lock().await;
         tables
             .sessions
@@ -1143,11 +1211,16 @@ async fn expire_recordings(shared: &Arc<Shared>) {
                         .recording_deadline
                         .is_some_and(|deadline| deadline <= now)
             })
-            .map(|(client_id, _)| client_id.clone())
+            .map(|(client_id, session)| {
+                let listening_ms = session
+                    .listening_since
+                    .map(|t| t.elapsed().as_millis() as u64);
+                (client_id.clone(), listening_ms)
+            })
             .collect()
     };
-    for client_id in due {
-        tracing::info!(%client_id, "录音超过 30 秒，强制生成回复");
+    for (client_id, listening_ms) in due {
+        tracing::info!(%client_id, listening_ms = ?listening_ms, "录音超过 30 秒，强制生成回复");
         start_playback(shared, &client_id).await;
     }
 }
@@ -1228,6 +1301,7 @@ async fn start_playback(shared: &Arc<Shared>, client_id: &str) {
         }
         session.state = SessionState::Playing;
         session.recording_deadline = None;
+        session.listening_since = None;
         session.playback_gen = session.playback_gen.wrapping_add(1);
         if let Some(old) = session.cancel_tx.take() {
             let _ = old.send(true);
@@ -1278,7 +1352,7 @@ async fn run_playback(shared: Arc<Shared>, job: PlaybackJob) {
         return;
     }
     // 设备要求 start → 句子/音频 → stop。stop 放在所有帧之后。
-    let _ = publish_tts(&shared, &job.client_id, TtsState::Stop, None).await;
+    publish_tts_stop(&shared, &job.client_id).await;
     finish_ready(&shared, &job).await;
 }
 
@@ -1643,6 +1717,18 @@ async fn session_state(shared: &Shared, client_id: &str) -> Option<SessionState>
         .map(|session| session.state)
 }
 
+/// 本轮聆听已持续的毫秒数；不在聆听中返回 `None`。
+async fn listening_elapsed_ms(shared: &Shared, client_id: &str) -> Option<u64> {
+    shared
+        .tables
+        .lock()
+        .await
+        .sessions
+        .get(client_id)
+        .and_then(|session| session.listening_since)
+        .map(|started| started.elapsed().as_millis() as u64)
+}
+
 fn ensure_session<'a>(tables: &'a mut Tables, client_id: &str) -> &'a mut DeviceSession {
     tables
         .sessions
@@ -1694,6 +1780,19 @@ async fn publish_tts(
         }
     };
     publish_body(shared, client_id, &body).await
+}
+
+/// 发 `tts stop`，成功后记录发送时刻。
+///
+/// auto 模式下固件收到 `tts stop` 会重新进入 Listening 并发 `listen start`；
+/// 下一个 listen start 日志里的 `since_tts_stop_ms` 小于 1 秒，基本就是自动重听。
+async fn publish_tts_stop(shared: &Shared, client_id: &str) {
+    if publish_tts(shared, client_id, TtsState::Stop, None).await {
+        let mut tables = shared.tables.lock().await;
+        if let Some(session) = tables.sessions.get_mut(client_id) {
+            session.last_tts_stop_at = Some(Instant::now());
+        }
+    }
 }
 
 async fn protocol_session_id(shared: &Shared, client_id: &str) -> Option<String> {
@@ -2000,6 +2099,15 @@ impl UplinkAudio {
 #[derive(Deserialize)]
 struct ListenIn {
     state: String,
+    /// `realtime` / `auto` / `manual`。老固件可能不带。
+    #[serde(default)]
+    mode: Option<String>,
+    /// 设备侧的 session_id（仅用于日志对照）。
+    #[serde(default)]
+    session_id: Option<String>,
+    /// 仅 `state:"detect"` 时带唤醒词文本。
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[cfg(test)]
@@ -2019,6 +2127,34 @@ mod tests {
     use crate::udp_audio::UdpAudioConfig;
 
     const CLIENT_ID: &str = "GID_haimen@@@84:c7:bb:59:93:64@@@84:c7:bb:59:93:64";
+
+    #[test]
+    fn listen_in_keeps_mode_session_and_wake_text() {
+        // listen start 必须保留 mode/session_id：这是「为什么进入聆听」的唯一线索。
+        let start: ListenIn = serde_json::from_value(serde_json::json!({
+            "state": "start",
+            "mode": "auto",
+            "session_id": "dev-sess-1",
+        }))
+        .expect("解析 listen start");
+        assert_eq!(start.state, "start");
+        assert_eq!(start.mode.as_deref(), Some("auto"));
+        assert_eq!(start.session_id.as_deref(), Some("dev-sess-1"));
+
+        // 唤醒词路径的 detect 带 text。
+        let detect: ListenIn = serde_json::from_value(serde_json::json!({
+            "state": "detect",
+            "text": "你好小智",
+        }))
+        .expect("解析 listen detect");
+        assert_eq!(detect.text.as_deref(), Some("你好小智"));
+
+        // 老固件可能只发 state，不能因此整条丢弃。
+        let legacy: ListenIn = serde_json::from_value(serde_json::json!({"state": "start"}))
+            .expect("解析老固件 listen");
+        assert!(legacy.mode.is_none());
+        assert!(legacy.text.is_none());
+    }
 
     struct MockInner {
         conversation_starts: Vec<String>,
