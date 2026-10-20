@@ -1,0 +1,28 @@
+# 门铃 → 小智 播报
+#
+# 放在 /config/automations.yaml（或通过 UI 新建自动化后粘贴）。
+#
+# 实体说明：
+#   event.loock_cn_1215944731_401_doorbell_ring_e_7_1  → 门锁 可视门铃 门铃响了
+#   event.loock_cn_1215944731_401_doorbell_ring_e_5_1006 → 门锁 门铃 门铃响了
+#
+# ⚠️ 这两个是同一台物理门铃的两条暴露，**只用一个**，否则小智会说两遍。
+#    这里选 e_7_1（可视门铃那条）。
+#
+# 触发原理：HA 的 event 实体每次事件把 state 更新成新的时间戳，
+# 所以 state 变化 = 门铃响了。不需要再判断 event_type。
+
+- id: xiaozhi_doorbell_announce
+  alias: 门铃响了让小智播报
+  description: 门铃一响就让小智说一句，避免用户戴耳机/在别的房间听不到
+  trigger:
+    - platform: state
+      entity_id: event.loock_cn_1215944731_401_doorbell_ring_e_7_1
+  action:
+    - service: rest_command.xiaozhi_say
+      data:
+        message: "门铃响了喔，有人在门口等。"
+      # 设备正忙时接口返回 409，continue_on_error 避免自动化被标记为失败
+      continue_on_error: true
+  # single：门铃连按两次时，上一句还在播就直接丢弃，不排队重复播
+  mode: single

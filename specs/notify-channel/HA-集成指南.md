@@ -3,6 +3,39 @@
 > 目标：HA 里任何事件（门铃响、洗衣机洗完、有人开门、定时提醒…）
 > 都能让 小智 主动开口说一句话。
 
+## ✅ 已在本环境部署并验证（2026-10-20）
+
+本文档描述的配置**已经在用户的 HA 上真实生效**，端到端验证通过：
+HA 自动化 → `rest_command.xiaozhi_say` → haimen → 小智播报，用户确认听到。
+
+**本环境实测信息：**
+
+| 项 | 值 |
+|---|---|
+| HA 版本 | 2026.10.1 |
+| HA 地址 | `http://192.168.110.34:80`（注意不是 8123） |
+| 配置路径 | `/config`（软链到 `/homeassistant`） |
+| 门铃实体 | `event.loock_cn_1215944731_401_doorbell_ring_e_7_1`（鹿客智能门锁自带的可视门铃） |
+| `rest_command` | 追加在 `/config/configuration.yaml` 末尾（原本没有 packages） |
+| 自动化 | `automation.men_ling_xiang_liao_rang_xiao_zhi_bo_bao`，写在 `/config/automations.yaml` |
+
+**改动的备份：**
+```
+/config/configuration.yaml.bak-20261020-112323
+/config/automations.yaml.bak-20261020-112631
+```
+
+**回滚：**
+```bash
+sudo cp /config/configuration.yaml.bak-20261020-112323 /config/configuration.yaml
+sudo cp /config/automations.yaml.bak-20261020-112631 /config/automations.yaml
+# 然后重启 HA 核心
+```
+
+**⚠️ 一个坑**：鹿客门锁把同一个物理门铃暴露成两个 event 实体
+（`..._e_5_1006` 是「门锁 门铃」，`..._e_7_1` 是「门锁 可视门铃」，
+两者状态相差约 1 秒）。**只用一个**，两个都配会让小智说两遍。
+
 ## 一句话结论
 
 **用 HA 自带的 `rest_command` + 自动化，不需要写自定义集成。**

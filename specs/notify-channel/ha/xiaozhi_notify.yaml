@@ -1,0 +1,32 @@
+# 小智通知通路 —— HA 侧配置
+#
+# 用法（推荐）：把这个文件放到 /config/packages/xiaozhi_notify.yaml
+# 前提：/config/configuration.yaml 里已启用 packages：
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# 如果没启用 packages，把下面 rest_command 整段直接追加到 configuration.yaml 末尾。
+
+rest_command:
+  # 让小智音箱说一句话。
+  #
+  # 参数：message（必填）—— 要念出来的文本
+  #
+  # 返回：
+  #   200 = 已下发（设备空闲时）
+  #   409 = 设备正忙（在聆听/说话中），notify 会被设备静默丢弃
+  #   404 = 设备离线
+  #   502 = 语音合成失败
+  #
+  # 注意：rest_command 不支持热重载，改完必须重启 HA 核心。
+  xiaozhi_say:
+    url: "http://192.168.50.33:9527/api/v1/xiaozhi/say"
+    method: POST
+    content_type: "application/json"
+    # to_json 负责转义引号/换行/中文，不要自己拼字符串
+    payload: '{"text": {{ message | to_json }}}'
+    timeout: 20
+    # 如果哪天在 haimen 的 settings.toml 里启用了 [xiaozhi] say_token，
+    # 取消下面两行注释并填入同一个值：
+    # headers:
+    #   Authorization: "Bearer <你的 say_token>"
