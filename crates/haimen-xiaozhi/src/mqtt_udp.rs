@@ -316,6 +316,23 @@ impl Drop for AbortJoin {
     }
 }
 
+impl AbortJoin {
+    /// 等待任务自然结束（不 abort），用于「消费循环看到 sender 关闭后」。
+    ///
+    /// 为什么必须等：生成任务失败时，`frame_tx` 会在 future 返回时先 drop，
+    /// 消费循环因此立刻收到 `None`；而失败标志是在 `.await` 返回之后才 store。
+    /// 多线程 runtime 上消费侧可能抢在 store 之前读标志，误判为「正常但没内容」，
+    /// 发出 `tts start` 后重新把设备带回聆听。先 join 生成任务，保证标志已写入。
+    async fn join(&mut self) {
+        if let Some(handle) = self.0.as_mut() {
+            let _ = handle.await;
+        }
+        // 任务结束后清空，避免 Drop 再 abort 一个已完成的 handle。
+        // 如果 join 自身被取消，handle 仍留在 Option 里，Drop 会照常 abort。
+        self.0 = None;
+    }
+}
+
 /// MQTT 控制面 + UDP 音频。`start` 之后主循环在后台跑。
 pub struct MqttUdpTransport {
     broker_addr: String,
@@ -1564,7 +1581,7 @@ async fn drive_playback_inner(
             tracing::warn!(%err, %log_session_id, "生成语音回复失败");
         }
     });
-    let _abort_gen = AbortJoin(Some(generate));
+    let mut generate_task = AbortJoin(Some(generate));
 
     let frame = frame_duration(shared);
     let want = shared.cfg.prebuffer_count;
@@ -1584,7 +1601,12 @@ async fn drive_playback_inner(
             }
             Some(PlaybackEvent::LlmSentence(text)) => sentences.push(text),
             Some(PlaybackEvent::Audio(audio)) => prebuffer.push(audio),
-            None => break,
+            None => {
+                // sender 已关闭：生成任务即将/已经返回。必须等它把
+                // generation_failed 写完，再判断失败分支。
+                generate_task.join().await;
+                break;
+            }
         }
     }
     if cancelled(&job.cancel, shared) {

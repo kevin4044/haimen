@@ -12,13 +12,16 @@
 //! - `GET /api/v1/agent/providers` — 列出注册表中所有 Agent 提供商
 //! - `POST /api/v1/settings/agent/verify` — 验证指定 Agent CLI 是否可用
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::State;
 use axum::{Json, http::StatusCode};
 
 use crate::config::settings::AppConfig;
-use crate::web::api::common::{error_response, load_strict, parse_providers};
+use crate::web::api::common::{
+    SettingsUpdateError, error_response, load_strict, parse_providers, update_settings,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 工具函数
@@ -86,6 +89,9 @@ pub async fn update_agent_settings(
         cfg.gateway.providers = providers;
     }
 
+    // 本次请求要写入的 Agent 字段。候选构建用快照，落盘时再与磁盘最新配置合并。
+    let active_provider = cfg.gateway.active_provider.clone();
+    let providers = cfg.gateway.providers.clone();
     let name = cfg.gateway.resolved_agent();
 
     // 1. 构建候选（未注册的 provider → 400，零改动）
@@ -116,19 +122,12 @@ pub async fn update_agent_settings(
         ));
     }
 
-    // 3. 写盘（失败 → 500，内存未换入）
-    if let Err(e) = crate::config::settings::save_settings(&cfg) {
-        tracing::warn!(error = %e, "保存 Agent 配置到文件失败");
-        let msg = format!("保存配置失败: {}", e);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": msg.clone(),
-                "message": msg,
-            })),
-        ));
-    }
+    // 3. 写盘：锁内重新加载最新配置，只合并 Agent 字段。
+    //
+    // 候选构建和 check_available 都在锁外（可能耗时数秒）；这里如果直接写
+    // 开头加载的旧快照，会把期间其他页面保存的 section 覆盖掉。
+    let saved_cfg = save_agent_settings(active_provider, providers)
+        .map_err(|e| error_response(e.status(), e.message()))?;
 
     // 4. 换入内存（此刻才换代，单条赋值原子生效）
     let (applied_agent, generation) = {
@@ -140,8 +139,8 @@ pub async fn update_agent_settings(
     Ok(Json(serde_json::json!({
         "success": true,
         "data": {
-            "active_provider": cfg.gateway.active_provider,
-            "providers": cfg.gateway.providers,
+            "active_provider": saved_cfg.gateway.active_provider,
+            "providers": saved_cfg.gateway.providers,
             "applied": true,
             "applied_agent": applied_agent,
             "generation": generation,
@@ -169,6 +168,23 @@ pub async fn list_agent_providers() -> Json<serde_json::Value> {
         "success": true,
         "data": { "providers": providers }
     }))
+}
+
+/// 在设置写锁内保存 Agent 配置。
+///
+/// 只覆盖 `gateway.active_provider` 与 `gateway.providers`，其余 section 从
+/// 磁盘最新配置重新加载后保留。这样 `check_available()` 等待期间其他页面
+/// 保存的 Xiaozhi / ASR / TTS 配置不会被本请求的旧快照覆盖。
+fn save_agent_settings(
+    active_provider: String,
+    providers: HashMap<String, HashMap<String, String>>,
+) -> Result<AppConfig, SettingsUpdateError> {
+    update_settings(|latest| {
+        latest.gateway.active_provider = active_provider;
+        latest.gateway.providers = providers;
+        Ok(false)
+    })
+    .map(|(cfg, _)| cfg)
 }
 
 /// 把请求体里的草稿字段合并进指定 provider 的临时配置。
@@ -329,6 +345,44 @@ mod tests {
         assert!(openai.get("ignored_number").is_none());
         // provider 自身不会被写成配置 key
         assert!(openai.get("provider").is_none());
+    }
+
+    #[test]
+    fn test_save_agent_settings_preserves_other_sections() {
+        use crate::test_util::run_with_temp_home;
+
+        run_with_temp_home(|_| {
+            let mut initial = AppConfig::default();
+            initial.xiaozhi.say_token = "keep-say".to_string();
+            initial.asr.active_provider = "qwen".to_string();
+            initial.tts.active_provider = "openai".to_string();
+            crate::config::settings::save_settings(&initial).expect("预置配置应写入");
+
+            let providers = HashMap::from([(
+                "openai".to_string(),
+                HashMap::from([
+                    ("base_url".to_string(), "http://example/v1".to_string()),
+                    ("model".to_string(), "example-model".to_string()),
+                ]),
+            )]);
+
+            let saved =
+                save_agent_settings("openai".to_string(), providers).expect("Agent 配置应保存成功");
+            assert_eq!(saved.gateway.active_provider, "openai");
+            // 其他 section 必须原样保留，不能被 Agent 的旧快照覆盖。
+            assert_eq!(saved.xiaozhi.say_token, "keep-say");
+            assert_eq!(saved.asr.active_provider, "qwen");
+            assert_eq!(saved.tts.active_provider, "openai");
+
+            let loaded = crate::config::settings::load_settings()
+                .unwrap()
+                .expect("settings.toml 应存在");
+            assert_eq!(loaded.gateway.active_provider, "openai");
+            assert_eq!(loaded.gateway.providers["openai"]["model"], "example-model");
+            assert_eq!(loaded.xiaozhi.say_token, "keep-say");
+            assert_eq!(loaded.asr.active_provider, "qwen");
+            assert_eq!(loaded.tts.active_provider, "openai");
+        });
     }
 
     // ─── 热切换原子性（回滚）测试 ─────────────────────────
