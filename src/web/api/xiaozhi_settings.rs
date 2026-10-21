@@ -88,6 +88,7 @@ fn settings_json(cfg: &XiaozhiConfig) -> serde_json::Value {
         },
         "udp": {
             "bind_addr": cfg.udp.bind_addr,
+            "tts_start_settle_ms": cfg.udp.tts_start_settle_ms,
         },
         "ota_allow_private_only": cfg.ota_allow_private_only,
         "ota_token": cfg.ota_token,
@@ -181,6 +182,11 @@ fn apply_patch(cfg: &mut XiaozhiConfig, body: &serde_json::Value) -> Result<(), 
         if let Some(value) = udp.get("bind_addr") {
             cfg.udp.bind_addr = expect_str(value, "udp.bind_addr")?.to_string();
         }
+        if let Some(value) = udp.get("tts_start_settle_ms") {
+            cfg.udp.tts_start_settle_ms = value
+                .as_u64()
+                .ok_or_else(|| "udp.tts_start_settle_ms 必须是非负整数".to_string())?;
+        }
     }
 
     if let Some(value) = obj.get("ota_allow_private_only") {
@@ -241,6 +247,10 @@ fn validate(cfg: &XiaozhiConfig) -> Result<(), String> {
         .trim()
         .parse::<SocketAddr>()
         .map_err(|_| format!("udp.bind_addr 不是合法的 SocketAddr：{}", cfg.udp.bind_addr))?;
+    // 1000ms 已远超「等固件切 Speaking」的物理需要，再大只会平白增加首帧延迟。
+    if cfg.udp.tts_start_settle_ms > 1000 {
+        return Err("udp.tts_start_settle_ms 不能超过 1000（推荐 0–300）".to_string());
+    }
     Ok(())
 }
 
@@ -353,6 +363,10 @@ mod tests {
                 "haimen/xz/{mac}/down"
             );
             assert_eq!(data["udp"]["bind_addr"], "0.0.0.0:8888");
+            assert_eq!(
+                data["udp"]["tts_start_settle_ms"],
+                haimen_xiaozhi::DEFAULT_TTS_START_SETTLE_MS
+            );
             assert_eq!(data["ota_allow_private_only"], true);
             assert_eq!(data["ota_token"], "");
             assert_eq!(data["say_token"], "");
@@ -379,7 +393,7 @@ mod tests {
                     "auth_grace": true,
                     "keepalive": 120,
                 },
-                "udp": { "bind_addr": "0.0.0.0:9999" },
+                "udp": { "bind_addr": "0.0.0.0:9999", "tts_start_settle_ms": 150 },
                 "ota_allow_private_only": true,
                 "ota_token": "ota-secret",
                 "ota_trusted_proxies": ["127.0.0.1", "::1"],
@@ -410,6 +424,7 @@ mod tests {
             assert_eq!(data["mqtt"]["auth_grace"], true);
             assert_eq!(data["mqtt"]["keepalive"], 120);
             assert_eq!(data["udp"]["bind_addr"], "0.0.0.0:9999");
+            assert_eq!(data["udp"]["tts_start_settle_ms"], 150);
             assert_eq!(data["ota_token"], "ota-secret");
             assert_eq!(
                 data["ota_trusted_proxies"],
@@ -424,6 +439,7 @@ mod tests {
             assert_eq!(saved.xiaozhi.mqtt.endpoint, "192.168.110.35:1883");
             assert_eq!(saved.xiaozhi.mqtt.keepalive, 120);
             assert_eq!(saved.xiaozhi.udp.bind_addr, "0.0.0.0:9999");
+            assert_eq!(saved.xiaozhi.udp.tts_start_settle_ms, 150);
             assert_eq!(saved.xiaozhi.say_token, "new-say-token");
             assert_eq!(saved.xiaozhi.ota_token, "ota-secret");
 
@@ -448,6 +464,31 @@ mod tests {
             assert!(
                 crate::config::settings::load_settings().unwrap().is_none(),
                 "校验失败的请求不应写入 settings.toml"
+            );
+
+            reset_runtime_globals();
+        });
+    }
+
+    #[test]
+    fn put_udp_settle_over_limit_returns_400() {
+        run_with_temp_home(|_| {
+            reset_runtime_globals();
+
+            let (status, body) = put(serde_json::json!({
+                "protocol": "mqtt",
+                "mqtt": { "endpoint": "192.168.110.35:1883" },
+                "udp": { "tts_start_settle_ms": 5000 },
+            }))
+            .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                body.0["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("tts_start_settle_ms"),
+                "{}",
+                body.0["error"]
             );
 
             reset_runtime_globals();

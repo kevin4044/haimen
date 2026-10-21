@@ -1810,7 +1810,24 @@ app_key = "old-key"
         assert_eq!(cfg.xiaozhi.mqtt.username, "");
         assert_eq!(cfg.xiaozhi.mqtt.password, "");
         assert_eq!(cfg.xiaozhi.udp.bind_addr, "0.0.0.0:8888");
+        // 老配置里没有 [xiaozhi.udp] tts_start_settle_ms 时也要落到 100。
+        assert_eq!(
+            cfg.xiaozhi.udp.tts_start_settle_ms,
+            haimen_xiaozhi::DEFAULT_TTS_START_SETTLE_MS
+        );
         assert_eq!(cfg.log_level, "info");
+    }
+
+    #[test]
+    fn test_xiaozhi_udp_tts_start_settle_can_be_overridden() {
+        // 真机 A/B 需要能不动代码把静默窗口调到 0（旧行为）或更大。
+        let cfg: AppConfig = toml::from_str(
+            "[xiaozhi]\nprotocol = \"mqtt\"\n[xiaozhi.udp]\ntts_start_settle_ms = 250\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.xiaozhi.udp.tts_start_settle_ms, 250);
+        // bind_addr 没写时必须回退默认，不能因为新增字段丢掉旧默认。
+        assert_eq!(cfg.xiaozhi.udp.bind_addr, "0.0.0.0:8888");
     }
 
     #[test]

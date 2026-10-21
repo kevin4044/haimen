@@ -78,6 +78,20 @@ const fn default_tail_extra_frames() -> u32 {
     2
 }
 
+/// `tts start` 之后、首帧音频之前额外等待的毫秒数，默认 150。
+///
+/// 为什么需要：MQTT 控制面与 UDP 音频是两条独立链路。`publish_to` 只是把
+/// 报文放进 per-client 写队列就返回，UDP 帧却会立刻出网；而固件要异步处理完
+/// `tts start`、切进 Speaking 状态后才把 UDP 包放进解码队列，这之前到达的
+/// 音频会被静默丢弃（协议层 `remote_sequence_` 已经前进，不会重传）。
+/// 预缓冲帧抢跑会让设备 jitter buffer 从 0 开始，之后任何 UDP 抖动都直接
+/// underrun —— 听感就是「经常掉帧」。等这一段把两条链路对齐。
+///
+/// 设为 0 时行为与修复前完全一致（不进 select、不额外等待）。
+const fn default_tts_start_settle_ms() -> u64 {
+    crate::types::DEFAULT_TTS_START_SETTLE_MS
+}
+
 /// 传输层配置。`prebuffer_count` / `frame_duration_ms` 的默认值见 [`Default`]。
 #[derive(Debug, Clone)]
 pub struct MqttUdpConfig {
@@ -94,6 +108,13 @@ pub struct MqttUdpConfig {
     /// 发 `tts stop` 前额外等待的帧数（乘 frame_duration）。
     /// 默认 2（= 参考实现的 `prebuffer + 2` 里的那个 2）。
     pub tail_extra_frames: u32,
+    /// `tts start` 之后、首帧音频之前额外等待的毫秒数，默认 150。
+    ///
+    /// MQTT 控制面（`publish_to` 只入队）与 UDP 音频是两条链路，固件要异步
+    /// 处理完 start 才肯收 UDP 音频。不等的话预缓冲帧会抢在固件切 Speaking
+    /// 之前到达并被静默丢弃，设备 jitter buffer 从 0 开始，后续持续 underrun。
+    /// 设为 0 表示不等待（修复前行为）。
+    pub tts_start_settle_ms: u64,
     /// 下发 hello 时告诉设备的 UDP 服务器地址。
     ///
     /// 为什么需要显式指定：容器里 `local_ip()` 拿到的是容器 IP（如 192.168.215.2），
@@ -117,6 +138,7 @@ impl Default for MqttUdpConfig {
             prebuffer_count: 5,
             frame_duration_ms: 60,
             tail_extra_frames: default_tail_extra_frames(),
+            tts_start_settle_ms: default_tts_start_settle_ms(),
             advertise_ip: None,
         }
     }
@@ -711,6 +733,12 @@ async fn say_raw_frames(shared: &Arc<Shared>, client_id: &str, frames: Vec<Vec<u
 
     if !publish_tts(shared, client_id, TtsState::Start, None).await {
         return;
+    }
+
+    // 主动播报同样要给固件留出处理 tts start、切 Speaking 的窗口，
+    // 否则首帧（以及连发的预缓冲帧）会被设备当成未就绪的包丢掉。
+    if shared.cfg.tts_start_settle_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(shared.cfg.tts_start_settle_ms)).await;
     }
 
     // 前 prebuffer 帧连发填满设备 jitter buffer，之后按 step 实时发送。
@@ -1607,6 +1635,9 @@ async fn drive_playback(shared: &Arc<Shared>, job: &PlaybackJob, tts_started: &m
             elapsed_ms,
             expected_ms,
             tail_wait_ms,
+            // 把本轮实际生效的 settle 也打出来：真机 A/B（0 vs 100）时
+            // 一眼就能确认部署的配置有没有生效，不用回去翻 settings.toml。
+            settle_ms = shared.cfg.tts_start_settle_ms,
             "下行播放统计"
         );
     }
@@ -1696,6 +1727,17 @@ async fn drive_playback_inner(
         return false;
     }
     *tts_started = true;
+    // 控制面只入队、UDP 立刻出网：等固件处理完 tts start 切进 Speaking，
+    // 否则下面的预缓冲帧会被静默丢弃（设备 jitter buffer 从 0 开始 → underrun）。
+    let mut settle_cancel = job.cancel.clone();
+    if !wait_tts_start_settle(shared.cfg.tts_start_settle_ms, &mut settle_cancel).await {
+        return false;
+    }
+    // timer 与 cancel 同时就绪时 `select!` 是随机选支，可能先返回 true。
+    // 补一次复查，避免打断后还给下一轮补发这一轮的 sentence_start。
+    if cancelled(&job.cancel, shared) {
+        return false;
+    }
     for sentence in sentences {
         if !publish_tts(
             shared,
@@ -2160,6 +2202,38 @@ async fn wait_tail_playback(shared: &Shared, cancel: &mut watch::Receiver<bool>)
     }
 }
 
+/// 发完 `tts start` 后等一小段再发首帧，给固件留出切到 Speaking 的时间。
+///
+/// 为什么要等：见 [`default_tts_start_settle_ms`] —— MQTT 控制面只入队、
+/// UDP 帧立刻出网，两条链路之间本来就有竞态；不等的话预缓冲帧会被固件
+/// 当成「还没进 Speaking」的杂包丢掉。
+///
+/// 必须可取消：settle 期间用户插话（barge-in）不能白等。
+/// `settle_ms == 0` 时立即返回 true，行为与修复前完全一致。
+///
+/// 参数只收毫秒数而不是 `&Shared`，是为了能直接单测取消语义 —— 用一个
+/// `watch` 通道就能覆盖「已取消 / 等待中取消 / 正常等完 / 0 立即返回」。
+async fn wait_tts_start_settle(settle_ms: u64, cancel: &mut watch::Receiver<bool>) -> bool {
+    if settle_ms == 0 {
+        return true;
+    }
+    if *cancel.borrow() {
+        return false;
+    }
+    let sleep = tokio::time::sleep(Duration::from_millis(settle_ms));
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+          _ = &mut sleep => return true,
+          changed = cancel.changed() => {
+            if changed.is_err() || *cancel.borrow() {
+              return false;
+            }
+          }
+        }
+    }
+}
+
 fn nonce_template(session_id: u32) -> [u8; 16] {
     let mut nonce = [0u8; 16];
     // 设备靠首字节 0x01 识别这是音频通道。session id 放在 [4..8)，大端。
@@ -2537,11 +2611,17 @@ mod tests {
         transport: MqttUdpTransport,
         link: DeviceLink,
         mock: Arc<MockStrategy>,
-        udp: UdpSocket,
+        /// 用 `Arc` 包住：固件行为模型测试需要另起一个任务实时收 UDP，
+        /// 才能按「真实到达时刻」判断哪些帧会被固件丢弃。
+        udp: Arc<UdpSocket>,
     }
 
     impl Env {
         async fn boot(playback: Vec<AudioFrame>) -> Self {
+            Self::boot_with_settle(playback, default_tts_start_settle_ms()).await
+        }
+
+        async fn boot_with_settle(playback: Vec<AudioFrame>, tts_start_settle_ms: u64) -> Self {
             let mock = Arc::new(MockStrategy::new(playback));
             let cfg = MqttUdpConfig {
                 broker: MqttBrokerConfig {
@@ -2556,6 +2636,7 @@ mod tests {
                 prebuffer_count: 5,
                 frame_duration_ms: 60,
                 tail_extra_frames: 2,
+                tts_start_settle_ms,
                 advertise_ip: None,
             };
             let transport = MqttUdpTransport::start(cfg, mock.clone())
@@ -2563,7 +2644,7 @@ mod tests {
                 .expect("启动传输层");
             let addr: SocketAddr = transport.broker_addr().parse().expect("broker 地址");
             let link = DeviceLink::connect(addr).await;
-            let udp = UdpSocket::bind("127.0.0.1:0").await.expect("绑定设备 UDP");
+            let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("绑定设备 UDP"));
             Self {
                 transport,
                 link,
@@ -3106,6 +3187,295 @@ mod tests {
         assert_eq!(tts["state"], "start");
         assert_eq!(env.mock.lock().generate_calls, 1);
         env.shutdown().await;
+    }
+
+    /// 回归：`tts start` 之后必须先等 settle，再发首帧预缓冲。
+    ///
+    /// 根因：MQTT 控制面 `publish_to` 只是把报文放进 per-client 写队列就返回，
+    /// UDP 帧却立刻出网。固件异步处理完 start 才切 Speaking，这之前收到的
+    /// 音频会被静默丢弃（协议层 sequence 已前进、不重传）→ 设备 jitter buffer
+    /// 从 0 开始，后续持续 underrun（用户听感「经常掉帧」）。
+    ///
+    /// 断言「设备收到 tts start → 首帧 UDP」的间隔 ≥ settle 的 80%（留调度余量）。
+    #[tokio::test]
+    async fn tts_start_settle_delays_first_downlink_frame() {
+        const SETTLE_MS: u64 = 150;
+        let playback: Vec<AudioFrame> = (0..3u8)
+            .map(|index| AudioFrame {
+                timestamp: 0,
+                data: vec![0xE0 + index],
+            })
+            .collect();
+        let mut env = Env::boot_with_settle(playback, SETTLE_MS).await;
+        let hello = env.hello().await;
+        let crypto = crypto_from_hello(&hello);
+
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while env.mock.lock().recording_starts.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listen start 没有生效"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 10, 1, b"hi").await;
+        wait_frames(&env.mock, 1).await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+
+        // 设备收到 tts start 的时刻 = 固件开始切 Speaking 的起点。
+        let tts = env.link.wait_type("tts", Duration::from_secs(2)).await;
+        assert_eq!(tts["state"], "start");
+        let started = tokio::time::Instant::now();
+
+        let mut buf = [0u8; 2048];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), env.udp.recv_from(&mut buf))
+            .await
+            .expect("等首帧 UDP 超时")
+            .expect("recv 首帧");
+        let gap = started.elapsed();
+        let (_header, payload) = crypto.open(&buf[..len]).expect("解密首帧");
+        assert_eq!(payload, vec![0xE0], "首帧内容不对");
+
+        let min_gap = Duration::from_millis(SETTLE_MS * 80 / 100);
+        assert!(
+            gap >= min_gap,
+            "tts start → 首帧 UDP 只隔了 {gap:?}，应 >= {min_gap:?}（settle={SETTLE_MS}ms）：\
+             预缓冲帧抢在固件切 Speaking 之前发出去了"
+        );
+        env.shutdown().await;
+    }
+
+    /// settle 期间被 barge-in 打断：不能把预缓冲帧发出去，且下一轮还能正常播。
+    #[tokio::test]
+    async fn abort_during_tts_start_settle_skips_audio_and_recovers() {
+        const SETTLE_MS: u64 = 400;
+        let playback: Vec<AudioFrame> = (0..4u8)
+            .map(|index| AudioFrame {
+                timestamp: 0,
+                data: vec![0xD0 + index],
+            })
+            .collect();
+        let mut env = Env::boot_with_settle(playback, SETTLE_MS).await;
+        let hello = env.hello().await;
+        let crypto = crypto_from_hello(&hello);
+
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while env.mock.lock().recording_starts.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listen start 没有生效"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 10, 1, b"hi").await;
+        wait_frames(&env.mock, 1).await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+        let tts = env.link.wait_type("tts", Duration::from_secs(2)).await;
+        assert_eq!(tts["state"], "start");
+
+        // Playing 上的 abort 会置 cancel，落在 settle 窗口里。
+        env.link
+            .publish("device-server", br#"{"type":"abort"}"#)
+            .await;
+
+        // 跨过整个 settle 也收不到音频：取消生效，预缓冲没有抢跑。
+        let mut buf = [0u8; 2048];
+        let early = tokio::time::timeout(
+            Duration::from_millis(SETTLE_MS + 300),
+            env.udp.recv_from(&mut buf),
+        )
+        .await;
+        assert!(early.is_err(), "settle 期间被打断后仍发出了下行音频");
+
+        // 会话要能继续：下一轮 listen stop 仍能触发播放并收到首帧。
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while env.mock.lock().recording_starts.len() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "打断后的 listen start 没有生效"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        send_uplink(&env, &crypto, 20, 2, b"again").await;
+        wait_frames(&env.mock, 2).await;
+        env.link
+            .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+            .await;
+        // 队列里可能还压着 abort 触发的 tts stop，跳过它等新的 start。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let tts = env.link.wait_type("tts", Duration::from_secs(2)).await;
+            if tts["state"] == "start" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "第二轮没有等到 tts start"
+            );
+        }
+        let down = collect_downlink(&env, &crypto, 1).await;
+        assert_eq!(down[0].payload, vec![0xD0], "第二轮首帧内容不对");
+        env.shutdown().await;
+    }
+
+    /// 默认值必须开启 settle：设为 0 等于回到「预缓冲抢跑」的旧行为。
+    /// 生产默认值统一来自 `types::DEFAULT_TTS_START_SETTLE_MS`，这里锁住数值防漂移。
+    #[test]
+    fn tts_start_settle_defaults_to_150ms() {
+        assert_eq!(default_tts_start_settle_ms(), 150);
+        assert_eq!(MqttUdpConfig::default().tts_start_settle_ms, 150);
+    }
+
+    /// settle 等待必须可取消：barge-in 不能白等。
+    /// 这里直接测 helper（不经过回放循环），覆盖四种分支：
+    /// 已取消 / 等待中取消 / 正常等完 / settle=0 立即返回。
+    #[tokio::test]
+    async fn wait_tts_start_settle_is_cancellable() {
+        // ① 进去前就已经取消：立即 false。
+        let (tx, mut cancel) = watch::channel(false);
+        tx.send(true).unwrap();
+        assert!(!wait_tts_start_settle(5_000, &mut cancel).await);
+
+        // ② 等待中被取消：不等满 5s，1s 内返回 false（覆盖 select 的取消分支）。
+        let (tx, mut cancel) = watch::channel(false);
+        let waiting = tokio::spawn(async move { wait_tts_start_settle(5_000, &mut cancel).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(true).unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("取消后没有及时返回")
+            .expect("wait 任务 panicked");
+        assert!(!cancelled);
+
+        // ③ 不取消：等满 settle 后 true（60ms，留足调度余量）。
+        let (_tx, mut cancel) = watch::channel(false);
+        let started = Instant::now();
+        assert!(wait_tts_start_settle(60, &mut cancel).await);
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "settle 没有真正等：{:?}",
+            started.elapsed()
+        );
+
+        // ④ settle=0：立即 true（修复前行为，不能凭空多等）。
+        let (_tx, mut cancel) = watch::channel(false);
+        let started = Instant::now();
+        assert!(wait_tts_start_settle(0, &mut cancel).await);
+        assert!(started.elapsed() < Duration::from_millis(40));
+    }
+
+    /// 固件行为模型：验证修复对「整批预缓冲被丢」这个具体故障确实有效。
+    ///
+    /// 固件事实（本地源码 `xiaozhi-esp32` @ 1718809）：
+    /// - `OnIncomingAudio` 只在 `Speaking` 才入解码队列（`main/application.cc:567-571`）；
+    /// - `tts start` 经 `Schedule` 异步切状态（`:637-641`、`:1248-1253`）；
+    /// - 切 `Speaking` 时还会 `ResetDecoder()` 清空解码队列（`main/audio/audio_service.cc:802-817`）。
+    /// 所以「设备收到 tts start → 真正能收音频」之间有一个窗口，窗口内的帧被静默丢弃。
+    ///
+    /// 模型：把「设备收到 tts start 后 `FIRMWARE_READY_DELAY`」当作最早可接收时刻，
+    /// 之前到达的预缓冲帧记为丢弃。断言：
+    /// - settle=0（旧行为）→ 整批预缓冲落入窗口，全丢（复现 bug）；
+    /// - settle=200ms → 零丢弃（修复有效）。
+    #[tokio::test]
+    async fn firmware_model_drops_prebuffer_without_settle_but_keeps_it_with_settle() {
+        // 模拟固件从收到 start 到 ResetDecoder 完成、真正可收音频的时延。
+        const FIRMWARE_READY_DELAY: Duration = Duration::from_millis(50);
+        // 约 1.3 倍余量（实际默认 150ms；这里加大到 200ms 让 CI 调度抖动无法钻空子）。
+        const SETTLE_MS: u64 = 200;
+        const FRAMES: usize = 3;
+
+        /// 跑一轮回放，返回（预缓冲帧的真实到达时刻，测试观测到 tts start 的时刻）。
+        async fn run_round(settle_ms: u64) -> (Vec<Instant>, Instant) {
+            let playback: Vec<AudioFrame> = (0..FRAMES as u8)
+                .map(|index| AudioFrame {
+                    timestamp: 0,
+                    data: vec![0xB0 + index],
+                })
+                .collect();
+            let mut env = Env::boot_with_settle(playback, settle_ms).await;
+            let hello = env.hello().await;
+            let crypto = crypto_from_hello(&hello);
+
+            env.link
+                .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+                .await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while env.mock.lock().recording_starts.is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "listen start 没有生效"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            send_uplink(&env, &crypto, 10, 1, b"hi").await;
+            wait_frames(&env.mock, 1).await;
+
+            // 收包任务必须在 listen stop 之前启动：包一旦进入内核 socket 缓冲，
+            // 读到的时刻就不再等于真实到达时刻，模型会判错。
+            let udp = Arc::clone(&env.udp);
+            let receiver = tokio::spawn(async move {
+                let mut arrivals = Vec::with_capacity(FRAMES);
+                let mut buf = [0u8; 2048];
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                while arrivals.len() < FRAMES {
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    assert!(!left.is_zero(), "预缓冲帧没收齐，只收到 {}", arrivals.len());
+                    let (len, _) = tokio::time::timeout(left, udp.recv_from(&mut buf))
+                        .await
+                        .expect("等下行音频超时")
+                        .expect("recv 下行音频");
+                    // 只统计可解密的音频帧，忽略其它报文。
+                    if crypto.open(&buf[..len]).is_ok() {
+                        arrivals.push(Instant::now());
+                    }
+                }
+                arrivals
+            });
+
+            env.link
+                .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+                .await;
+            let tts = env.link.wait_type("tts", Duration::from_secs(2)).await;
+            assert_eq!(tts["state"], "start");
+            // 固件「收到 tts start」的起点：从这里开始异步切 Speaking + ResetDecoder。
+            let device_saw_start = Instant::now();
+            let arrivals = receiver.await.expect("收包任务 panicked");
+            env.shutdown().await;
+            (arrivals, device_saw_start)
+        }
+
+        let (old_arrivals, old_start) = run_round(0).await;
+        let old_dropped = old_arrivals
+            .iter()
+            .filter(|at| **at < old_start + FIRMWARE_READY_DELAY)
+            .count();
+        assert_eq!(
+            old_dropped, FRAMES,
+            "旧行为下整批预缓冲应落在固件就绪窗口内被丢，实际丢 {old_dropped}/{FRAMES}"
+        );
+
+        let (new_arrivals, new_start) = run_round(SETTLE_MS).await;
+        let new_dropped = new_arrivals
+            .iter()
+            .filter(|at| **at < new_start + FIRMWARE_READY_DELAY)
+            .count();
+        assert_eq!(
+            new_dropped, 0,
+            "settle={SETTLE_MS}ms 后预缓冲仍落入固件就绪窗口（丢 {new_dropped}/{FRAMES}），修复无效"
+        );
     }
 
     #[tokio::test]
