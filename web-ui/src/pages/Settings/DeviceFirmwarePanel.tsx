@@ -30,7 +30,6 @@ import {
 } from '@/components/ui/table';
 import {
   candidateLabel,
-  defaultVersionForDevice,
   describeFirmwareError,
   firmwareStateMeta,
   formatFetchedAt,
@@ -138,9 +137,20 @@ export default function DeviceFirmwarePanel() {
     [overview],
   );
 
-  /** 设备当前最新 release 的 tag；候选固件只对这个版本有效 */
-  const latestVersionFor = (device: XiaozhiFirmwareDevice): string =>
-    device.latest?.tag?.trim() || (overview?.releases[0]?.tag ?? '');
+  /**
+   * 设备候选/最新 release 的 tag。
+   *
+   * 候选固件只对 computed 的那个 release 有效；如果后端没给出 latest
+   * （旧后端/异常数据）而存在候选，不要回退到 `releases[0]` —— 它可能是
+   * prerelease，会和候选的 stable release 对不上。此时返回空串，让用户
+   * 自己选择版本（Cursor Bugbot #12 第二条）。
+   */
+  const latestVersionFor = (device: XiaozhiFirmwareDevice): string => {
+    const latestTag = device.latest?.tag?.trim();
+    if (latestTag) return latestTag;
+    if ((device.candidates ?? []).length > 0) return '';
+    return overview?.releases[0]?.tag ?? '';
+  };
 
   /** 重置候选区，并默认选第一个芯片型号匹配的候选 */
   const applyCandidates = (list: XiaozhiFirmwareCandidate[]) => {
@@ -158,7 +168,7 @@ export default function DeviceFirmwarePanel() {
   const confirmDisabled = upgrading || mustChooseCandidate || selectedChipMismatch;
 
   const openUpgrade = (device: XiaozhiFirmwareDevice) => {
-    const defaultVersion = defaultVersionForDevice(device, overview?.releases ?? []);
+    const defaultVersion = latestVersionFor(device);
     setVersion(defaultVersion);
     setManualVersion('');
     setUpgradeError(null);
@@ -466,9 +476,14 @@ export default function DeviceFirmwarePanel() {
                         <Badge variant="outline" className={meta.className}>
                           {meta.label}
                         </Badge>
-                        {device.candidates.length > 0 && (
+                        {device.state === 'needs_selection' && device.candidates.length > 0 && (
                           <span className="text-xs text-orange-600 dark:text-orange-400">
                             需手动选择（{device.candidates.length} 个候选）
+                          </span>
+                        )}
+                        {device.state !== 'needs_selection' && device.candidates.length > 0 && (
+                          <span className="text-xs text-muted-foreground">
+                            上游板型未精确匹配，保留 {device.candidates.length} 个候选可用于重刷
                           </span>
                         )}
                         {device.latest && (

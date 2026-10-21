@@ -1027,6 +1027,7 @@ mod tests {
             mac,
             crate::firmware::FirmwareTarget {
                 version: "2.5.2".to_string(),
+                from_version: "2.5.1".to_string(),
                 file: file.to_string(),
                 asset: "v2.5.2_bread-compact-wifi.zip".to_string(),
                 sha256: "deadbeef".to_string(),

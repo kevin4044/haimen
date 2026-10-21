@@ -160,7 +160,7 @@ pub async fn record_device_report(report: DeviceFirmwareReport) {
             && !target.board_name.eq_ignore_ascii_case(&report.board_name)
         {
             clear_reason = Some("board_name_changed");
-        } else if target.delivered && version_reached(&report.app_version, &target.version) {
+        } else if target.delivered && target_reached(&report.app_version, target) {
             clear_reason = Some("version_reached");
         } else if target.deliveries >= MAX_DELIVERIES {
             clear_reason = Some("delivery_limit");
@@ -217,14 +217,26 @@ pub async fn firmware_info_for(device_id: &str, base_url: &str) -> Option<Firmwa
 
     let _guard = rt.mutation.lock().await;
     let mut candidate = read_snapshot(&rt);
-    let target = candidate
-        .devices
-        .get_mut(device_id)
-        .and_then(|record| record.target.as_mut())?;
+    let record = candidate.devices.get_mut(device_id)?;
+    let target = record.target.as_mut()?;
     target.deliveries = target.deliveries.saturating_add(1);
     target.delivered = true;
     let version = target.version.clone();
     let file = target.file.clone();
+    // 同版本重刷无法从版本号判断设备是否真的刷写成功（前后都是同一版本）。
+    // 采用一次性下发：这次 OTA 响应带出固件 URL 后立即清目标，避免
+    // 「下载失败 → 下次上报被当成成功清目标」和「刷成功后每次启动都重刷」。
+    // 设备下载失败时用户重新在 UI 里设置一次即可。
+    let one_shot_reflash = !target.from_version.trim().is_empty()
+        && versions_equal(&target.from_version, &target.version);
+    if one_shot_reflash {
+        record.target = None;
+        tracing::warn!(
+            device_id = %device_id,
+            version = %version,
+            "同版本重刷目标已一次性下发，清除目标"
+        );
+    }
     write_snapshot(&rt, candidate.clone());
     if let Err(err) = rt.metadata.save(&candidate).await {
         tracing::warn!(error = %err, "保存固件下发计数失败（内存已更新）");
@@ -359,11 +371,36 @@ fn write_snapshot(rt: &FirmwareRuntime, snapshot: FirmwareSnapshot) {
     *rt.snapshot.write().unwrap_or_else(|err| err.into_inner()) = snapshot;
 }
 
-fn version_reached(current: &str, target: &str) -> bool {
-    match compare_versions(current, target) {
-        Some(ordering) => ordering != Ordering::Less,
+/// 设备上报的当前版本是否证明目标已经刷写成功。
+///
+/// 不能简单用 `current >= target`：
+/// - 升级（from < target）：上报 >= target 才算成功；
+/// - 降级（from > target）：设备失败时会继续上报旧版本（> target），
+///   只有上报 == target 才算成功，否则要继续重试；
+/// - 同版本重刷（from == target）：版本号无法证明是否成功，改由
+///   [`firmware_info_for`] 一次性下发后清目标，本函数不参与。
+/// - 旧状态文件没有 `from_version`（空串）时保持原升级语义，兼容存量目标。
+fn target_reached(current: &str, target: &FirmwareTarget) -> bool {
+    let target_version = target.version.trim();
+    if target_version.is_empty() {
+        return false;
+    }
+    let Some(ordering) = compare_versions(current, target_version) else {
         // 版本串无法解析时只做字符串兜底，避免误清目标。
-        None => versions_equal(current, target),
+        return versions_equal(current, target_version);
+    };
+    match ordering {
+        Ordering::Equal => true,
+        Ordering::Greater => {
+            // 只有升级目标才把 current > target 当成成功；降级目标下
+            // current > target 说明设备还在旧版本，必须继续重试。
+            if target.from_version.trim().is_empty() {
+                return true;
+            }
+            compare_versions(&target.from_version, target_version)
+                .is_some_and(|from_order| from_order == Ordering::Less)
+        }
+        Ordering::Less => false,
     }
 }
 
@@ -507,6 +544,7 @@ mod tests {
     fn target(version: &str, board: &str, file: &str) -> FirmwareTarget {
         FirmwareTarget {
             version: version.to_string(),
+            from_version: String::new(),
             file: file.to_string(),
             asset: format!("v{version}_{board}.zip"),
             sha256: "deadbeef".to_string(),
@@ -527,9 +565,9 @@ mod tests {
         store_firmware_file(file, vec![1, 2, 3])
             .await
             .expect("写固件");
-        set_firmware_target(mac, target("2.5.2", "bread-compact-wifi", file))
-            .await
-            .expect("设置目标");
+        let mut upgrade = target("2.5.2", "bread-compact-wifi", file);
+        upgrade.from_version = "2.5.1".to_string();
+        set_firmware_target(mac, upgrade).await.expect("设置目标");
 
         record_device_report(report(mac, "2.5.1", "bread-compact-wifi")).await;
         assert!(target_for(mac).is_some(), "旧版本不应清除目标");
@@ -549,15 +587,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_version_target_survives_until_delivered() {
+    async fn same_version_reflash_is_one_shot() {
         let _lock = test_lock().lock().await;
         install_mem().await;
         let mac = "aa:bb:cc:dd:ee:02";
         let file = "2.5.2-bread-compact-wifi-abcdef123456.bin";
         store_firmware_file(file, vec![1]).await.expect("写固件");
-        set_firmware_target(mac, target("2.5.2", "bread-compact-wifi", file))
-            .await
-            .expect("设置目标");
+        let mut reflash = target("2.5.2", "bread-compact-wifi", file);
+        reflash.from_version = "2.5.2".to_string();
+        set_firmware_target(mac, reflash).await.expect("设置目标");
 
         // 同版本重刷：首次上报不能清目标，否则永远下发不出去。
         record_device_report(report(mac, "2.5.2", "bread-compact-wifi")).await;
@@ -566,8 +604,42 @@ mod tests {
             firmware_info_for(mac, "http://h").await.is_some(),
             "应下发一次"
         );
+        assert!(
+            target_for(mac).is_none(),
+            "同版本重刷无法从版本判断成功，按一次性下发后清除"
+        );
+    }
+
+    #[tokio::test]
+    async fn downgrade_target_retries_until_device_reports_target() {
+        let _lock = test_lock().lock().await;
+        install_mem().await;
+        let mac = "aa:bb:cc:dd:ee:06";
+        let file = "2.4.0-bread-compact-wifi-abcdef123456.bin";
+        store_firmware_file(file, vec![1]).await.expect("写固件");
+        let mut downgrade = target("2.4.0", "bread-compact-wifi", file);
+        downgrade.from_version = "2.5.2".to_string();
+        set_firmware_target(mac, downgrade).await.expect("设置目标");
+
         record_device_report(report(mac, "2.5.2", "bread-compact-wifi")).await;
-        assert!(target_for(mac).is_none(), "下发后再次上报应清除");
+        assert!(target_for(mac).is_some(), "下发前不能清目标");
+        assert!(
+            firmware_info_for(mac, "http://h").await.is_some(),
+            "第一次下发"
+        );
+
+        // 设备下载失败/未刷成功，重启后仍上报旧版本：必须继续重试，
+        // 不能因为 current(2.5.2) >= target(2.4.0) 被误判为成功。
+        record_device_report(report(mac, "2.5.2", "bread-compact-wifi")).await;
+        assert!(target_for(mac).is_some(), "降级失败后目标应保留重试");
+        assert!(
+            firmware_info_for(mac, "http://h").await.is_some(),
+            "失败后应再次下发"
+        );
+
+        // 真正降到目标版本后才清除。
+        record_device_report(report(mac, "2.4.0", "bread-compact-wifi")).await;
+        assert!(target_for(mac).is_none(), "降级成功应清除目标");
     }
 
     #[tokio::test]

@@ -382,12 +382,40 @@ fn latest_state(
                     Some("上游最新版本没有匹配此板型的固件资产".to_string()),
                 )
             } else {
-                (
-                    None,
-                    candidates,
-                    "needs_selection",
-                    Some("未精确匹配板型，请选择候选固件".to_string()),
-                )
+                // 候选存在不代表设备还没升级：设备可能已经刷到该版本，
+                // 只是板型仍无法精确匹配。这里用版本号决定展示状态，
+                // 避免升级完成后一直显示「需选择」。
+                let release_version = manifest
+                    .map(|manifest| manifest.version.trim_start_matches(['v', 'V']).to_string())
+                    .unwrap_or_else(|| latest_release.version.clone());
+                // 同时把 latest 指向最可能的候选 release，供 UI 作为默认版本；
+                // 否则 UI 会回退到 releases[0]，可能选中 prerelease 而候选
+                // 来自另一个 stable release（Cursor Bugbot #12 第二条）。
+                let latest_json = candidates.first().map(|top| {
+                    json!({
+                        "tag": latest_release.tag,
+                        "version": release_version,
+                        "asset": top.asset.clone(),
+                        "published_at": latest_release.published_at,
+                        "html_url": latest_release.html_url,
+                    })
+                });
+                let (comparison, comparison_error) =
+                    update_state(&report.app_version, &release_version);
+                let (state, error) = match comparison {
+                    "update_available" => (
+                        "needs_selection",
+                        Some("未精确匹配板型，请选择候选固件".to_string()),
+                    ),
+                    "latest" => ("latest", None),
+                    "ahead" => ("ahead", None),
+                    _ => (
+                        "needs_selection",
+                        comparison_error
+                            .or_else(|| Some("无法解析固件版本，请选择候选固件".to_string())),
+                    ),
+                };
+                (latest_json, candidates, state, error)
             }
         }
         Err(GithubError::AssetNotFound(_)) => (
@@ -768,6 +796,7 @@ async fn upgrade_with_service(
 
     let target = FirmwareTarget {
         version: matched.version.clone(),
+        from_version: report.app_version.clone(),
         file: file.clone(),
         asset: matched.asset.name.clone(),
         sha256: app_sha.clone(),
@@ -910,6 +939,68 @@ mod tests {
             );
         }
         assert!(!OverviewQuery::default().wants_refresh());
+    }
+
+    fn vendor_release_and_manifest() -> (ReleaseInfo, ReleaseManifest) {
+        let release = ReleaseInfo {
+            tag: "v2.5.2".to_string(),
+            version: "2.5.2".to_string(),
+            name: "v2.5.2".to_string(),
+            published_at: "2026-10-11T20:49:36Z".to_string(),
+            prerelease: false,
+            draft: false,
+            html_url: "https://github.com/78/xiaozhi-esp32/releases/tag/v2.5.2".to_string(),
+            assets: vec![github::ReleaseAsset {
+                name: "v2.5.2_spotpear-sp-esp32-s3-1.28-box.zip".to_string(),
+                download_url: "https://example.test/fw.zip".to_string(),
+                size: 2_536_926,
+                digest: None,
+            }],
+        };
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            version: "2.5.2".to_string(),
+            tag: "v2.5.2".to_string(),
+            variants: vec![github::ManifestVariant {
+                board: "spotpear/sp-esp32-s3-1.28-box".to_string(),
+                name: "sp-esp32-s3-1.28-box".to_string(),
+                full_name: "spotpear-sp-esp32-s3-1.28-box".to_string(),
+                target: "esp32s3".to_string(),
+            }],
+        };
+        (release, manifest)
+    }
+
+    #[test]
+    fn vendor_board_status_uses_version_not_exact_match() {
+        let (release, manifest) = vendor_release_and_manifest();
+        let mut report = DeviceFirmwareReport {
+            device_id: "90:70:69:f5:7a:04".to_string(),
+            app_version: "2.5.2".to_string(),
+            board_type: "sp-esp32-s3-1.28-box".to_string(),
+            board_name: "sp-esp32-s3-1.28-box".to_string(),
+            chip_model: "esp32s3".to_string(),
+            ..DeviceFirmwareReport::default()
+        };
+
+        // 已刷到目标版本：虽然板型仍无法精确匹配，状态应是 latest，
+        // 而不是一直 needs_selection。
+        let (latest, candidates, state, error) = latest_state(&release, Some(&manifest), &report);
+        assert_eq!(state, "latest");
+        assert!(error.is_none());
+        assert!(!candidates.is_empty());
+        let latest = latest.expect("latest 视图");
+        assert_eq!(latest["tag"], "v2.5.2");
+        assert_eq!(latest["version"], "2.5.2");
+        assert_eq!(latest["asset"], "v2.5.2_spotpear-sp-esp32-s3-1.28-box.zip");
+
+        // 仍低于目标版本：需要用户选择候选。
+        report.app_version = "2.4.2".to_string();
+        let (latest, candidates, state, error) = latest_state(&release, Some(&manifest), &report);
+        assert_eq!(state, "needs_selection");
+        assert!(error.is_some());
+        assert!(latest.is_some(), "候选状态也要给出默认版本");
+        assert_eq!(candidates[0].full_name, "spotpear-sp-esp32-s3-1.28-box");
     }
 }
 

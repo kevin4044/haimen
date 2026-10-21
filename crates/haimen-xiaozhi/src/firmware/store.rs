@@ -100,6 +100,16 @@ pub struct DeviceFirmwareReport {
 pub struct FirmwareTarget {
     /// 下发给设备的版本，必须是不带 `v` 的点分数字。
     pub version: String,
+    /// 设置目标时设备当前版本。用于区分升级 / 降级 / 同版本重刷：
+    /// - `from_version < version`：升级，上报版本 >= 目标视为成功；
+    /// - `from_version > version`：降级，只有上报版本 == 目标才算成功，
+    ///   设备仍停在旧版本时要继续重试；
+    /// - `from_version == version`：同版本重刷，无法从版本判断是否刷成功，
+    ///   按「一次性下发」处理。
+    ///
+    /// 旧状态文件没有该字段时为空串，按原来的升级语义兼容处理。
+    #[serde(default)]
+    pub from_version: String,
     /// 固件 blob 名（`FirmwareBlobStore` 的 key）。
     pub file: String,
     /// release 资产名，排查用。
