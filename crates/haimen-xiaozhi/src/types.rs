@@ -387,7 +387,7 @@ impl Default for XiaozhiMqttConfig {
 pub struct XiaozhiUdpConfig {
     #[serde(default = "default_udp_bind")]
     pub bind_addr: String,
-    /// `tts start` 之后、首帧音频之前额外等待的毫秒数，默认 100。
+    /// `tts start` 之后、首帧音频之前额外等待的毫秒数，默认 150。
     ///
     /// MQTT 控制面（只入 broker 写队列）和 UDP 音频是两条独立链路，固件要
     /// 异步处理完 start 才肯收 UDP 音频。留一段静默窗口，预缓冲帧才不会被
@@ -401,7 +401,12 @@ pub struct XiaozhiUdpConfig {
 }
 
 /// 静默窗口默认值。与 [`crate::MqttUdpConfig::default`] 共用，避免两处漂移。
-pub const DEFAULT_TTS_START_SETTLE_MS: u64 = 100;
+///
+/// 取 150 而不是 100：固件从收到 `tts start` 到「真正可收音频」要经过
+/// `Schedule` → 主任务下一轮 → `SetDeviceState` → `ResetDecoder`，典型 2–10ms、
+/// 尾部（显示/锁/CPU 抢占）30–60ms；而失败是双峰的（settle 差一点就整批又丢），
+/// 所以留到 2–5 倍余量。多出的 50ms 在流式路径只推迟静音，不影响首字。
+pub const DEFAULT_TTS_START_SETTLE_MS: u64 = 150;
 
 fn default_tts_start_settle_ms() -> u64 {
     DEFAULT_TTS_START_SETTLE_MS

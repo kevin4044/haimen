@@ -275,12 +275,12 @@ sed -n '1694,1731p'        crates/haimen-xiaozhi/src/mqtt_udp.rs   # 注意：WI
 
 | 位置 | 改动 |
 | --- | --- |
-| `crates/haimen-xiaozhi/src/mqtt_udp.rs` | `MqttUdpConfig.tts_start_settle_ms`（默认 `crate::types::DEFAULT_TTS_START_SETTLE_MS = 100`） |
+| `crates/haimen-xiaozhi/src/mqtt_udp.rs` | `MqttUdpConfig.tts_start_settle_ms`（默认 `crate::types::DEFAULT_TTS_START_SETTLE_MS`，复核定稿为 150） |
 | 同上 | `wait_tts_start_settle(settle_ms, &mut watch::Receiver<bool>)`：`select!` 等 sleep 或 cancel；0 时立即返回 true；只收毫秒数，便于直接单测 |
 | 同上 | `drive_playback_inner`：`publish_tts(Start)` 之后、`sentence_start`/预缓冲之前调用；取消即 `return false`；settle 返回后补一次 cancel 复查（避免 timer/cancel 同时就绪时补发 stale sentence_start） |
 | 同上 | `say_raw_frames`：start 之后、首帧之前 sleep settle（主动播报路径无 cancel watch，沿用既有设计） |
 | 同上 | `下行播放统计` 增加 `settle_ms` 字段，真机 A/B 时可直接确认配置生效 |
-| `crates/haimen-xiaozhi/src/types.rs` | `[xiaozhi.udp] tts_start_settle_ms`（serde 默认 100，0 = 旧行为） |
+| `crates/haimen-xiaozhi/src/types.rs` | `[xiaozhi.udp] tts_start_settle_ms`（serde 默认 150，0 = 旧行为） |
 | `src/gateway/mod.rs` | `build_mqtt_udp_config` 用 `x.udp.tts_start_settle_ms`，不再硬编码 |
 | `src/web/api/xiaozhi_settings.rs` | GET/PUT 暴露 `udp.tts_start_settle_ms`；上限 1000（推荐 0–300） |
 
@@ -289,7 +289,8 @@ sed -n '1694,1731p'        crates/haimen-xiaozhi/src/mqtt_udp.rs   # 注意：WI
 - `tts_start_settle_delays_first_downlink_frame`：settle=150 时断言「设备收到 tts start → 首帧 UDP」≥120ms（变异测试：删掉 settle 调用后失败，实测只隔 5.7µs）。
 - `abort_during_tts_start_settle_skips_audio_and_recovers`：settle 期间 barge-in 不发音频，下一轮可恢复。
 - `wait_tts_start_settle_is_cancellable`：直接覆盖「已取消 / 等待中取消 / 正常等完 / 0 立即返回」。
-- `tts_start_settle_defaults_to_100ms`：锁默认值，防止漂移。
+- `tts_start_settle_defaults_to_150ms`：锁默认值，防止漂移。
+- `firmware_model_drops_prebuffer_without_settle_but_keeps_it_with_settle`：用固件行为模型（start 后 50ms 内到达的帧判丢）验证 settle=0 时整批 3/3 被丢、settle=200 时 0 丢。
 - `cargo test -p haimen-xiaozhi`：148 passed / 0 failed。
 
 ### 8.3 A/B 操作（真机）
@@ -307,3 +308,74 @@ A/B（不要与 settle 同时改）。
 
 `PumpGuard` 超时假 abort（P1）、broker 「已写 socket」屏障（P2）、WS 路径 settle
 （P2）、统计行 `tts_start→首帧实际间隔`（P3）。
+
+---
+
+## 9. 第二轮复审（2026-10-21，独立固件审计 + 对抗性 review）
+
+> 触发：用户反馈「这个 bug 修复了好几次了，确认这次修改有效」。
+> 方法：独立子代理逐行核对本地固件源码（`xiaozhi-esp32` @ 1718809 = v2.5.2+16）、
+> 复核线上日志、对 commit 做有效性/失效条件评审。
+
+### 9.1 结论
+
+| 问题 | 结论 |
+| --- | --- |
+| 代码改动是否正确且在 MQTT 主路径生效 | **是**（审查确认 strategy/请求路径/配置/取消语义/回退均正确；无回归） |
+| 固件丢帧机制是否真实 | **是，高置信**；且确认有**两个**窗口：① 非 Speaking 静默丢；② 状态已置位但主任务还没跑完 Speaking handler 时，`ResetDecoder()` 会清空解码队列（`audio_service.cc:802-817`） |
+| 丢帧量是否必然为「整批 5 帧」 | **不是**。UDP 接收任务优先级低于 MQTT/主任务（`CreateUdp(2)`，推断），start 先被处理时部分帧可能在 ResetDecoder 之后入队。丢 0–5 帧都可能，呈双峰。 |
+| 100ms 是否够 | 典型足够（2–10ms，尾 30–60ms），但为双峰失败留余量，**默认上调到 150ms** |
+| 参考实现「tts start 后 sleep 20–100ms」 | **说法不成立**（见 §9.2），旧文档已修正 |
+| 是否一定解决用户症状 | **不能仅凭代码确认**：设备侧无观测、提交后无真机数据。机制置信度高，但「是症状主因」仍是推断 |
+
+**为什么这次不同**：前几次修复分别针对「尾帧」（T1）、「服务端供给断档」（ContinuityPump）、
+「发送节奏累积漂移」（WS）。这次针对的是 **start 边界**：ContinuityPump 让 `tts start`
+与首帧之间的天然间隔从「TTS 合成时延（数百 ms）」变成 ~0，把固件异步切状态的窗口暴露了出来。
+这是唯一能同时解释「为什么 pump 之后更明显」「为什么尾帧修复无效」的机制。
+
+### 9.2 更正：参考实现并没有显式等待
+
+`specs/对比-xiaozhi-esp32-server.md:355` 的「它 ✅ 20–100ms」是报告作者的**建议措辞**，
+不是参考代码事实。xiaozhi-esp32-server 的 `sendAudioHandle.py` 首帧是立即发的；它之所以
+不暴露该竞态，是因为它在 LLM/TTS 产出音频**之前**就发了 `tts start`，start → 首帧之间
+天然有数百 ms。本项目的 ContinuityPump 为了消除服务端断档，把这段天然间隔填成了静音。
+
+### 9.3 本轮加固
+
+1. 默认 settle **100ms → 150ms**（`types::DEFAULT_TTS_START_SETTLE_MS`）；失败是双峰的，
+   宁可在 start 边界多等 50ms（流式路径只推迟静音，不影响首字）。
+2. `build_mqtt_udp_config` 对直接手改 `settings.toml` 的路径补 `clamp(0..=1000)`
+   （Web API 已校验，但 TOML 直写绕过）。
+3. 新增**固件行为模型测试**：模拟「start 后 50ms 内到达的帧被丢」，
+   断言 settle=0 时整批 3/3 被丢、settle=200 时 0 丢（旧行为可复现、修复可证）。
+4. 复审仍保留的缺口：WS 路径未加 settle（当前 `protocol=mqtt` 不受影响）；settle 从
+   `publish_to` **入队返回**起算而非 socket 写完（见 §9.4）。
+
+### 9.4 失效条件（按概率）
+
+1. **中**：设备真实切换时延 > settle（显示锁/PSRAM/CPU 抢占；显示锁尾部可达 30–60ms，
+   已用 150ms 覆盖 2.5–5 倍余量）。
+2. **中**：broker 写队列/ TCP 重传吃掉 settle —— settle 从「入队」起算，start 的 TCP
+   包若重传（RTO 200ms+），预缓冲仍会抢跑。彻底修法：broker 加「已写 socket」屏障后再
+   起计时（§6.6 P2，本次未做）。
+3. **低–中**：播放期 WiFi 若仍在省电（PERFORMANCE 是否等于 `WIFI_PS_NONE` 未核实），
+   300ms lead 可能被 DTIM/唤醒抖动击穿 —— settle 无线。
+4. **低**：稳态网络丢包/乱序；解码队列 20 包在 >1.2s 停摆时溢出；`tts start` 落在
+   非法状态（Connecting 等）。
+
+### 9.5 决定性验证（不需要烧固件，且不依赖主观听感）
+
+现有部署（**旧版、settle=0**）即可先验证根因，不必先部署修复：
+
+1. 用控制面测试通道 `__say_audio` 向设备注入一段 **前 300ms 为 440Hz 提示音、之后静音**
+   的 20 帧 Opus（`scripts/xiaozhi_sim/send_ctl.py` → `haimen/ctl/<client_id>`）。
+2. 设备需先唤醒（说「你好小智」，UDP 会话存在）。
+3. 若旧版听到提示音 → 预缓冲没被丢，**根因假设错误**，不要指望 settle 修复；
+   若旧版**听不到**提示音 → 预缓冲确实被固件丢弃，根因确认。
+4. 部署修复后重复：`settle=0` 听不到、`settle=150` 能听到完整提示音 → 修复有效。
+   同时 `下行播放统计` 的 `settle_ms` 字段可确认配置生效。
+
+补充取证（可选，更硬）：设备 UART/USB 串口（本机已看到 Espressif USB CDC 设备）
+可抓固件日志——状态切换（`State: listening -> speaking`）、`wrong sequence` /
+`duplicate/old audio sequence` 警告；或在固件 `OnIncomingAudio` 的 else 分支加一行
+丢弃计数（需自编译固件），这是唯一能定量统计每轮丢帧数的办法。

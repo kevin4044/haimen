@@ -78,7 +78,7 @@ const fn default_tail_extra_frames() -> u32 {
     2
 }
 
-/// `tts start` 之后、首帧音频之前额外等待的毫秒数，默认 100。
+/// `tts start` 之后、首帧音频之前额外等待的毫秒数，默认 150。
 ///
 /// 为什么需要：MQTT 控制面与 UDP 音频是两条独立链路。`publish_to` 只是把
 /// 报文放进 per-client 写队列就返回，UDP 帧却会立刻出网；而固件要异步处理完
@@ -108,7 +108,7 @@ pub struct MqttUdpConfig {
     /// 发 `tts stop` 前额外等待的帧数（乘 frame_duration）。
     /// 默认 2（= 参考实现的 `prebuffer + 2` 里的那个 2）。
     pub tail_extra_frames: u32,
-    /// `tts start` 之后、首帧音频之前额外等待的毫秒数，默认 100。
+    /// `tts start` 之后、首帧音频之前额外等待的毫秒数，默认 150。
     ///
     /// MQTT 控制面（`publish_to` 只入队）与 UDP 音频是两条链路，固件要异步
     /// 处理完 start 才肯收 UDP 音频。不等的话预缓冲帧会抢在固件切 Speaking
@@ -2611,7 +2611,9 @@ mod tests {
         transport: MqttUdpTransport,
         link: DeviceLink,
         mock: Arc<MockStrategy>,
-        udp: UdpSocket,
+        /// 用 `Arc` 包住：固件行为模型测试需要另起一个任务实时收 UDP，
+        /// 才能按「真实到达时刻」判断哪些帧会被固件丢弃。
+        udp: Arc<UdpSocket>,
     }
 
     impl Env {
@@ -2642,7 +2644,7 @@ mod tests {
                 .expect("启动传输层");
             let addr: SocketAddr = transport.broker_addr().parse().expect("broker 地址");
             let link = DeviceLink::connect(addr).await;
-            let udp = UdpSocket::bind("127.0.0.1:0").await.expect("绑定设备 UDP");
+            let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("绑定设备 UDP"));
             Self {
                 transport,
                 link,
@@ -3332,9 +3334,9 @@ mod tests {
     /// 默认值必须开启 settle：设为 0 等于回到「预缓冲抢跑」的旧行为。
     /// 生产默认值统一来自 `types::DEFAULT_TTS_START_SETTLE_MS`，这里锁住数值防漂移。
     #[test]
-    fn tts_start_settle_defaults_to_100ms() {
-        assert_eq!(default_tts_start_settle_ms(), 100);
-        assert_eq!(MqttUdpConfig::default().tts_start_settle_ms, 100);
+    fn tts_start_settle_defaults_to_150ms() {
+        assert_eq!(default_tts_start_settle_ms(), 150);
+        assert_eq!(MqttUdpConfig::default().tts_start_settle_ms, 150);
     }
 
     /// settle 等待必须可取消：barge-in 不能白等。
@@ -3373,6 +3375,107 @@ mod tests {
         let started = Instant::now();
         assert!(wait_tts_start_settle(0, &mut cancel).await);
         assert!(started.elapsed() < Duration::from_millis(40));
+    }
+
+    /// 固件行为模型：验证修复对「整批预缓冲被丢」这个具体故障确实有效。
+    ///
+    /// 固件事实（本地源码 `xiaozhi-esp32` @ 1718809）：
+    /// - `OnIncomingAudio` 只在 `Speaking` 才入解码队列（`main/application.cc:567-571`）；
+    /// - `tts start` 经 `Schedule` 异步切状态（`:637-641`、`:1248-1253`）；
+    /// - 切 `Speaking` 时还会 `ResetDecoder()` 清空解码队列（`main/audio/audio_service.cc:802-817`）。
+    /// 所以「设备收到 tts start → 真正能收音频」之间有一个窗口，窗口内的帧被静默丢弃。
+    ///
+    /// 模型：把「设备收到 tts start 后 `FIRMWARE_READY_DELAY`」当作最早可接收时刻，
+    /// 之前到达的预缓冲帧记为丢弃。断言：
+    /// - settle=0（旧行为）→ 整批预缓冲落入窗口，全丢（复现 bug）；
+    /// - settle=200ms → 零丢弃（修复有效）。
+    #[tokio::test]
+    async fn firmware_model_drops_prebuffer_without_settle_but_keeps_it_with_settle() {
+        // 模拟固件从收到 start 到 ResetDecoder 完成、真正可收音频的时延。
+        const FIRMWARE_READY_DELAY: Duration = Duration::from_millis(50);
+        // 约 1.3 倍余量（实际默认 150ms；这里加大到 200ms 让 CI 调度抖动无法钻空子）。
+        const SETTLE_MS: u64 = 200;
+        const FRAMES: usize = 3;
+
+        /// 跑一轮回放，返回（预缓冲帧的真实到达时刻，测试观测到 tts start 的时刻）。
+        async fn run_round(settle_ms: u64) -> (Vec<Instant>, Instant) {
+            let playback: Vec<AudioFrame> = (0..FRAMES as u8)
+                .map(|index| AudioFrame {
+                    timestamp: 0,
+                    data: vec![0xB0 + index],
+                })
+                .collect();
+            let mut env = Env::boot_with_settle(playback, settle_ms).await;
+            let hello = env.hello().await;
+            let crypto = crypto_from_hello(&hello);
+
+            env.link
+                .publish("device-server", br#"{"type":"listen","state":"start"}"#)
+                .await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while env.mock.lock().recording_starts.is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "listen start 没有生效"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            send_uplink(&env, &crypto, 10, 1, b"hi").await;
+            wait_frames(&env.mock, 1).await;
+
+            // 收包任务必须在 listen stop 之前启动：包一旦进入内核 socket 缓冲，
+            // 读到的时刻就不再等于真实到达时刻，模型会判错。
+            let udp = Arc::clone(&env.udp);
+            let receiver = tokio::spawn(async move {
+                let mut arrivals = Vec::with_capacity(FRAMES);
+                let mut buf = [0u8; 2048];
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                while arrivals.len() < FRAMES {
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    assert!(!left.is_zero(), "预缓冲帧没收齐，只收到 {}", arrivals.len());
+                    let (len, _) = tokio::time::timeout(left, udp.recv_from(&mut buf))
+                        .await
+                        .expect("等下行音频超时")
+                        .expect("recv 下行音频");
+                    // 只统计可解密的音频帧，忽略其它报文。
+                    if crypto.open(&buf[..len]).is_ok() {
+                        arrivals.push(Instant::now());
+                    }
+                }
+                arrivals
+            });
+
+            env.link
+                .publish("device-server", br#"{"type":"listen","state":"stop"}"#)
+                .await;
+            let tts = env.link.wait_type("tts", Duration::from_secs(2)).await;
+            assert_eq!(tts["state"], "start");
+            // 固件「收到 tts start」的起点：从这里开始异步切 Speaking + ResetDecoder。
+            let device_saw_start = Instant::now();
+            let arrivals = receiver.await.expect("收包任务 panicked");
+            env.shutdown().await;
+            (arrivals, device_saw_start)
+        }
+
+        let (old_arrivals, old_start) = run_round(0).await;
+        let old_dropped = old_arrivals
+            .iter()
+            .filter(|at| **at < old_start + FIRMWARE_READY_DELAY)
+            .count();
+        assert_eq!(
+            old_dropped, FRAMES,
+            "旧行为下整批预缓冲应落在固件就绪窗口内被丢，实际丢 {old_dropped}/{FRAMES}"
+        );
+
+        let (new_arrivals, new_start) = run_round(SETTLE_MS).await;
+        let new_dropped = new_arrivals
+            .iter()
+            .filter(|at| **at < new_start + FIRMWARE_READY_DELAY)
+            .count();
+        assert_eq!(
+            new_dropped, 0,
+            "settle={SETTLE_MS}ms 后预缓冲仍落入固件就绪窗口（丢 {new_dropped}/{FRAMES}），修复无效"
+        );
     }
 
     #[tokio::test]

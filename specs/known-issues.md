@@ -246,7 +246,7 @@ per-client 写队列就返回（写 socket 在另一个任务里），UDP 帧却
 
 ```toml
 [xiaozhi.udp]
-tts_start_settle_ms = 100   # 默认 100；0 = 旧行为，真机 A/B 用
+tts_start_settle_ms = 150   # 默认 150；0 = 旧行为，真机 A/B 用
 ```
 
 覆盖正常回放与主动播报（`say_raw_frames`）；`下行播放统计` 日志新增 `settle_ms`
@@ -254,7 +254,7 @@ tts_start_settle_ms = 100   # 默认 100；0 = 旧行为，真机 A/B 用
 
 ### A/B 验证步骤
 
-1. 部署后确认 `settings.toml` 有 `[xiaozhi.udp] tts_start_settle_ms`（不写默认 100）；
+1. 部署后确认 `settings.toml` 有 `[xiaozhi.udp] tts_start_settle_ms`（不写默认 150）；
 2. 设 0 播 10 轮、设 100 播 10 轮，对比句中卡顿次数；
 3. 看 `下行播放统计` 的 `settle_ms` 确认每轮配置真正生效；
 4. 若 100ms 仍偶发掉帧 → 先排除网络/固件侧（见 diagnosis §6.5），再考虑
