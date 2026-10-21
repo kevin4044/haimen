@@ -3586,6 +3586,28 @@ impl Default for PumpConfig {
 /// 一帧 60ms @ 24kHz 16-bit mono 的 PCM 字节数（与 `StreamingOpusEncoder` 的 frame_bytes 一致）
 const PUMP_FRAME_PCM_BYTES: usize = 2880;
 
+/// 开头真实内容预缓冲目标：首段真实 PCM 攒到这么久再开播。
+///
+/// 为什么需要：TTS 是流式供数的，开头几百毫秒经常一顿一顿地来。泵若立刻
+/// 往外吐，供数断档就会被补成 60ms 静音帧，听感是「刚开始说话的 2–3 秒
+/// 断断续续」（同内容录音直接回放是顺的，已真机验证）。先攒一小段再开播，
+/// 抖动被吸收；只在开头做一次，之后恢复到逐块实时发送。
+const PUMP_CONTENT_PREBUFFER_MS: u64 = 400;
+
+/// 预缓冲最长等待：供数太慢时到点就按已攒内容开播，避免首字被无限延迟。
+const PUMP_CONTENT_PREBUFFER_TIMEOUT_MS: u64 = 900;
+
+/// 预缓冲字节阈值（24kHz 16-bit mono = 48 字节/ms）。
+const PUMP_CONTENT_PREBUFFER_BYTES: usize = (PUMP_CONTENT_PREBUFFER_MS as usize) * 48;
+
+/// 插静音前要求管道里至少还有这么多帧内容没播（5 × 60ms = 300ms）。
+///
+/// 为什么：泵只知道自己手上有没有新 PCM，不知道管道里还有多少内容排着队。
+/// 一旦供数抖动就先插静音，这些静音会排在稍后到达的内容前面被播出来 ——
+/// 短抖动也会变成可听的断档。先看管道余量：余量够就跳过本 tick，让队列先顶住；
+/// 余量见底（< 300ms）才补静音。这样短抖动被队列吸收，不产生可听静音。
+const PUMP_SILENCE_SKIP_LEAD_FRAMES: usize = 5;
+
 /// 连续音频管道（ContinuityPump）
 ///
 /// 持有唯一 [`StreamingOpusEncoder`]，在整个回放窗口内持续向 `frame_tx` 推送音频帧：
@@ -3621,23 +3643,93 @@ pub(crate) async fn run_continuity_pump(
     let mut cached_silence: Option<Vec<u8>> = None;
     let mut silence_ready = false;
 
+    // ── 开头内容预缓冲状态 ──
+    // 只做一次：第一段真实 PCM 攒到阈值（或超时）后释放，之后恢复正常节奏。
+    let mut content_started = false;
+    let mut prebuffer: Vec<Vec<u8>> = Vec::new();
+    let mut prebuffer_bytes: usize = 0;
+    let mut prebuffer_started_at: Option<tokio::time::Instant> = None;
+    // 诊断：内容开播后每个「插入静音」段的起点/长度（相对开播时刻）。
+    // 用来确认剩余卡顿发生在第几秒、需要多大预缓冲。
+    let mut content_started_at: Option<tokio::time::Instant> = None;
+    let mut silence_run_started_at: Option<tokio::time::Instant> = None;
+    let mut silence_run_frames: u64 = 0;
+
     loop {
         tokio::select! {
             biased;
             pcm = pcm_rx.recv() => {
                 match pcm {
                     Some(pcm) => {
-                        let frames = enc.feed(&pcm)?;
-                        for opus in frames {
-                            pump_send_frame(&frame_tx, &mut timestamp, opus).await?;
-                            sent_frames += 1;
-                        }
-                        // 内容到达：编码器离开静音稳态，须重新收敛后才能复用
-                        if cfg.silence_dedup {
-                            silence_ready = false;
+                        if !content_started {
+                            // 开头阶段：先攒，够阈值再释放
+                            if prebuffer_started_at.is_none() {
+                                prebuffer_started_at = Some(tokio::time::Instant::now());
+                            }
+                            prebuffer_bytes = prebuffer_bytes.saturating_add(pcm.len());
+                            prebuffer.push(pcm);
+                            if prebuffer_bytes >= PUMP_CONTENT_PREBUFFER_BYTES {
+                                release_content_prebuffer(
+                                    &mut enc,
+                                    &frame_tx,
+                                    &mut timestamp,
+                                    &mut sent_frames,
+                                    &prebuffer,
+                                )
+                                .await?;
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    buffered_ms = prebuffer_bytes / 48,
+                                    waited_ms = prebuffer_started_at
+                                        .map(|t| t.elapsed().as_millis() as u64)
+                                        .unwrap_or(0),
+                                    "ContinuityPump 内容预缓冲释放"
+                                );
+                                prebuffer.clear();
+                                prebuffer_bytes = 0;
+                                content_started = true;
+                                content_started_at = Some(tokio::time::Instant::now());
+                                if cfg.silence_dedup {
+                                    silence_ready = false;
+                                }
+                            }
+                        } else {
+                            let frames = enc.feed(&pcm)?;
+                            for opus in frames {
+                                pump_send_frame(&frame_tx, &mut timestamp, opus).await?;
+                                sent_frames += 1;
+                            }
+                            // 内容恢复：记录上一段插入静音的时长与位置
+                            if let Some(start) = silence_run_started_at.take() {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    offset_ms = content_started_at
+                                        .map(|t| start.saturating_duration_since(t).as_millis() as u64)
+                                        .unwrap_or(0),
+                                    dur_ms = start.elapsed().as_millis() as u64,
+                                    silence_frames = silence_run_frames,
+                                    "ContinuityPump 插入静音（内容中途）"
+                                );
+                                silence_run_frames = 0;
+                            }
+                            // 内容到达：编码器离开静音稳态，须重新收敛后才能复用
+                            if cfg.silence_dedup {
+                                silence_ready = false;
+                            }
                         }
                     }
                     None => {
+                        // 还有没来得及播的预缓冲内容：先补发，再收尾
+                        if !content_started && !prebuffer.is_empty() {
+                            release_content_prebuffer(
+                                &mut enc,
+                                &frame_tx,
+                                &mut timestamp,
+                                &mut sent_frames,
+                                &prebuffer,
+                            )
+                            .await?;
+                        }
                         // 所有 PCM 源已关闭：flush 残片 + 追加尾静音帧，然后退出
                         let flush_frames = enc.flush()?;
                         for opus in flush_frames {
@@ -3660,7 +3752,52 @@ pub(crate) async fn run_continuity_pump(
                     }
                 }
             }
+            // 预缓冲兜底：供数太慢时到点按已攒内容开播（不无限等）
+            _ = async {
+                match prebuffer_started_at {
+                    Some(t) => tokio::time::sleep_until(
+                        t + std::time::Duration::from_millis(PUMP_CONTENT_PREBUFFER_TIMEOUT_MS),
+                    )
+                    .await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if !content_started && !prebuffer.is_empty() => {
+                release_content_prebuffer(
+                    &mut enc,
+                    &frame_tx,
+                    &mut timestamp,
+                    &mut sent_frames,
+                    &prebuffer,
+                )
+                .await?;
+                tracing::warn!(
+                    session_id = %session_id,
+                    buffered_ms = prebuffer_bytes / 48,
+                    "ContinuityPump 内容预缓冲超时释放"
+                );
+                prebuffer.clear();
+                prebuffer_bytes = 0;
+                content_started = true;
+                content_started_at = Some(tokio::time::Instant::now());
+                if cfg.silence_dedup {
+                    silence_ready = false;
+                }
+            }
             _ = ticker.tick() => {
+                // 管道里还有 ≥300ms 内容没播：本轮不补静音，让队列先顶住。
+                // 否则短供数抖动会被补成静音、排在后续内容前面被播出来（可听断档）。
+                let queued = frame_tx
+                    .max_capacity()
+                    .saturating_sub(frame_tx.capacity());
+                if queued >= PUMP_SILENCE_SKIP_LEAD_FRAMES {
+                    continue;
+                }
+                if content_started {
+                    if silence_run_started_at.is_none() {
+                        silence_run_started_at = Some(tokio::time::Instant::now());
+                    }
+                    silence_run_frames = silence_run_frames.saturating_add(1);
+                }
                 if cfg.silence_dedup && silence_ready {
                     // 收敛态：复用缓存静音帧，免重复编码（比特流与喂零逐字节相同）
                     if let Some(cached) = &cached_silence {
@@ -3690,6 +3827,24 @@ pub(crate) async fn run_continuity_pump(
             }
         }
     }
+}
+
+/// 把内容预缓冲里的 PCM 块按顺序编码并推入回放管道。
+async fn release_content_prebuffer(
+    enc: &mut StreamingOpusEncoder,
+    frame_tx: &mpsc::Sender<PlaybackEvent>,
+    timestamp: &mut u32,
+    sent_frames: &mut u64,
+    chunks: &[Vec<u8>],
+) -> Result<(), String> {
+    for chunk in chunks {
+        let frames = enc.feed(chunk)?;
+        for opus in frames {
+            pump_send_frame(frame_tx, timestamp, opus).await?;
+            *sent_frames = sent_frames.saturating_add(1);
+        }
+    }
+    Ok(())
 }
 
 /// 封装一帧 Opus 为 `AudioFrame` 并推入回放管道（会话级单调时间戳 +60/帧）
