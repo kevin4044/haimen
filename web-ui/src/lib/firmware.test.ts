@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { XiaozhiError } from '@/api/xiaozhi';
-import type { XiaozhiFirmwareRelease } from '@/types';
+import type { XiaozhiFirmwareCandidate, XiaozhiFirmwareRelease } from '@/types';
 import {
+  candidateLabel,
   defaultVersionForDevice,
   describeFirmwareError,
   FIRMWARE_STATE_META,
@@ -20,6 +21,23 @@ function makeRelease(overrides: Partial<XiaozhiFirmwareRelease> = {}): XiaozhiFi
     published_at: '2026-10-11T12:00:00Z',
     prerelease: false,
     html_url: 'https://github.com/78/xiaozhi-esp32/releases/tag/v2.5.2',
+    ...overrides,
+  };
+}
+
+function makeCandidate(
+  overrides: Partial<XiaozhiFirmwareCandidate> = {},
+): XiaozhiFirmwareCandidate {
+  return {
+    full_name: 'spotpear-sp-esp32-s3-1.28-box',
+    board: 'spotpear/sp-esp32-s3-1.28-box',
+    name: 'sp-esp32-s3-1.28-box',
+    target: 'esp32s3',
+    asset: 'v2.5.2_spotpear-sp-esp32-s3-1.28-box.zip',
+    asset_size: 2_345_678,
+    chip_match: true,
+    score: 60,
+    reason: '构建名匹配',
     ...overrides,
   };
 }
@@ -75,11 +93,12 @@ describe('formatFetchedAt', () => {
 });
 
 describe('firmwareStateMeta', () => {
-  it('6 种状态都有中文文案与 Badge class', () => {
+  it('7 种状态都有中文文案与 Badge class', () => {
     const states = Object.keys(FIRMWARE_STATE_META);
-    expect(states).toHaveLength(6);
+    expect(states).toHaveLength(7);
     expect(firmwareStateMeta('update_available').label).toBe('可升级');
     expect(firmwareStateMeta('latest').label).toBe('已是最新');
+    expect(firmwareStateMeta('needs_selection').label).toBe('需选择');
     expect(firmwareStateMeta('ahead').label).toBe('领先上游');
     expect(firmwareStateMeta('unknown').label).toBe('待上报');
     expect(firmwareStateMeta('unsupported').label).toBe('不支持');
@@ -87,6 +106,27 @@ describe('firmwareStateMeta', () => {
     for (const state of states) {
       expect(firmwareStateMeta(state as keyof typeof FIRMWARE_STATE_META).className).not.toBe('');
     }
+  });
+});
+
+describe('candidateLabel', () => {
+  it('组合构建名、芯片目标与匹配原因', () => {
+    expect(candidateLabel(makeCandidate())).toBe('sp-esp32-s3-1.28-box · esp32s3 · 构建名匹配');
+  });
+
+  it('芯片不匹配时追加警告', () => {
+    const label = candidateLabel(makeCandidate({ chip_match: false }));
+    expect(label).toContain('sp-esp32-s3-1.28-box · esp32s3 · 构建名匹配');
+    expect(label).toContain('⚠ 芯片不匹配');
+  });
+
+  it('name 缺失时回退 full_name，target/reason 缺失时省略', () => {
+    expect(candidateLabel(makeCandidate({ name: '', target: '', reason: '' }))).toBe(
+      'spotpear-sp-esp32-s3-1.28-box',
+    );
+    expect(candidateLabel(makeCandidate({ name: '', full_name: '' }))).toBe(
+      '未知固件 · esp32s3 · 构建名匹配',
+    );
   });
 });
 
@@ -142,6 +182,8 @@ describe('describeFirmwareError', () => {
     'release_not_found',
     'board_not_found',
     'board_ambiguous',
+    'selection_required',
+    'variant_not_found',
     'chip_mismatch',
     'asset_not_found',
     'download_failed',
@@ -170,9 +212,24 @@ describe('describeFirmwareError', () => {
     expect(describeFirmwareError(error)).toContain('API limit exceeded');
   });
 
+  it('selection_required 错误会携带候选列表', () => {
+    const candidates = [makeCandidate(), makeCandidate({ full_name: 'other', chip_match: false })];
+    const error = new XiaozhiError('selection_required', 409, 'selection required', {
+      candidates,
+    });
+    expect(error.candidates).toEqual(candidates);
+    expect(describeFirmwareError(error)).toContain('候选固件');
+  });
+
   it('常见错误码给出可操作文案', () => {
     expect(describeFirmwareError(new XiaozhiError('github_unavailable', 502, 'x'))).toContain(
       '刷新版本信息',
+    );
+    expect(describeFirmwareError(new XiaozhiError('selection_required', 409, 'x'))).toContain(
+      '候选固件',
+    );
+    expect(describeFirmwareError(new XiaozhiError('variant_not_found', 422, 'x'))).toContain(
+      '重新选择候选固件',
     );
     expect(describeFirmwareError(new XiaozhiError('upgrade_in_progress', 409, 'x'))).toContain(
       '升级任务',

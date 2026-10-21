@@ -29,6 +29,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import {
+  candidateLabel,
   defaultVersionForDevice,
   describeFirmwareError,
   firmwareStateMeta,
@@ -37,7 +38,11 @@ import {
   formatVersion,
   releaseLabel,
 } from '@/lib/firmware';
-import type { XiaozhiFirmwareDevice, XiaozhiFirmwareOverview } from '@/types';
+import type {
+  XiaozhiFirmwareCandidate,
+  XiaozhiFirmwareDevice,
+  XiaozhiFirmwareOverview,
+} from '@/types';
 
 /** 上游 release 页面（与后端默认仓库一致；仅作跳转入口） */
 const UPSTREAM_RELEASES_URL = 'https://github.com/78/xiaozhi-esp32/releases';
@@ -53,6 +58,19 @@ function deviceDisplayName(device: XiaozhiFirmwareDevice): string {
 function loadErrorMessage(error: unknown): string {
   if (error instanceof XiaozhiError) return describeFirmwareError(error);
   return '加载固件信息失败：请检查网络连接或 haimen 后端日志。';
+}
+
+/** 候选固件默认选择：第一个芯片型号匹配的候选 */
+function pickCandidateFullName(candidates: readonly XiaozhiFirmwareCandidate[]): string | null {
+  return candidates.find((candidate) => candidate.chip_match)?.full_name ?? null;
+}
+
+/** 固件资产大小展示（字节 → KB / MB） */
+function formatAssetSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '未知大小';
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1) return `${mb.toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 /**
@@ -73,6 +91,9 @@ export default function DeviceFirmwarePanel() {
   const [dialogDevice, setDialogDevice] = useState<XiaozhiFirmwareDevice | null>(null);
   const [version, setVersion] = useState('');
   const [manualVersion, setManualVersion] = useState('');
+  const [candidates, setCandidates] = useState<XiaozhiFirmwareCandidate[]>([]);
+  const [selectedVariant, setSelectedVariant] = useState<string | null>(null);
+  const [selectionRequired, setSelectionRequired] = useState(false);
   const [upgrading, setUpgrading] = useState(false);
   const [upgradeError, setUpgradeError] = useState<string | null>(null);
 
@@ -117,17 +138,70 @@ export default function DeviceFirmwarePanel() {
     [overview],
   );
 
+  /** 设备当前最新 release 的 tag；候选固件只对这个版本有效 */
+  const latestVersionFor = (device: XiaozhiFirmwareDevice): string =>
+    device.latest?.tag?.trim() || (overview?.releases[0]?.tag ?? '');
+
+  /** 重置候选区，并默认选第一个芯片型号匹配的候选 */
+  const applyCandidates = (list: XiaozhiFirmwareCandidate[]) => {
+    setCandidates(list);
+    setSelectedVariant(pickCandidateFullName(list));
+  };
+
+  const effectiveVersion = manualVersion.trim() || version.trim();
+  const selectedCandidate =
+    candidates.find((candidate) => candidate.full_name === selectedVariant) ?? null;
+  const compatibleCandidateCount = candidates.filter((candidate) => candidate.chip_match).length;
+  const selectedChipMismatch = selectedCandidate != null && !selectedCandidate.chip_match;
+  const mustChooseCandidate = candidates.length > 0 && selectedCandidate == null;
+  // 候选中的芯片不匹配 / 尚未选择候选时禁用确认，避免后端返回 chip_mismatch / selection_required
+  const confirmDisabled = upgrading || mustChooseCandidate || selectedChipMismatch;
+
   const openUpgrade = (device: XiaozhiFirmwareDevice) => {
-    setVersion(defaultVersionForDevice(device, overview?.releases ?? []));
+    const defaultVersion = defaultVersionForDevice(device, overview?.releases ?? []);
+    setVersion(defaultVersion);
     setManualVersion('');
     setUpgradeError(null);
+    setSelectionRequired(false);
     setDialogDevice(device);
+    // 候选来自「最新 release」的非精确匹配：打开时预填并默认选第一个芯片匹配的候选
+    applyCandidates(device.candidates ?? []);
   };
 
   const closeUpgrade = () => {
     if (upgrading) return;
     setDialogDevice(null);
     setUpgradeError(null);
+    setSelectionRequired(false);
+    setCandidates([]);
+    setSelectedVariant(null);
+  };
+
+  /** 版本切换：候选只对最新 release 有效，切走时清空、切回最新时恢复 */
+  const handleVersionChange = (next: string) => {
+    setVersion(next);
+    setUpgradeError(null);
+    setSelectionRequired(false);
+    if (!dialogDevice) return;
+    applyCandidates(
+      next.trim() === latestVersionFor(dialogDevice) ? (dialogDevice.candidates ?? []) : [],
+    );
+  };
+
+  /** 手动版本优先于下拉选择；只在留空且仍停留在最新版本时保留候选 */
+  const handleManualVersionChange = (value: string) => {
+    setManualVersion(value);
+    setUpgradeError(null);
+    setSelectionRequired(false);
+    if (!dialogDevice) return;
+    const keepCandidates = value.trim() === '' && version.trim() === latestVersionFor(dialogDevice);
+    applyCandidates(keepCandidates ? (dialogDevice.candidates ?? []) : []);
+  };
+
+  const handleSelectCandidate = (value: string) => {
+    setSelectedVariant(value);
+    setUpgradeError(null);
+    setSelectionRequired(false);
   };
 
   const handleClearTarget = async (device: XiaozhiFirmwareDevice) => {
@@ -145,21 +219,31 @@ export default function DeviceFirmwarePanel() {
     }
   };
 
-  const effectiveVersion = manualVersion.trim() || version.trim();
-
   const handleUpgrade = async () => {
     if (!dialogDevice) return;
     if (!effectiveVersion) {
       setUpgradeError('请选择或输入要升级到的版本。');
       return;
     }
+    if (selectedChipMismatch) {
+      setUpgradeError('所选候选固件芯片型号不匹配，后端会拒绝升级，请改选其他候选。');
+      return;
+    }
+    if (mustChooseCandidate) {
+      setUpgradeError(null);
+      setSelectionRequired(true);
+      return;
+    }
+
     setUpgrading(true);
     setUpgradeError(null);
+    setSelectionRequired(false);
     setActionError(null);
     try {
       const result = await upgradeXiaozhiFirmware({
         device: dialogDevice.device_id,
         version: effectiveVersion,
+        variant: selectedCandidate?.full_name,
       });
       const message = result.message?.trim() || '升级目标已设置';
       const suffix = message.includes('重启') ? '' : '（设备重启后生效）';
@@ -167,9 +251,22 @@ export default function DeviceFirmwarePanel() {
       setDialogDevice(null);
       setManualVersion('');
       setVersion('');
+      setCandidates([]);
+      setSelectedVariant(null);
       await loadOverview(false, true);
     } catch (upgradeFailure) {
-      setUpgradeError(describeFirmwareError(upgradeFailure));
+      if (upgradeFailure instanceof XiaozhiError && upgradeFailure.code === 'selection_required') {
+        const nextCandidates = upgradeFailure.candidates ?? [];
+        if (nextCandidates.length > 0) {
+          applyCandidates(nextCandidates);
+          setUpgradeError(null);
+          setSelectionRequired(true);
+        } else {
+          setUpgradeError(describeFirmwareError(upgradeFailure));
+        }
+      } else {
+        setUpgradeError(describeFirmwareError(upgradeFailure));
+      }
     } finally {
       setUpgrading(false);
     }
@@ -369,6 +466,11 @@ export default function DeviceFirmwarePanel() {
                         <Badge variant="outline" className={meta.className}>
                           {meta.label}
                         </Badge>
+                        {device.candidates.length > 0 && (
+                          <span className="text-xs text-orange-600 dark:text-orange-400">
+                            需手动选择（{device.candidates.length} 个候选）
+                          </span>
+                        )}
                         {device.latest && (
                           <span className="text-xs text-muted-foreground">
                             上游最新 {formatVersion(device.latest.tag || device.latest.version)}
@@ -453,7 +555,7 @@ export default function DeviceFirmwarePanel() {
                 <Combobox
                   options={releaseOptions}
                   value={version || null}
-                  onChange={setVersion}
+                  onChange={handleVersionChange}
                   placeholder="选择上游版本"
                   searchPlaceholder="搜索版本..."
                   emptyText="没有匹配的版本，可在下方手动输入"
@@ -470,16 +572,69 @@ export default function DeviceFirmwarePanel() {
                   placeholder="v2.4.0"
                   className="font-mono"
                   value={manualVersion}
-                  onChange={(event) => {
-                    setManualVersion(event.target.value);
-                    setUpgradeError(null);
-                  }}
+                  onChange={(event) => handleManualVersionChange(event.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
                   非空时覆盖上方选择；留空则使用所选版本
                   {effectiveVersion ? `（将使用 ${effectiveVersion}）` : ''}。
                 </p>
               </div>
+
+              {candidates.length > 0 && (
+                <div className="space-y-1.5 rounded-lg border p-2.5">
+                  <span className="text-sm font-medium">候选固件（{candidates.length}）</span>
+                  <p className="text-xs text-muted-foreground">
+                    未精确匹配板型，请选择要刷入的候选固件；芯片型号不匹配的候选无法升级。
+                  </p>
+                  <Combobox
+                    options={candidates.map((candidate) => ({
+                      value: candidate.full_name,
+                      label: candidateLabel(candidate),
+                    }))}
+                    value={selectedVariant}
+                    onChange={handleSelectCandidate}
+                    placeholder="选择候选固件"
+                    searchPlaceholder="搜索候选固件..."
+                    emptyText="没有匹配的候选"
+                  />
+                  {selectedCandidate && (
+                    <div className="space-y-0.5 text-xs text-muted-foreground">
+                      <p>
+                        板型：{selectedCandidate.board || '未知'}（
+                        {selectedCandidate.name || '未知构建名'}）
+                      </p>
+                      <p>
+                        固件资产：{selectedCandidate.asset || '未知文件'}（
+                        {formatAssetSize(selectedCandidate.asset_size)}）
+                      </p>
+                      <p>匹配原因：{selectedCandidate.reason || '未提供'}</p>
+                      {!selectedCandidate.chip_match && (
+                        <p className="text-destructive">
+                          ⚠ 芯片不匹配：设备 {dialogDevice.report?.chip_model || '未知芯片'} / 固件{' '}
+                          {selectedCandidate.target || '未知芯片'}
+                          ，后端会拒绝升级，请改选其他候选。
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {compatibleCandidateCount === 0 && (
+                    <p className="text-xs text-destructive">
+                      ⚠ 所有候选的芯片型号都与设备不匹配，无法升级。
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {selectionRequired && (
+                <Alert className="border-yellow-500/50 bg-yellow-500/10">
+                  <AlertTitle className="text-yellow-700 dark:text-yellow-400">
+                    请选择要刷入的固件
+                  </AlertTitle>
+                  <AlertDescription className="text-yellow-700/90 dark:text-yellow-400/90">
+                    未精确匹配板型，请在上方候选固件中选择要刷入的固件后再点「确认升级」。
+                  </AlertDescription>
+                </Alert>
+              )}
 
               <Alert className="border-yellow-500/50 bg-yellow-500/10">
                 <AlertTitle className="text-yellow-700 dark:text-yellow-400">升级前须知</AlertTitle>
@@ -500,7 +655,7 @@ export default function DeviceFirmwarePanel() {
               <Button variant="outline" onClick={closeUpgrade} disabled={upgrading}>
                 取消
               </Button>
-              <Button onClick={() => void handleUpgrade()} disabled={upgrading}>
+              <Button onClick={() => void handleUpgrade()} disabled={confirmDisabled}>
                 {upgrading ? '下发中...' : '确认升级'}
               </Button>
             </DialogFooter>

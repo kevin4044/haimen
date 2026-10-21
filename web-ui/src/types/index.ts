@@ -367,6 +367,29 @@ export interface XiaozhiFirmwareLatest {
   html_url: string;
 }
 
+/**
+ * 非精确匹配时后端返回的候选固件。
+ *
+ * 设备上报的板型/构建名与上游 manifest 没有精确命中时，后端列出所有
+ * 可能的 variant；用户选定后把 `full_name` 作为 `variant` 传给升级接口。
+ */
+export interface XiaozhiFirmwareCandidate {
+  /** manifest variant 完整名，升级时作为 `variant` 提交 */
+  full_name: string;
+  board: string;
+  name: string;
+  target: string;
+  asset: string;
+  /** 固件资产大小（字节） */
+  asset_size: number;
+  /** 芯片型号是否与设备上报一致；false 的候选后端会拒绝升级 */
+  chip_match: boolean;
+  /** 匹配得分，越高越可能命中 */
+  score: number;
+  /** 匹配原因，如「构建名匹配」 */
+  reason: string;
+}
+
 /** 固件与上游的版本关系 */
 export type XiaozhiFirmwareState =
   | 'update_available'
@@ -374,6 +397,7 @@ export type XiaozhiFirmwareState =
   | 'ahead'
   | 'unknown'
   | 'unsupported'
+  | 'needs_selection'
   | 'error';
 
 /** `GET /api/v1/xiaozhi/firmware` 返回的单台设备状态 */
@@ -386,6 +410,8 @@ export interface XiaozhiFirmwareDevice {
   latest: XiaozhiFirmwareLatest | null;
   state: XiaozhiFirmwareState;
   error: string | null;
+  /** 精确匹配失败时的候选固件；无候选为空数组 */
+  candidates: XiaozhiFirmwareCandidate[];
 }
 
 /**

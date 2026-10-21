@@ -17,7 +17,7 @@
 //! - `HAIMEN_XIAOZHI_GITHUB_DOWNLOAD_BASE`：资产下载基地址，默认 `https://github.com`
 //! - `GITHUB_TOKEN` / `HAIMEN_GITHUB_TOKEN`：可选令牌，仅作为请求头使用，绝不记录
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -45,6 +45,9 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// release 列表每页条数。
 const RELEASES_PER_PAGE: usize = 30;
+
+/// 非精确匹配时最多返回多少个候选固件。
+const MAX_CANDIDATES: usize = 12;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 对外数据结构
@@ -132,6 +135,34 @@ pub struct MatchedFirmware {
     pub asset: ReleaseAsset,
 }
 
+/// 精确匹配失败时提供给用户选择的候选固件。
+///
+/// 设备上报的 `board.type` 是 `config.json` 里的短类型（如
+/// `sp-esp32-s3-1.28-box`），而 manifest 的 `board` 是板子目录路径
+/// （如 `spotpear/sp-esp32-s3-1.28-box`）。两者对不上时不再直接报
+/// 「无固件」，而是按名称相似度给出候选，由用户确认后再刷。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirmwareCandidate {
+    /// 用户选择时回传的稳定标识（manifest 的 `full_name`）。
+    pub full_name: String,
+    /// manifest 的板型路径。
+    pub board: String,
+    /// manifest 的板型短名。
+    pub name: String,
+    /// 芯片目标。
+    pub target: String,
+    /// 对应的 release 资产名。
+    pub asset: String,
+    /// 资产大小（字节）。
+    pub asset_size: u64,
+    /// 芯片型号是否与设备一致（设备未上报芯片时视为 true）。
+    pub chip_match: bool,
+    /// 相似度分数（仅用于排序/展示）。
+    pub score: u32,
+    /// 中文匹配原因，例如「构建名匹配」。
+    pub reason: String,
+}
+
 /// GitHub 交互错误。
 #[derive(Debug, thiserror::Error)]
 pub enum GithubError {
@@ -153,6 +184,8 @@ pub enum GithubError {
     ChipMismatch { device: String, firmware: String },
     #[error("release 中没有匹配的固件资产: {0}")]
     AssetNotFound(String),
+    #[error("用户选择的固件变体不存在: {0}")]
+    VariantNotFound(String),
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -756,6 +789,182 @@ fn pick_manifest_asset(
                 .join(", ")
         ))),
     }
+}
+
+/// 精确匹配失败时，按相似度返回可选的固件变体，交给用户确认。
+///
+/// 只保留「有对应资产」的变体；按分数、芯片匹配、名称排序，最多
+/// [`MAX_CANDIDATES`] 个。分数为 0 的变体不返回，避免把完全无关的板型
+/// 塞给用户。
+pub fn candidate_firmwares(
+    release: &ReleaseInfo,
+    manifest: &ReleaseManifest,
+    board_type: &str,
+    board_name: &str,
+    chip_model: &str,
+) -> Vec<FirmwareCandidate> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for variant in &manifest.variants {
+        if !seen.insert(variant.full_name.to_ascii_lowercase()) {
+            continue;
+        }
+        let (score, reason) = candidate_score(variant, board_type, board_name);
+        if score == 0 {
+            continue;
+        }
+        let Ok(asset) = pick_manifest_asset(release, variant) else {
+            continue;
+        };
+        let chip_match = chip_model.trim().is_empty()
+            || variant.target.trim().is_empty()
+            || normalize_chip(chip_model) == normalize_chip(&variant.target);
+        candidates.push(FirmwareCandidate {
+            full_name: variant.full_name.clone(),
+            board: variant.board.clone(),
+            name: variant.name.clone(),
+            target: variant.target.clone(),
+            asset: asset.name,
+            asset_size: asset.size,
+            chip_match,
+            score,
+            reason: reason.to_string(),
+        });
+    }
+    candidates.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.chip_match.cmp(&a.chip_match))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    candidates.truncate(MAX_CANDIDATES);
+    candidates
+}
+
+/// 按用户选择的 `full_name`（也兼容 name/board）取固件变体。
+///
+/// 仍然执行芯片校验：板型可以由用户确认，但把别的芯片固件刷进去会变砖。
+pub fn match_candidate(
+    release: &ReleaseInfo,
+    manifest: &ReleaseManifest,
+    full_name: &str,
+    chip_model: &str,
+) -> Result<MatchedFirmware, GithubError> {
+    let wanted = full_name.trim();
+    if wanted.is_empty() {
+        return Err(GithubError::VariantNotFound("empty".to_string()));
+    }
+    let variant = manifest
+        .variants
+        .iter()
+        .find(|variant| {
+            variant.full_name.eq_ignore_ascii_case(wanted)
+                || variant.name.eq_ignore_ascii_case(wanted)
+                || variant.board.eq_ignore_ascii_case(wanted)
+        })
+        .ok_or_else(|| GithubError::VariantNotFound(wanted.to_string()))?;
+
+    if !chip_model.trim().is_empty()
+        && !variant.target.trim().is_empty()
+        && normalize_chip(chip_model) != normalize_chip(&variant.target)
+    {
+        return Err(GithubError::ChipMismatch {
+            device: chip_model.to_string(),
+            firmware: variant.target.clone(),
+        });
+    }
+
+    let asset = pick_manifest_asset(release, variant)?;
+    Ok(MatchedFirmware {
+        version: firmware_version(release, Some(manifest)),
+        variant: variant.clone(),
+        asset,
+    })
+}
+
+/// 候选变体的相似度评分 + 中文原因。
+fn candidate_score(
+    variant: &ManifestVariant,
+    board_type: &str,
+    board_name: &str,
+) -> (u32, &'static str) {
+    let board_type = board_type.trim();
+    let board_name = board_name.trim();
+
+    if !board_name.is_empty() && variant.name.eq_ignore_ascii_case(board_name) {
+        return (100, "构建名匹配");
+    }
+    if !board_type.is_empty() && variant.board.eq_ignore_ascii_case(board_type) {
+        return (95, "板型路径匹配");
+    }
+    if !board_type.is_empty() && board_basename(&variant.board).eq_ignore_ascii_case(board_type) {
+        return (90, "板型目录末段匹配");
+    }
+    if !board_name.is_empty() && variant.full_name.eq_ignore_ascii_case(board_name) {
+        return (85, "资产名匹配");
+    }
+    if contains_normalized(&variant.name, board_type)
+        || contains_normalized(&variant.name, board_name)
+    {
+        return (60, "名称包含板型");
+    }
+    if contains_normalized(&variant.full_name, board_type)
+        || contains_normalized(&variant.board, board_type)
+    {
+        return (50, "资产/目录包含板型");
+    }
+    let overlap = token_overlap(&variant.name, board_type)
+        + token_overlap(&variant.name, board_name)
+        + token_overlap(&variant.full_name, board_type);
+    if overlap >= 2 {
+        return (20 + overlap.min(5) as u32 * 5, "名称片段相似");
+    }
+    (0, "")
+}
+
+fn board_basename(board: &str) -> &str {
+    board.rsplit('/').next().unwrap_or(board)
+}
+
+/// 归一化：只保留 ASCII 字母数字并转小写，用于宽松包含判断。
+fn normalize_match_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn contains_normalized(haystack: &str, needle: &str) -> bool {
+    let needle = normalize_match_token(needle);
+    // 太短的片段（如 "s3"）容易误匹配，要求至少 4 个字符。
+    needle.len() >= 4 && normalize_match_token(haystack).contains(&needle)
+}
+
+fn token_overlap(a: &str, b: &str) -> usize {
+    fn tokens(value: &str) -> HashSet<String> {
+        value
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .map(|token| token.to_ascii_lowercase())
+            .filter(|token| {
+                token.len() >= 2
+                    && !matches!(
+                        token.as_str(),
+                        "esp32"
+                            | "esp32s3"
+                            | "s3"
+                            | "c3"
+                            | "p4"
+                            | "wifi"
+                            | "box"
+                            | "board"
+                            | "xiaozhi"
+                            | "ai"
+                    )
+            })
+            .collect()
+    }
+    tokens(a).intersection(&tokens(b)).count()
 }
 
 /// 老 release（没有 manifest）时按资产名后缀匹配。
@@ -1743,5 +1952,119 @@ abc123 *v2.5.2_bread-compact-esp32.zip
         assert!(!is_rate_limited(429, b"slow down"));
         assert!(!is_rate_limited(403, b"forbidden"));
         assert!(!is_rate_limited(500, b"rate limit"));
+    }
+
+    // ── 非精确匹配候选 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn candidate_firmwares_matches_vendor_prefixed_board_by_name() {
+        let release = make_release(
+            "v2.5.2",
+            &[
+                "v2.5.2_spotpear-sp-esp32-s3-1.28-box.zip",
+                "v2.5.2_alientek-atk-dnesp32s3.zip",
+            ],
+        );
+        let manifest = make_manifest(vec![
+            make_variant(
+                "spotpear/sp-esp32-s3-1.28-box",
+                "sp-esp32-s3-1.28-box",
+                "spotpear-sp-esp32-s3-1.28-box",
+                "esp32s3",
+            ),
+            make_variant(
+                "alientek/atk-dnesp32s3",
+                "atk-dnesp32s3",
+                "alientek-atk-dnesp32s3",
+                "esp32s3",
+            ),
+        ]);
+
+        let candidates = candidate_firmwares(
+            &release,
+            &manifest,
+            "sp-esp32-s3-1.28-box",
+            "sp-esp32-s3-1.28-box",
+            "esp32s3",
+        );
+        let top = candidates.first().expect("应有候选");
+        assert_eq!(top.full_name, "spotpear-sp-esp32-s3-1.28-box");
+        assert_eq!(top.score, 100);
+        assert!(top.chip_match);
+        assert_eq!(top.asset, "v2.5.2_spotpear-sp-esp32-s3-1.28-box.zip");
+        assert_eq!(top.reason, "构建名匹配");
+    }
+
+    #[test]
+    fn candidate_firmwares_matches_m5stack_name_without_basename() {
+        let release = make_release("v2.5.2", &["v2.5.2_m5stack-core-s3.zip"]);
+        let manifest = make_manifest(vec![make_variant(
+            "m5stack/core-s3",
+            "m5stack-core-s3",
+            "m5stack-core-s3",
+            "esp32s3",
+        )]);
+        let candidates = candidate_firmwares(
+            &release,
+            &manifest,
+            "m5stack-core-s3",
+            "m5stack-core-s3",
+            "esp32s3",
+        );
+        let top = candidates.first().expect("应有候选");
+        assert_eq!(top.full_name, "m5stack-core-s3");
+        assert_eq!(top.score, 100);
+    }
+
+    #[test]
+    fn match_candidate_uses_selected_full_name_and_checks_chip() {
+        let release = make_release(
+            "v2.5.2",
+            &[
+                "v2.5.2_spotpear-sp-esp32-s3-1.28-box.zip",
+                "v2.5.2_bread-compact-wifi.zip",
+            ],
+        );
+        let manifest = make_manifest(vec![
+            make_variant(
+                "spotpear/sp-esp32-s3-1.28-box",
+                "sp-esp32-s3-1.28-box",
+                "spotpear-sp-esp32-s3-1.28-box",
+                "esp32s3",
+            ),
+            make_variant(
+                "bread-compact-wifi",
+                "bread-compact-wifi",
+                "bread-compact-wifi",
+                "esp32s3",
+            ),
+        ]);
+
+        let matched = match_candidate(
+            &release,
+            &manifest,
+            "spotpear-sp-esp32-s3-1.28-box",
+            "esp32s3",
+        )
+        .expect("应命中候选");
+        assert_eq!(
+            matched.asset.name,
+            "v2.5.2_spotpear-sp-esp32-s3-1.28-box.zip"
+        );
+        assert_eq!(matched.version, "2.5.2");
+
+        assert!(matches!(
+            match_candidate(&release, &manifest, "not-exist", "esp32s3"),
+            Err(GithubError::VariantNotFound(_))
+        ));
+        assert!(matches!(
+            match_candidate(
+                &release,
+                &manifest,
+                "spotpear-sp-esp32-s3-1.28-box",
+                "esp32c3"
+            ),
+            Err(GithubError::ChipMismatch { .. })
+        ));
     }
 }

@@ -32,7 +32,7 @@ use haimen_xiaozhi::firmware::{
 };
 use haimen_xiaozhi::mqtt_udp::say_hub;
 
-use github::{GithubError, ReleaseInfo, ReleaseManifest, ReleaseService};
+use github::{FirmwareCandidate, GithubError, ReleaseInfo, ReleaseManifest, ReleaseService};
 
 /// 上游固件仓库。需求固定为 78/xiaozhi-esp32；测试通过 base URL 覆盖。
 pub const FIRMWARE_REPOSITORY: &str = "78/xiaozhi-esp32";
@@ -114,6 +114,11 @@ fn map_github_error(err: GithubError) -> ApiError {
         GithubError::AssetNotFound(detail) => {
             error_response(StatusCode::UNPROCESSABLE_ENTITY, "asset_not_found", detail)
         }
+        GithubError::VariantNotFound(detail) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "variant_not_found",
+            format!("所选固件变体不存在: {detail}"),
+        ),
     }
 }
 
@@ -150,6 +155,19 @@ fn map_archive_error(err: archive::ArchiveError) -> ApiError {
         "extract_failed"
     };
     error_response(StatusCode::UNPROCESSABLE_ENTITY, code, err.to_string())
+}
+
+/// 精确匹配失败但存在相似候选时，要求用户先选择具体固件变体。
+fn selection_required(candidates: Vec<FirmwareCandidate>) -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "ok": false,
+            "error": "selection_required",
+            "detail": "未精确匹配板型，请从候选固件中选择",
+            "candidates": candidates,
+        })),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -309,12 +327,17 @@ fn update_state(current: &str, latest: &str) -> (&'static str, Option<String>) {
     }
 }
 
-/// 匹配结果转成设备的最新固件视图 + 状态。
+/// 匹配结果转成设备的最新固件视图 + 状态 + 候选固件。
 fn latest_state(
     latest_release: &ReleaseInfo,
     manifest: Option<&ReleaseManifest>,
     report: &DeviceFirmwareReport,
-) -> (Option<Value>, &'static str, Option<String>) {
+) -> (
+    Option<Value>,
+    Vec<FirmwareCandidate>,
+    &'static str,
+    Option<String>,
+) {
     match github::match_firmware(
         latest_release,
         manifest,
@@ -332,19 +355,51 @@ fn latest_state(
                     "published_at": latest_release.published_at,
                     "html_url": latest_release.html_url,
                 })),
+                Vec::new(),
                 state,
                 error,
             )
         }
-        Err(GithubError::BoardNotFound { .. }) | Err(GithubError::AssetNotFound(_)) => (
+        Err(GithubError::BoardNotFound { .. }) | Err(GithubError::BoardAmbiguous(_)) => {
+            // 精确匹配失败不代表没有可用的固件：厂商目录前缀、自定义构建名
+            // 都可能让 board/name 对不上。给出候选让用户自己确认。
+            let candidates = manifest
+                .map(|manifest| {
+                    github::candidate_firmwares(
+                        latest_release,
+                        manifest,
+                        &report.board_type,
+                        &report.board_name,
+                        &report.chip_model,
+                    )
+                })
+                .unwrap_or_default();
+            if candidates.is_empty() {
+                (
+                    None,
+                    Vec::new(),
+                    "unsupported",
+                    Some("上游最新版本没有匹配此板型的固件资产".to_string()),
+                )
+            } else {
+                (
+                    None,
+                    candidates,
+                    "needs_selection",
+                    Some("未精确匹配板型，请选择候选固件".to_string()),
+                )
+            }
+        }
+        Err(GithubError::AssetNotFound(_)) => (
             None,
+            Vec::new(),
             "unsupported",
             Some("上游最新版本没有匹配此板型的固件资产".to_string()),
         ),
-        Err(err @ GithubError::BoardAmbiguous(_)) | Err(err @ GithubError::ChipMismatch { .. }) => {
-            (None, "unsupported", Some(err.to_string()))
+        Err(err @ GithubError::ChipMismatch { .. }) => {
+            (None, Vec::new(), "unsupported", Some(err.to_string()))
         }
-        Err(err) => (None, "error", Some(err.to_string())),
+        Err(err) => (None, Vec::new(), "error", Some(err.to_string())),
     }
 }
 
@@ -406,15 +461,15 @@ pub async fn get_xiaozhi_firmware(Query(query): Query<OverviewQuery>) -> Json<Va
             None => None,
         };
 
-        let (latest_json, state, device_error) = match entry.report.as_ref() {
-            None => (None, "unknown", None),
+        let (latest_json, candidates, state, device_error) = match entry.report.as_ref() {
+            None => (None, Vec::new(), "unknown", None),
             Some(report) => match latest.as_ref() {
                 Some(release) => latest_state(release, manifest.as_ref(), report),
                 None => {
                     let detail = latest_error
                         .clone()
                         .unwrap_or_else(|| "没有可用的稳定 release".to_string());
-                    (None, "error", Some(detail))
+                    (None, Vec::new(), "error", Some(detail))
                 }
             },
         };
@@ -426,6 +481,7 @@ pub async fn get_xiaozhi_firmware(Query(query): Query<OverviewQuery>) -> Json<Va
             "report": entry.report.as_ref().map(report_json),
             "target": target_json,
             "latest": latest_json,
+            "candidates": candidates,
             "state": state,
             "error": device_error,
         }));
@@ -454,6 +510,9 @@ pub struct UpgradeRequest {
     device: String,
     /// tag 或版本号，如 `v2.5.2` / `2.5.2`。
     version: String,
+    /// 用户在候选列表里选择的 `full_name`；精确匹配时可省略。
+    #[serde(default)]
+    variant: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,6 +634,7 @@ async fn upgrade_with_service(
     service: &ReleaseService,
     identity: &str,
     raw_version: &str,
+    variant: Option<&str>,
     base_url: &str,
 ) -> Result<Value, ApiError> {
     if !firmware::is_installed() {
@@ -601,14 +661,50 @@ async fn upgrade_with_service(
         Err(GithubError::ManifestMissing(_)) => None,
         Err(err) => return Err(map_github_error(err)),
     };
-    let matched = github::match_firmware(
-        &release,
-        manifest.as_ref(),
-        &report.board_type,
-        &report.board_name,
-        &report.chip_model,
-    )
-    .map_err(map_github_error)?;
+
+    // 有 variant：用户已从候选列表里明确选择，按 full_name 取变体；
+    // 没有 variant：先走精确匹配，匹配不上但有候选时返回 409 让用户选。
+    let matched = match variant.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(selected) => {
+            let Some(manifest) = manifest.as_ref() else {
+                return Err(error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "variant_not_found",
+                    "该 release 没有 release-manifest.json，无法按候选变体升级",
+                ));
+            };
+            github::match_candidate(&release, manifest, selected, &report.chip_model)
+                .map_err(map_github_error)?
+        }
+        None => match github::match_firmware(
+            &release,
+            manifest.as_ref(),
+            &report.board_type,
+            &report.board_name,
+            &report.chip_model,
+        ) {
+            Ok(matched) => matched,
+            Err(err) => {
+                if matches!(
+                    err,
+                    GithubError::BoardNotFound { .. } | GithubError::BoardAmbiguous(_)
+                ) && let Some(manifest) = manifest.as_ref()
+                {
+                    let candidates = github::candidate_firmwares(
+                        &release,
+                        manifest,
+                        &report.board_type,
+                        &report.board_name,
+                        &report.chip_model,
+                    );
+                    if !candidates.is_empty() {
+                        return Err(selection_required(candidates));
+                    }
+                }
+                return Err(map_github_error(err));
+            }
+        },
+    };
 
     // 先拿 zip 校验和；失败不阻塞（老 release 可能既没有 digest 也没有 SHA256SUMS）。
     let expected_zip_sha = match service.zip_sha256(&release.tag, &matched.asset).await {
@@ -726,7 +822,14 @@ pub async fn upgrade_xiaozhi_firmware(
         ));
     };
     let base = http_base(&headers);
-    let value = upgrade_with_service(service, &req.device, &req.version, &base).await?;
+    let value = upgrade_with_service(
+        service,
+        &req.device,
+        &req.version,
+        req.variant.as_deref(),
+        &base,
+    )
+    .await?;
     Ok(Json(value))
 }
 
@@ -942,12 +1045,23 @@ mod integration_tests {
 
     /// 起一个只服务 release 列表 / manifest / zip 的本地 GitHub。
     async fn start_fake_github(zip: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        start_fake_github_with(zip, TEST_BOARD, TEST_BOARD, TEST_BOARD).await
+    }
+
+    /// 同上，但允许 manifest 的 board 路径 / 短名 / 资产 slug 不同，用于模拟厂商目录板。
+    async fn start_fake_github_with(
+        zip: Vec<u8>,
+        board_path: &'static str,
+        board_name: &'static str,
+        full_name: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("绑定 fake GitHub");
         let addr = listener.local_addr().expect("fake GitHub 地址");
         let base = format!("http://{addr}");
         let zip_sha = sha256_hex(&zip);
+        let asset_name = format!("{TEST_TAG}_{full_name}.zip");
         let release = json!({
             "tag_name": TEST_TAG,
             "name": TEST_TAG,
@@ -956,8 +1070,8 @@ mod integration_tests {
             "draft": false,
             "html_url": format!("{base}/releases/tag/{TEST_TAG}"),
             "assets": [{
-                "name": format!("{TEST_TAG}_{TEST_BOARD}.zip"),
-                "browser_download_url": format!("{base}/download/{TEST_TAG}_{TEST_BOARD}.zip"),
+                "name": asset_name,
+                "browser_download_url": format!("{base}/download/{asset_name}"),
                 "size": zip.len(),
                 "digest": format!("sha256:{zip_sha}"),
             }],
@@ -967,14 +1081,18 @@ mod integration_tests {
             "version": TEST_VERSION,
             "tag": TEST_TAG,
             "variants": [{
-                "board": TEST_BOARD,
-                "name": TEST_BOARD,
-                "full_name": TEST_BOARD,
+                "board": board_path,
+                "name": board_name,
+                "full_name": full_name,
                 "target": "esp32s3",
             }],
         });
 
         let releases_body = json!([release.clone()]);
+        let manifest_path =
+            format!("/78/xiaozhi-esp32/releases/download/{TEST_TAG}/release-manifest.json");
+        let download_path = format!("/download/{TEST_TAG}_{full_name}.zip");
+        let tag_path = format!("/repos/78/xiaozhi-esp32/releases/tags/{TEST_TAG}");
         let app = Router::new()
             .route(
                 "/repos/78/xiaozhi-esp32/releases",
@@ -987,7 +1105,7 @@ mod integration_tests {
                 }),
             )
             .route(
-                "/repos/78/xiaozhi-esp32/releases/tags/v9.9.9",
+                &tag_path,
                 get({
                     let body = release;
                     move || {
@@ -997,7 +1115,7 @@ mod integration_tests {
                 }),
             )
             .route(
-                "/78/xiaozhi-esp32/releases/download/v9.9.9/release-manifest.json",
+                &manifest_path,
                 get({
                     let body = manifest;
                     move || {
@@ -1007,7 +1125,7 @@ mod integration_tests {
                 }),
             )
             .route(
-                "/download/v9.9.9_test-board.zip",
+                &download_path,
                 get({
                     move || {
                         let zip = zip.clone();
@@ -1049,7 +1167,7 @@ mod integration_tests {
         })
         .await;
 
-        let result = upgrade_with_service(&service, mac, "9.9.9", "http://haimen:9527")
+        let result = upgrade_with_service(&service, mac, "9.9.9", None, "http://haimen:9527")
             .await
             .expect("升级应成功");
         assert_eq!(result["target"]["version"], TEST_VERSION);
@@ -1098,6 +1216,77 @@ mod integration_tests {
         })
         .await;
         assert!(firmware::target_for(mac).is_none(), "升级完成后应清除目标");
+
+        handle.abort();
+    }
+
+    /// 厂商目录板：manifest board 带 `vendor/` 前缀，设备只报短 type。
+    /// 精确匹配失败时必须返回候选，用户选择 full_name 后才能升级。
+    #[tokio::test]
+    async fn vendor_prefixed_board_requires_selection_then_upgrades() {
+        let _guard = STORE_LOCK.lock().await;
+        let app = build_app_image(TEST_VERSION);
+        let merged = build_merged(&app);
+        let zip = build_stored_zip("merged-binary.bin", &merged);
+        let (base, handle) =
+            start_fake_github_with(zip, "vendor/test-board", "test-board", "vendor-test-board")
+                .await;
+        let service =
+            ReleaseService::new(Some(base.clone()), Some(base.clone())).expect("创建 fake 服务");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        install_temp_store(dir.path()).await;
+
+        let mac = "aa:bb:cc:dd:ee:aa";
+        firmware::record_device_report(DeviceFirmwareReport {
+            device_id: mac.to_string(),
+            app_name: "xiaozhi".to_string(),
+            app_version: "9.9.8".to_string(),
+            board_type: "test-board".to_string(),
+            board_name: "test-board".to_string(),
+            chip_model: "esp32s3".to_string(),
+            mac: mac.to_string(),
+            ota_partition_size: Some(APP_SLOT_SIZE as u64),
+            reported_at_ms: 1,
+        })
+        .await;
+
+        let (status, Json(body)) =
+            upgrade_with_service(&service, mac, "9.9.9", None, "http://haimen:9527")
+                .await
+                .expect_err("未选择候选时应要求选择");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "应返回 409 selection_required"
+        );
+        assert_eq!(body["error"], "selection_required");
+        let candidates = body["candidates"].as_array().expect("候选数组");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate["full_name"] == "vendor-test-board"),
+            "应包含 vendor-test-board 候选: {body}"
+        );
+        assert!(
+            firmware::target_for(mac).is_none(),
+            "未选择候选时不应设置升级目标"
+        );
+
+        let result = upgrade_with_service(
+            &service,
+            mac,
+            "9.9.9",
+            Some("vendor-test-board"),
+            "http://haimen:9527",
+        )
+        .await
+        .expect("选择候选后应升级成功");
+        assert_eq!(result["target"]["asset"], "v9.9.9_vendor-test-board.zip");
+        assert_eq!(
+            firmware::target_for(mac).map(|target| target.version),
+            Some(TEST_VERSION.to_string())
+        );
 
         handle.abort();
     }

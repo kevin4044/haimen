@@ -3,6 +3,7 @@ import type {
   XiaozhiConfiguredDevice,
   XiaozhiDeviceState,
   XiaozhiDevicesData,
+  XiaozhiFirmwareCandidate,
   XiaozhiFirmwareOverview,
   XiaozhiFirmwareUpgradeResult,
   XiaozhiSayResult,
@@ -55,6 +56,8 @@ export class XiaozhiError extends Error {
   readonly devices?: XiaozhiControlDevice[];
   readonly state?: string;
   readonly room?: string;
+  /** 固件升级返回 `selection_required` 时附带的候选固件 */
+  readonly candidates?: XiaozhiFirmwareCandidate[];
 
   constructor(
     code: string,
@@ -65,6 +68,7 @@ export class XiaozhiError extends Error {
       devices?: XiaozhiControlDevice[];
       state?: string;
       room?: string;
+      candidates?: XiaozhiFirmwareCandidate[];
     } = {},
   ) {
     super(message);
@@ -75,6 +79,7 @@ export class XiaozhiError extends Error {
     this.devices = extra.devices;
     this.state = extra.state;
     this.room = extra.room;
+    this.candidates = extra.candidates;
   }
 }
 
@@ -99,6 +104,7 @@ interface XiaozhiControlErrorBody {
   state?: string;
   room?: string;
   devices?: XiaozhiControlDevice[];
+  candidates?: XiaozhiFirmwareCandidate[];
 }
 
 interface XiaozhiControlDevicesBody {
@@ -122,6 +128,7 @@ async function toXiaozhiError(res: Response): Promise<XiaozhiError> {
     devices: body.devices,
     state: body.state,
     room: body.room,
+    candidates: body.candidates,
   });
 }
 
@@ -260,7 +267,13 @@ export async function getXiaozhiFirmware(refresh = false): Promise<XiaozhiFirmwa
     stale: Boolean(body.stale),
     error: body.error ?? null,
     releases: Array.isArray(body.releases) ? body.releases : [],
-    devices: Array.isArray(body.devices) ? body.devices : [],
+    // 老版本后端可能还没有 candidates 字段，统一补成空数组，避免面板读取时报错
+    devices: Array.isArray(body.devices)
+      ? body.devices.map((device) => ({
+          ...device,
+          candidates: Array.isArray(device.candidates) ? device.candidates : [],
+        }))
+      : [],
   };
 }
 
@@ -268,6 +281,11 @@ export async function getXiaozhiFirmware(refresh = false): Promise<XiaozhiFirmwa
 export interface XiaozhiFirmwareUpgradeInput {
   device: string;
   version: string;
+  /**
+   * 非精确匹配时需要用户选定的候选固件（`candidate.full_name`）。
+   * 不传时后端在需要选择的情况下返回 409 `selection_required`。
+   */
+  variant?: string;
 }
 
 /**
@@ -275,15 +293,21 @@ export interface XiaozhiFirmwareUpgradeInput {
  *
  * 成功只代表目标已设置、等待设备重启后拉取；失败抛 `XiaozhiError`，
  * 页面按 `code` 给出可操作提示（见 `lib/firmware.ts#describeFirmwareError`）。
+ * 非精确匹配时传 `variant`；不传会收到 409 `selection_required`（携带候选列表）。
  */
 export async function upgradeXiaozhiFirmware({
   device,
   version,
+  variant,
 }: XiaozhiFirmwareUpgradeInput): Promise<XiaozhiFirmwareUpgradeResult> {
+  const payload: { device: string; version: string; variant?: string } = { device, version };
+  const variantValue = variant?.trim();
+  if (variantValue) payload.variant = variantValue;
+
   const res = await fetch('/api/v1/xiaozhi/firmware/upgrade', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ device, version }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) throw await toXiaozhiError(res);
   return (await res.json()) as XiaozhiFirmwareUpgradeResult;

@@ -1,5 +1,10 @@
 import { XiaozhiError } from '@/api/xiaozhi';
-import type { XiaozhiFirmwareDevice, XiaozhiFirmwareRelease, XiaozhiFirmwareState } from '@/types';
+import type {
+  XiaozhiFirmwareCandidate,
+  XiaozhiFirmwareDevice,
+  XiaozhiFirmwareRelease,
+  XiaozhiFirmwareState,
+} from '@/types';
 
 /** 两位补零（本地时间格式化用） */
 function pad2(value: number): string {
@@ -69,6 +74,10 @@ export const FIRMWARE_STATE_META: Record<
     label: '已是最新',
     className: 'bg-green-500/15 text-green-600 border-transparent',
   },
+  needs_selection: {
+    label: '需选择',
+    className: 'bg-orange-500/15 text-orange-600 border-transparent',
+  },
   ahead: {
     label: '领先上游',
     className: 'bg-secondary text-secondary-foreground border-transparent',
@@ -126,6 +135,21 @@ export function defaultVersionForDevice(
 }
 
 /**
+ * 候选固件的展示文案：`sp-esp32-s3-1.28-box · esp32s3 · 构建名匹配`。
+ * 芯片型号不匹配时追加「⚠ 芯片不匹配」（后端会以 `chip_mismatch` 拒绝升级）。
+ */
+export function candidateLabel(candidate: XiaozhiFirmwareCandidate): string {
+  const primary = candidate.name?.trim() || candidate.full_name?.trim() || '未知固件';
+  const parts = [primary];
+  const target = candidate.target?.trim();
+  const reason = candidate.reason?.trim();
+  if (target) parts.push(target);
+  if (reason) parts.push(reason);
+  const label = parts.join(' · ');
+  return candidate.chip_match ? label : `${label} · ⚠ 芯片不匹配`;
+}
+
+/**
  * 把升级 / 清除目标时抛出的 `XiaozhiError` 映射为可操作的中文提示。
  * 非 `XiaozhiError`（网络错误等）给出通用提示。
  */
@@ -145,6 +169,10 @@ export function describeFirmwareError(error: unknown): string {
       return `该版本没有匹配当前板型的固件：请确认设备上报的板型，或换一个版本重试${detail}。`;
     case 'board_ambiguous':
       return `该版本匹配到多个板型固件：请稍后重试，或到上游 release 确认板型${detail}。`;
+    case 'selection_required':
+      return `未精确匹配板型：请从候选固件中选择要刷入的版本后再确认${detail}。`;
+    case 'variant_not_found':
+      return `所选固件变体不存在：请重新选择候选固件后再试${detail}。`;
     case 'chip_mismatch':
       return `芯片型号不匹配：该固件不能刷入当前设备，请确认板型 / 芯片型号${detail}。`;
     case 'asset_not_found':
