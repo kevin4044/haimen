@@ -63,6 +63,103 @@ fn invalid_request(detail: impl Into<String>) -> ApiError {
 
 static SERVICE: OnceLock<Result<ReleaseService, String>> = OnceLock::new();
 
+/// 取某台设备对应 board 的官方 factory assets 分区镜像。
+///
+/// 自定义主题会整体覆盖 assets 分区；如果包内没有唤醒词 `srmodels.bin`
+/// 或 `common` 中文字体，设备会退化成 `basic` 字库并丢失唤醒词。apply
+/// 前用这份 factory assets 补齐缺失的基础资源。
+///
+/// 结果按 `board-version.bin` 缓存到 `~/.haimen/xiaozhi-firmware/base-assets/`，
+/// 第一次下载官方 release zip，后续离线可用。
+pub(crate) async fn factory_assets_for_device(device_id: &str) -> Result<Vec<u8>, String> {
+    let report = firmware::reports()
+        .into_iter()
+        .find(|report| report.device_id.eq_ignore_ascii_case(device_id))
+        .ok_or_else(|| format!("设备 {device_id} 还没有 OTA 上报，无法确定 board"))?;
+    let board_type = if report.board_type.trim().is_empty() {
+        report.board_name.trim()
+    } else {
+        report.board_type.trim()
+    };
+    let board_name = if report.board_name.trim().is_empty() {
+        board_type
+    } else {
+        report.board_name.trim()
+    };
+    if board_name.is_empty() {
+        return Err("设备上报的 board 为空".to_owned());
+    }
+
+    let service = service()?;
+    let page = service
+        .releases(false)
+        .await
+        .map_err(|err| format!("获取 release 失败: {err}"))?;
+    let release = github::latest_release(&page.releases)
+        .ok_or_else(|| "没有可用的稳定 release".to_owned())?
+        .clone();
+    let manifest = match service.manifest(&release.tag).await {
+        Ok(manifest) => Some(manifest),
+        Err(GithubError::ManifestMissing(_)) => None,
+        Err(err) => return Err(format!("获取 release manifest 失败: {err}")),
+    };
+    let matched = github::match_firmware(
+        &release,
+        manifest.as_ref(),
+        board_type,
+        board_name,
+        &report.chip_model,
+    )
+    .map_err(|err| format!("匹配官方固件失败: {err}"))?;
+
+    let root = std::env::var_os("HAIMEN_XIAOZHI_FIRMWARE_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| crate::config::settings::get_settings_dir().join("xiaozhi-firmware"));
+    let cache_dir = root.join("base-assets");
+    let safe_board = board_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let cache_file = cache_dir.join(format!("{safe_board}-{}.bin", matched.version));
+    if let Ok(bytes) = tokio::fs::read(&cache_file).await
+        && !bytes.is_empty()
+    {
+        return Ok(bytes);
+    }
+
+    tracing::warn!(
+        device_id = %device_id,
+        board = %board_name,
+        version = %matched.version,
+        asset = %matched.asset.name,
+        "下载官方 factory assets 作为主题基础资源"
+    );
+    let zip = service
+        .download(&matched.asset.download_url, MAX_ZIP_BYTES)
+        .await
+        .map_err(|err| format!("下载官方固件包失败: {err}"))?;
+    let assets = archive::extract_assets_image(&zip, archive::MAX_ASSETS_BYTES)
+        .map_err(|err| format!("提取官方 assets 失败: {err}"))?;
+    if let Err(err) = tokio::fs::create_dir_all(&cache_dir).await {
+        tracing::warn!(error = %err, dir = %cache_dir.display(), "创建 base-assets 目录失败");
+    } else {
+        let tmp = cache_dir.join(format!(".{safe_board}-{}.tmp", matched.version));
+        if tokio::fs::write(&tmp, &assets).await.is_ok() {
+            if let Err(err) = tokio::fs::rename(&tmp, &cache_file).await {
+                tracing::warn!(error = %err, "写入 base-assets 缓存失败");
+            }
+        }
+    }
+    Ok(assets)
+}
+
 fn service() -> Result<&'static ReleaseService, String> {
     SERVICE
         .get_or_init(ReleaseService::from_env)

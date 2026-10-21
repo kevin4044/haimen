@@ -232,6 +232,7 @@ Web 控制台的「小智设备」页新增「自定义主题」面板（不重�
 2. 配置浅色/深色背景（纯色或图片）、21 个情绪表情、隐藏字幕；可选上传预编译 CBin 字体。
 3. 浏览器在本地生成 `assets.bin`（格式与官方 `78/xiaozhi-assets-generator` 一致：12 字节头 + 44 字节文件表 + `0x5A5A` 数据 + checksum）。
 4. 上传到 haimen 后，haimen 通过设备 MQTT 直接发 MCP `self.assets.set_download_url` + `self.reboot`；设备重启后自己下载并写入 assets 分区。**全程不经过 LLM/Agent。**
+5. apply 时 haimen 会检查包内是否带唤醒词 `srmodels.bin` 和 `common` 中文字体；缺失时自动从官方固件 release 里提取 factory assets 补齐（首次需要联网，之后缓存到 `~/.haimen/xiaozhi-firmware/base-assets/`），避免主题包把唤醒词/中文渲染覆盖掉。
 
 ```bash
 # 上传 assets.bin（octet-stream）
@@ -248,6 +249,7 @@ curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/assets/apply \
 
 - assets 分区只有一份、整体覆盖，**没有 A/B 回滚**；换主题前建议先用 `esptool read_flash` 备份 assets 分区。
 - 只换 UI 资源，不改字幕布局/字号/位置；`hide_subtitle` 对 WeChat 气泡风格固件可能不生效。
+- 如果设备 hello 的 `text_font.charset` 是 `basic` 而不是 `common`，中文/字幕文字会渲染不出来；haimen 的自动补齐会避免这个问题。
 - 自定义字体沿用官方生成器的 CBin 格式；当前页面不把 TTF 转 CBin。
 - assets 文件存于 `~/.haimen/xiaozhi-firmware/assets/`（随现有数据卷持久化）；端点与 settings API 一样不做鉴权，只建议内网使用。
 - 详细协议与官方链路调研见 [docs/research/xiaozhi-custom-theme-2026-10.md](docs/research/xiaozhi-custom-theme-2026-10.md)。

@@ -877,11 +877,14 @@ export default function DeviceThemePanel() {
       setUploaded(result);
       setPhase('applying');
       const applied = await applyXiaozhiAssets(selectedDevice, result.file);
+      const enriched = applied.file !== result.file;
       setNotice(
         [
-          `主题已上传并下发：${result.file}（${formatBytes(result.size)}`,
-          result.sha256 ? `，sha256 ${result.sha256.slice(0, 12)}…` : '',
-          '）。',
+          `主题已上传并下发：${applied.file}`,
+          applied.size ? `（${formatBytes(applied.size)}）` : '',
+          '。',
+          enriched ? '已自动补齐官方唤醒词和 common 中文字体。' : '',
+          `hide_subtitle=${hideSubtitle ? 'true' : 'false'}。`,
           applied.reboot
             ? '设备将重启并拉取新的 assets.bin；重启完成后自动应用，无需手动操作。'
             : '下发成功，但设备未确认重启；如主题未生效请重启设备。',
@@ -1184,12 +1187,13 @@ export default function DeviceThemePanel() {
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-sm font-medium">字体</span>
               <Badge variant="outline" className="text-muted-foreground">
-                {fontData ? '自定义字体' : '保持设备当前字体'}
+                {fontData ? '自定义字体' : '官方中文字体（自动补齐）'}
               </Badge>
             </div>
             <p className="text-xs text-muted-foreground">
-              默认不写 text_font；如需更换字体，请上传预编译的 CBin .bin（会以 font_custom.bin
-              写入）。不支持 TTF/OTF 转换。
+              默认不写 text_font；apply 时会自动从官方固件包补齐 common 中文字体和唤醒词
+              srmodels（首次需要联网下载）。也可上传预编译的 CBin .bin 覆盖字体（会以
+              font_custom.bin 写入；自定义字体缺少 text_font_meta 时 glyph push 会关闭）。
             </p>
             <input
               ref={fontInputRef}
@@ -1261,8 +1265,18 @@ export default function DeviceThemePanel() {
               <span>大小：{assetsBin ? formatBytes(binSize) : '—'}</span>
               <span>分区：{partitionSize !== null ? formatBytes(partitionSize) : '未上报'}</span>
               <span>文件：{packageEntries.length}</span>
+              <span>隐藏字幕：{hideSubtitle ? '开' : '关'}</span>
             </div>
           </div>
+
+          <Alert>
+            <AlertTitle>会自动保留唤醒词与中文字体</AlertTitle>
+            <AlertDescription>
+              主题包会整体覆盖 assets 分区；apply 时 haimen 会从官方固件包补齐 srmodels.bin 和
+              common 中文字体，避免唤醒词失效或中文/字幕不显示。
+              首次补齐需要联网下载官方固件包，之后会缓存。
+            </AlertDescription>
+          </Alert>
 
           {packageEntries.length > 0 ? (
             <Table className="min-w-[24rem]" aria-label="主题包文件列表">

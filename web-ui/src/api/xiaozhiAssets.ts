@@ -45,6 +45,8 @@ export interface XiaozhiAssetsApplyResult {
   device: string;
   file: string;
   url: string;
+  /** 实际下发的包大小（后端可能自动补齐唤醒词/字体，与上传包不同） */
+  size?: number;
   reboot: boolean;
 }
 
@@ -196,6 +198,7 @@ export async function applyXiaozhiAssets(
     device: typeof body.device === 'string' ? body.device : device,
     file: typeof body.file === 'string' ? body.file : file,
     url: typeof body.url === 'string' ? body.url : '',
+    size: typeof body.size === 'number' ? body.size : undefined,
     reboot: Boolean(body.reboot),
   };
 }

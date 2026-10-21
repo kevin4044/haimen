@@ -65,6 +65,192 @@ struct ParsedAssets {
     index: Value,
 }
 
+#[derive(Debug, Clone)]
+struct AssetFile {
+    name: String,
+    data: Vec<u8>,
+    width: u16,
+    height: u16,
+}
+
+/// 解出 assets.bin 里的原始文件，供 base assets 合并使用。
+fn unpack_assets(data: &[u8]) -> Result<Vec<AssetFile>, String> {
+    if data.len() < ASSETS_HEADER_SIZE {
+        return Err("assets.bin 小于 12 字节头".to_owned());
+    }
+    let total_files = u32_at(data, 0).ok_or("文件数缺失")? as usize;
+    let combined_len = u32_at(data, 8).ok_or("combined_len 缺失")? as usize;
+    if combined_len != data.len() - ASSETS_HEADER_SIZE {
+        return Err("combined_len 与实际长度不一致".to_owned());
+    }
+    let table_len = total_files
+        .checked_mul(ASSETS_TABLE_ENTRY_SIZE)
+        .ok_or("文件表长度溢出")?;
+    if table_len > combined_len {
+        return Err("文件表超出 combined 数据".to_owned());
+    }
+    let combined = &data[ASSETS_HEADER_SIZE..];
+    let mut files = Vec::with_capacity(total_files);
+    for index in 0..total_files {
+        let base = index * ASSETS_TABLE_ENTRY_SIZE;
+        let name = entry_name(combined, base).ok_or_else(|| format!("第 {index} 项文件名非法"))?;
+        let size = u32_at(combined, base + ASSETS_NAME_LENGTH).ok_or("文件大小缺失")? as usize;
+        let relative =
+            u32_at(combined, base + ASSETS_NAME_LENGTH + 4).ok_or("文件偏移缺失")? as usize;
+        let width = u16_at(combined, base + ASSETS_NAME_LENGTH + 8).ok_or("图片宽度缺失")?;
+        let height = u16_at(combined, base + ASSETS_NAME_LENGTH + 10).ok_or("图片高度缺失")?;
+        let offset = table_len.checked_add(relative).ok_or("文件偏移溢出")?;
+        let start = offset.checked_add(2).ok_or("文件偏移溢出")?;
+        let end = start.checked_add(size).ok_or("文件范围溢出")?;
+        if end > combined_len || combined.get(offset..offset + 2) != Some(b"ZZ") {
+            return Err(format!("文件 {name} 范围/魔数非法"));
+        }
+        files.push(AssetFile {
+            name,
+            data: combined[start..end].to_vec(),
+            width,
+            height,
+        });
+    }
+    Ok(files)
+}
+
+/// 把文件列表 + index.json 重新打包成 assets.bin。
+fn pack_assets(files: Vec<AssetFile>, index: &Value) -> Result<Vec<u8>, String> {
+    let index_bytes =
+        serde_json::to_vec(index).map_err(|err| format!("index.json 序列化失败: {err}"))?;
+    let mut files: Vec<AssetFile> = files
+        .into_iter()
+        .filter(|file| file.name != "index.json")
+        .collect();
+    files.insert(
+        0,
+        AssetFile {
+            name: "index.json".to_owned(),
+            data: index_bytes,
+            width: 0,
+            height: 0,
+        },
+    );
+    if files.len() > 256 {
+        return Err("文件数超过 256".to_owned());
+    }
+    let table_len = files.len() * ASSETS_TABLE_ENTRY_SIZE;
+    let data_len = files
+        .iter()
+        .try_fold(0usize, |total, file| {
+            total
+                .checked_add(2)
+                .and_then(|value| value.checked_add(file.data.len()))
+        })
+        .ok_or("文件总长度溢出")?;
+    let mut combined = vec![0u8; table_len + data_len];
+    let mut data_offset = table_len;
+    for (index, file) in files.iter().enumerate() {
+        let base = index * ASSETS_TABLE_ENTRY_SIZE;
+        let name_bytes = file.name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() >= ASSETS_NAME_LENGTH {
+            return Err(format!("文件名长度非法: {}", file.name));
+        }
+        combined[base..base + name_bytes.len()].copy_from_slice(name_bytes);
+        combined[base + ASSETS_NAME_LENGTH..base + ASSETS_NAME_LENGTH + 4]
+            .copy_from_slice(&(file.data.len() as u32).to_le_bytes());
+        combined[base + ASSETS_NAME_LENGTH + 4..base + ASSETS_NAME_LENGTH + 8]
+            .copy_from_slice(&((data_offset - table_len) as u32).to_le_bytes());
+        combined[base + ASSETS_NAME_LENGTH + 8..base + ASSETS_NAME_LENGTH + 10]
+            .copy_from_slice(&file.width.to_le_bytes());
+        combined[base + ASSETS_NAME_LENGTH + 10..base + ASSETS_NAME_LENGTH + 12]
+            .copy_from_slice(&file.height.to_le_bytes());
+        combined[data_offset] = 0x5a;
+        combined[data_offset + 1] = 0x5a;
+        combined[data_offset + 2..data_offset + 2 + file.data.len()].copy_from_slice(&file.data);
+        data_offset += 2 + file.data.len();
+    }
+    let checksum = combined
+        .iter()
+        .fold(0u32, |acc, byte| acc + u32::from(*byte))
+        & 0xffff;
+    let mut out = Vec::with_capacity(ASSETS_HEADER_SIZE + combined.len());
+    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(&(combined.len() as u32).to_le_bytes());
+    out.extend_from_slice(&combined);
+    Ok(out)
+}
+
+/// 把官方 factory assets 里缺失的 `srmodels` / `text_font` 补齐到上传包。
+///
+/// 返回 `None` 表示上传包已经自带这两个基础资源，不需要改。
+fn merge_base_assets(uploaded: &[u8], factory: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let uploaded_files = unpack_assets(uploaded)?;
+    let factory_files = unpack_assets(factory)?;
+    let uploaded_index = uploaded_files
+        .iter()
+        .find(|file| file.name == "index.json")
+        .and_then(|file| serde_json::from_slice::<Value>(&file.data).ok())
+        .ok_or("上传包缺少合法 index.json")?;
+    let factory_index = factory_files
+        .iter()
+        .find(|file| file.name == "index.json")
+        .and_then(|file| serde_json::from_slice::<Value>(&file.data).ok())
+        .ok_or("官方 assets 缺少合法 index.json")?;
+    let mut files = uploaded_files;
+    let mut index = uploaded_index;
+    let mut changed = false;
+
+    let uploaded_has_models = index.get("srmodels").is_some();
+    let uploaded_has_font = index.get("text_font").is_some();
+    if uploaded_has_models && uploaded_has_font {
+        return Ok(None);
+    }
+
+    if !uploaded_has_models {
+        let name = factory_index
+            .get("srmodels")
+            .and_then(Value::as_str)
+            .ok_or("官方 assets 缺少 srmodels")?;
+        let file = factory_files
+            .iter()
+            .find(|file| file.name == name)
+            .ok_or_else(|| format!("官方 assets 缺少 srmodels 文件 {name}"))?;
+        if !files.iter().any(|existing| existing.name == name) {
+            files.push(file.clone());
+        }
+        index["srmodels"] = Value::String(name.to_owned());
+        changed = true;
+    }
+
+    if !uploaded_has_font {
+        let name = factory_index
+            .get("text_font")
+            .and_then(Value::as_str)
+            .ok_or("官方 assets 缺少 text_font")?;
+        let file = factory_files
+            .iter()
+            .find(|file| file.name == name)
+            .ok_or_else(|| format!("官方 assets 缺少字体文件 {name}"))?;
+        if !files.iter().any(|existing| existing.name == name) {
+            files.push(file.clone());
+        }
+        index["text_font"] = Value::String(name.to_owned());
+        if let Some(meta) = factory_index.get("text_font_meta") {
+            index["text_font_meta"] = meta.clone();
+        }
+        changed = true;
+    } else if index.get("text_font_meta").is_none()
+        && index.get("text_font") == factory_index.get("text_font")
+        && let Some(meta) = factory_index.get("text_font_meta")
+    {
+        index["text_font_meta"] = meta.clone();
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    pack_assets(files, &index).map(Some)
+}
+
 fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
     let bytes = data.get(offset..offset + 4)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
@@ -590,6 +776,65 @@ pub async fn get_xiaozhi_assets_device_info(
     })))
 }
 
+/// 如果上传包缺少官方唤醒词/中文字体，用 factory assets 补齐后再下发。
+///
+/// 自定义主题会整体覆盖 assets 分区；不补的话设备会从 `common` 退化成
+/// `basic` 字库（中文/字幕不显示），并丢失唤醒词 `srmodels.bin`。
+async fn enrich_assets_for_apply(
+    device_id: &str,
+    file: &str,
+    store: &AssetStore,
+) -> Result<Option<StoredAsset>, ApiError> {
+    let original = store.read(file).await.map_err(|err| {
+        error_response(
+            StatusCode::NOT_FOUND,
+            "assets_not_found",
+            format!("读取 assets 失败: {err}"),
+        )
+    })?;
+    let parsed = parse_assets_bin(&original).map_err(|detail| {
+        error_response(StatusCode::UNPROCESSABLE_ENTITY, "invalid_assets", detail)
+    })?;
+    if parsed.index.get("srmodels").is_some() && parsed.index.get("text_font").is_some() {
+        return Ok(None);
+    }
+
+    let factory = super::xiaozhi_firmware::factory_assets_for_device(device_id)
+        .await
+        .map_err(|err| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "base_assets_unavailable",
+                format!("无法获取官方唤醒词/中文字体，已阻止下发以免设备丢失这些资源: {err}"),
+            )
+        })?;
+    let Some(merged) = merge_base_assets(&original, &factory).map_err(|err| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            "base_assets_merge_failed",
+            format!("合并官方基础资源失败: {err}"),
+        )
+    })?
+    else {
+        return Ok(None);
+    };
+    let stored = store.save(&merged).await.map_err(|err| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "assets_unavailable",
+            format!("保存补齐后的 assets 失败: {err}"),
+        )
+    })?;
+    tracing::warn!(
+        device_id = %device_id,
+        original = %file,
+        enriched = %stored.file,
+        size = stored.size,
+        "主题包缺少唤醒词/中文字体，已用官方 factory assets 补齐"
+    );
+    Ok(Some(stored))
+}
+
 /// `POST /api/v1/xiaozhi/assets/apply` — 设下载 URL 并重启设备。
 pub async fn apply_xiaozhi_assets(
     headers: HeaderMap,
@@ -602,7 +847,7 @@ pub async fn apply_xiaozhi_assets(
     let path = store
         .path_for(&request.file)
         .ok_or_else(|| invalid_request("assets 文件名非法"))?;
-    let file_size = tokio::fs::metadata(&path)
+    let mut file_size = tokio::fs::metadata(&path)
         .await
         .map_err(|_| {
             error_response(
@@ -628,6 +873,12 @@ pub async fn apply_xiaozhi_assets(
         )
     })?;
 
+    let mut target_file = request.file.clone();
+    if let Some(enriched) = enrich_assets_for_apply(&online.mac, &target_file, &store).await? {
+        target_file = enriched.file;
+        file_size = enriched.size;
+    }
+
     if let Ok(system_info) = read_system_info(&online.client_id).await
         && let Some(partition) = assets_partition_size(&system_info)
         && file_size as u64 > partition
@@ -644,7 +895,7 @@ pub async fn apply_xiaozhi_assets(
     let url = format!(
         "{}/xiaozhi/assets/{}",
         base.trim_end_matches('/'),
-        request.file
+        target_file
     );
     if let Err(err) = call_tool(
         &online.client_id,
@@ -664,7 +915,7 @@ pub async fn apply_xiaozhi_assets(
     };
     tracing::warn!(
         device_id = %online.mac,
-        file = %request.file,
+        file = %target_file,
         size = file_size,
         reboot,
         "已下发小智自定义主题"
@@ -672,8 +923,9 @@ pub async fn apply_xiaozhi_assets(
     Ok(Json(json!({
         "ok": true,
         "device": online.mac,
-        "file": request.file,
+        "file": target_file,
         "url": url,
+        "size": file_size,
         "reboot": reboot,
     })))
 }
@@ -749,6 +1001,49 @@ mod tests {
 
     fn valid_assets() -> Vec<u8> {
         build_assets(&[("index.json", br#"{"version":1,"hide_subtitle":true}"#)])
+    }
+
+    #[test]
+    fn merge_base_assets_preserves_theme_and_adds_wakeword_font() {
+        let uploaded_index = br##"{"version":1,"hide_subtitle":false,"skin":{"light":{"text_color":"#000000","background_color":"#ffffff"}},"emoji_collection":[{"name":"happy","file":"emoji_happy.gif"}]}"##;
+        let uploaded = build_assets(&[
+            ("index.json", uploaded_index),
+            ("emoji_happy.gif", &[0x47, 0x49, 0x46]),
+        ]);
+        let factory_index = br##"{"version":1,"srmodels":"srmodels.bin","text_font":"font.bin","text_font_meta":{"charset":"common","size":16,"bpp":4,"bundle":"noto-v1"}}"##;
+        let factory = build_assets(&[
+            ("index.json", factory_index),
+            ("srmodels.bin", &[1, 2, 3]),
+            ("font.bin", &[4, 5, 6, 7]),
+        ]);
+        let merged = merge_base_assets(&uploaded, &factory)
+            .expect("merge")
+            .expect("changed");
+        let parsed = parse_assets_bin(&merged).expect("valid merged");
+        assert_eq!(parsed.index["srmodels"], "srmodels.bin");
+        assert_eq!(parsed.index["text_font"], "font.bin");
+        assert_eq!(parsed.index["text_font_meta"]["charset"], "common");
+        assert_eq!(parsed.index["hide_subtitle"], false);
+        assert_eq!(
+            parsed.index["emoji_collection"][0]["file"],
+            "emoji_happy.gif"
+        );
+        let files = unpack_assets(&merged).expect("unpack");
+        assert!(files.iter().any(|file| file.name == "srmodels.bin"));
+        assert!(files.iter().any(|file| file.name == "font.bin"));
+        assert!(files.iter().any(|file| file.name == "emoji_happy.gif"));
+        assert!(parse_assets_bin(&pack_assets(files, &parsed.index).expect("repack")).is_ok());
+    }
+
+    #[test]
+    fn merge_base_assets_is_noop_when_both_present() {
+        let index = br##"{"version":1,"srmodels":"s.bin","text_font":"f.bin","text_font_meta":{"charset":"common","size":16,"bpp":4,"bundle":"noto-v1"}}"##;
+        let assets = build_assets(&[("index.json", index), ("s.bin", &[1]), ("f.bin", &[2])]);
+        assert!(
+            merge_base_assets(&assets, &assets)
+                .expect("merge")
+                .is_none()
+        );
     }
 
     #[test]
