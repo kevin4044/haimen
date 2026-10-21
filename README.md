@@ -32,6 +32,7 @@
 | 小智传输 | 仅 WebSocket（会话式） | 新增 MQTT + UDP 常连传输，可与 WebSocket 切换 |
 | 主动播报 | 无 | `POST /api/v1/xiaozhi/say`，经 MQTT `notify` 下发 |
 | OTA 安全 | 无来源限制 | 默认只接受私网/回环来源，可配 `ota_token` |
+| 固件 OTA 升级 | 无服务端版本管理 | Web UI 查看设备版本、匹配 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32/releases)，支持指定版本刷写 |
 | 语音链路 | 能量阈值 VAD、批处理 ASR | Silero VAD、ASR 2.0、判停/超时/首帧/下行节奏调优 |
 | Agent | 4 个 provider（以 CLI 子进程为主） | 新增 OpenAI 兼容 HTTP provider（SSE 流式） |
 | 工程化 | 本机 cargo + GitHub Actions | Docker 化开发/CI 工具链、设备模拟器与端到端脚本 |
@@ -188,6 +189,40 @@ haimen serve --xiaozhi-llm-provider openai    # 小智语音路径（流式）
 | [运维-迁移到Mac-mini.md](specs/运维-迁移到Mac-mini.md) | 从容器迁到 Mac mini 原生部署的原因 |
 | [运维-鉴权启用步骤.md](specs/运维-鉴权启用步骤.md) | MQTT 鉴权启用与 grace 收尾 |
 
+### 8. 固件 OTA 升级（UI 指定版本）
+
+Web 控制台的「小智设备」页新增「固件升级（OTA）」面板：
+
+1. 设备开机拉 OTA 时会把当前固件版本、板型（`board.type` / `board.name`）、芯片型号和 OTA 分区大小上报给 haimen，面板即时可见。
+2. 服务端从 [78/xiaozhi-esp32 releases](https://github.com/78/xiaozhi-esp32/releases) 拉取版本列表，用板型匹配 `release-manifest.json`，判断「可升级 / 已是最新 / 无此板型」。
+3. 用户选择版本（或手动输入 `v2.4.0` 这类 tag）点击升级；haimen 会下载对应 release zip，提取出 **app 分区镜像**（release 里的 `merged-binary.bin` 不能直接给设备 OTA），存到本地后设置升级目标。
+4. **重启设备**（拔电/复位）后，设备开机拉 OTA 会拿到 `firmware.version` + haimen 的下载地址 + `force=1`，从 haimen 拉取固件并刷写；刷完重启上报新版本后，目标自动清除，不会反复刷机。
+
+关键限制与说明：
+
+- 升级由用户显式触发，**不会后台自动升级**；设备只在开机时检查 OTA，所以设置目标后必须手动重启设备。
+- 只更新 **app 分区**；assets/bootloader/分区表不变（与上游 OTA 行为一致）。
+- 固件来自上游 `78/xiaozhi-esp32`，刷入会覆盖设备当前固件（包括自行编译的版本）；自定义板型名若不在上游 manifest 里会提示「无此板型」。
+- 默认取最新的非 draft、非 prerelease；旧版本可在升级弹窗里手动输入 tag。
+- GitHub API 未认证限流 60 次/小时；服务端缓存 10 分钟，可用 `GITHUB_TOKEN` 或 `HAIMEN_GITHUB_TOKEN` 提高限额。
+- 状态与固件缓存位于 `~/.haimen/xiaozhi-firmware/`（`state.json` + `bin/`）。Docker 下该路径在现有数据卷 `/root/.haimen` 内，`./scripts/dev.sh run` 或 `docker run -v <host>:/root/.haimen` 会自动持久化到宿主机；也可用 `HAIMEN_XIAOZHI_FIRMWARE_DIR` 指定其他宿主机挂载目录。
+- 固件管理端点与现有 settings API 一样不做鉴权；请只把 Web 控制台暴露在内网。
+
+```bash
+# 查看设备当前版本 / 最新 release / 目标
+curl -s http://127.0.0.1:9527/api/v1/xiaozhi/firmware | python3 -m json.tool
+
+# 指定版本升级（device 支持 MAC / client_id / 设备名）
+curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/firmware/upgrade \
+  -H 'Content-Type: application/json' \
+  -d '{"device":"84:c7:bb:59:93:64","version":"v2.5.2"}'
+
+# 清除升级目标
+curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/firmware/target/clear \
+  -H 'Content-Type: application/json' \
+  -d '{"device":"84:c7:bb:59:93:64"}'
+```
+
 ## 快速开始
 
 ### 方式一：Docker（推荐，本机不需要 Rust）
@@ -277,6 +312,7 @@ model = "qwen2.5:7b"
 - MQTT broker 明文无 TLS；`auth_key` 未配置时，局域网内任何客户端都可向 `haimen/ctl/<client_id>` 发布控制消息。仅建议内网使用。
 - OTA 默认仅接受私网来源。公网/反向代理部署需配置 `ota_token`（或按需调整 `ota_allow_private_only`）；Docker 端口映射下对端是网桥地址，来源判断会失真。
 - `notify` 无 ACK、不排队：设备忙时直接丢弃，调用方需自行重试；`200` 只代表已下发。
+- 固件 OTA 升级只更新 app 分区，且必须手动重启设备才会检查；升级管理端点未鉴权，只建议内网使用。
 - 本仓库无 Release；`haimen upgrade` 会从上游仓库下载，勿用于本仓库构建。
 - `specs/soul/` 只是人设 prompt 草稿，尚未接入代码，不是可配置功能。
 

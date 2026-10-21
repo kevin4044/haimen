@@ -9,6 +9,7 @@ use axum::{
 };
 use chrono::Local;
 
+use crate::firmware::{self, DeviceFirmwareReport};
 use crate::types::*;
 
 /// 处理 POST /xiaozhi/ota/ 请求
@@ -65,11 +66,70 @@ pub async fn handle_ota(
             (StatusCode::BAD_REQUEST, Json(err))
         })?;
 
-    Ok(Json(compose_ota(
-        &headers,
-        &body,
-        &current_xiaozhi_config(),
-    )))
+    // 记录设备上报（固件版本/板型/芯片/OTA 分区大小）。存储未安装时是 no-op，
+    // 不影响本次 OTA 响应。
+    let mac = extract_mac(&body, &headers);
+    firmware::record_device_report(build_device_report(&mac, &body)).await;
+
+    Ok(Json(
+        compose_ota(&mac, &headers, &current_xiaozhi_config()).await,
+    ))
+}
+
+/// 把 OTA 请求里的设备信息整理成存储层结构。
+fn build_device_report(mac: &str, body: &OtaRequest) -> DeviceFirmwareReport {
+    let app = body.application.as_ref();
+    let board = body.board.as_ref();
+    let ota_label = body
+        .ota
+        .as_ref()
+        .and_then(|ota| ota.label.as_deref())
+        .map(str::trim)
+        .filter(|label| !label.is_empty());
+    // OTA 分区：优先 `ota.label` 指向的 app 分区，其次 ota_0、factory。
+    // 设备没上报 partition_table 时为 None，服务端跳过体积预检。
+    let ota_partition_size = ota_label
+        .and_then(|label| {
+            body.partition_table
+                .iter()
+                .find(|part| part.r#type == 0 && part.label.eq_ignore_ascii_case(label))
+                .map(|part| part.size)
+        })
+        .or_else(|| {
+            body.partition_table
+                .iter()
+                .find(|part| part.r#type == 0 && part.subtype == 0x11)
+                .map(|part| part.size)
+        })
+        .or_else(|| {
+            body.partition_table
+                .iter()
+                .find(|part| part.r#type == 0 && part.subtype == 0x10)
+                .map(|part| part.size)
+        })
+        // 真实 ESP-IDF 的 factory 子类型是 0x00；没有 label 时兜底取第一个 app 分区。
+        .or_else(|| {
+            body.partition_table
+                .iter()
+                .find(|part| part.r#type == 0)
+                .map(|part| part.size)
+        })
+        .filter(|size| *size > 0);
+
+    DeviceFirmwareReport {
+        device_id: crate::devices::normalize_mac(mac),
+        app_name: app.map(|info| info.name.clone()).unwrap_or_default(),
+        app_version: app.map(|info| info.version.clone()).unwrap_or_default(),
+        board_type: board.map(|info| info.r#type.clone()).unwrap_or_default(),
+        board_name: board.and_then(|info| info.name.clone()).unwrap_or_default(),
+        chip_model: body.chip_model_name.clone().unwrap_or_default(),
+        mac: mac.trim().to_string(),
+        ota_partition_size,
+        reported_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or_default(),
+    }
 }
 
 /// 安装 OTA 使用的配置。默认是 websocket，不会把设备切到 MQTT。
@@ -225,17 +285,24 @@ fn current_xiaozhi_config() -> XiaozhiConfig {
 }
 
 /// 按协议组装 OTA 响应。websocket 与 mqtt 互斥，避免固件看到 mqtt 就切走。
-fn compose_ota(headers: &HeaderMap, body: &OtaRequest, cfg: &XiaozhiConfig) -> OtaResponse {
-    let mac = extract_mac(body, headers);
+async fn compose_ota(mac: &str, headers: &HeaderMap, cfg: &XiaozhiConfig) -> OtaResponse {
     let (websocket, mqtt) = match cfg.protocol {
         XiaozhiProtocol::Websocket => (Some(build_ws_info(headers)), None),
-        XiaozhiProtocol::Mqtt => (None, Some(build_mqtt_info(&cfg.mqtt, &mac))),
+        XiaozhiProtocol::Mqtt => (None, Some(build_mqtt_info(&cfg.mqtt, mac))),
     };
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let timezone_offset = Local::now().offset().local_minus_utc() / 60;
+
+    // 只有用户显式指定过目标（且文件存在）才下发 firmware。
+    // 默认不自动升级，避免设备重启即被刷成上游版本。
+    let firmware_info = firmware::firmware_info_for(
+        &crate::devices::normalize_mac(mac),
+        &device_http_base(headers),
+    )
+    .await;
 
     OtaResponse {
         websocket,
@@ -244,13 +311,29 @@ fn compose_ota(headers: &HeaderMap, body: &OtaRequest, cfg: &XiaozhiConfig) -> O
             timestamp: now.as_millis() as i64,
             timezone_offset,
         },
-        firmware: Some(FirmwareInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            url: String::new(),
-            force: false,
-        }),
+        firmware: firmware_info,
         audio_params: AudioParams::default(),
     }
+}
+
+/// 设备能访问的 haimen HTTP 基址。
+///
+/// 与 [`build_ws_url`] 的取值顺序一致：反向代理头优先，其次 Host，最后本地回退。
+/// 固件 URL 必须让设备可达，因此不能写死局域网 IP。
+fn device_http_base(headers: &HeaderMap) -> String {
+    let is_secure = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|proto| {
+            proto.eq_ignore_ascii_case("https") || proto.eq_ignore_ascii_case("wss")
+        });
+    let scheme = if is_secure { "https" } else { "http" };
+    let host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get("host").and_then(|v| v.to_str().ok()))
+        .unwrap_or("localhost:9527");
+    format!("{scheme}://{host}")
 }
 
 /// 设备 MAC：优先请求体 `mac_address`，其次 `Device-Id`。都没有时用 `unknown` 并告警。
@@ -583,6 +666,7 @@ mod tests {
             flash_size: None,
             minimum_free_heap_size: None,
             ota: None,
+            partition_table: Vec::new(),
         }
     }
 
@@ -613,6 +697,7 @@ mod tests {
             flash_size: None,
             minimum_free_heap_size: None,
             ota: None,
+            partition_table: Vec::new(),
         };
 
         let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
@@ -635,6 +720,7 @@ mod tests {
             flash_size: None,
             minimum_free_heap_size: None,
             ota: None,
+            partition_table: Vec::new(),
         };
 
         let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
@@ -647,6 +733,10 @@ mod tests {
         assert_eq!(websocket.version, 2);
         assert_eq!(response.audio_params.format, "opus");
         assert_eq!(response.audio_params.sample_rate, 24000);
+        assert!(
+            response.firmware.is_none(),
+            "没有用户指定的升级目标时不应下发 firmware"
+        );
     }
 
     #[tokio::test]
@@ -665,6 +755,7 @@ mod tests {
             flash_size: None,
             minimum_free_heap_size: None,
             ota: None,
+            partition_table: Vec::new(),
         };
 
         let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
@@ -695,6 +786,7 @@ mod tests {
             flash_size: None,
             minimum_free_heap_size: None,
             ota: None,
+            partition_table: Vec::new(),
         };
 
         let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
@@ -721,6 +813,7 @@ mod tests {
             flash_size: None,
             minimum_free_heap_size: None,
             ota: None,
+            partition_table: Vec::new(),
         };
 
         let result = handle_ota(test_peer(), test_uri(), headers, Json(body)).await;
@@ -842,5 +935,138 @@ mod tests {
             HeaderValue::from_str(device_id).expect("device-id"),
         );
         headers
+    }
+
+    /// 安装一份临时文件存储，测试结束随 TempDir 删除。
+    async fn install_temp_firmware_store() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::firmware::install_firmware_store(crate::firmware::FirmwareStoreConfig {
+            metadata: std::sync::Arc::new(crate::firmware::JsonFileMetadataStore::new(
+                dir.path().join("state.json"),
+            )),
+            blobs: std::sync::Arc::new(crate::firmware::LocalFileBlobStore::new(
+                dir.path().join("bin"),
+            )),
+            gc_on_start: false,
+        })
+        .await
+        .expect("安装固件存储");
+        dir
+    }
+
+    fn report_body(mac: &str, version: &str) -> OtaRequest {
+        let mut body = sample_request(mac);
+        body.chip_model_name = Some("esp32s3".to_string());
+        body.application = Some(ApplicationInfo {
+            name: "xiaozhi".to_string(),
+            version: version.to_string(),
+            compile_time: None,
+            board: None,
+        });
+        body.board = Some(BoardInfo {
+            r#type: "bread-compact-wifi".to_string(),
+            mac: None,
+            ssid: None,
+            rssi: None,
+            ip: None,
+            channel: None,
+            name: Some("bread-compact-wifi".to_string()),
+        });
+        body.ota = Some(OtaInfo {
+            label: Some("ota_0".to_string()),
+        });
+        body.partition_table = vec![PartitionInfo {
+            label: "ota_0".to_string(),
+            r#type: 0,
+            subtype: 0x11,
+            address: 0x20000,
+            size: 0x3f0000,
+        }];
+        body
+    }
+
+    #[tokio::test]
+    async fn test_ota_records_device_report() {
+        let _config_lock = ota_test_lock();
+        let _firmware_lock = crate::firmware::test_lock().lock().await;
+        let _store = install_temp_firmware_store().await;
+
+        let mac = "12:34:56:78:9a:bc";
+        let response = handle_ota(
+            test_peer(),
+            test_uri(),
+            make_headers_with_device(mac),
+            Json(report_body(mac, "2.5.1")),
+        )
+        .await
+        .expect("ota")
+        .0;
+        assert!(response.firmware.is_none());
+
+        let report = crate::firmware::report_for(mac).expect("应记录设备上报");
+        assert_eq!(report.app_version, "2.5.1");
+        assert_eq!(report.app_name, "xiaozhi");
+        assert_eq!(report.board_type, "bread-compact-wifi");
+        assert_eq!(report.board_name, "bread-compact-wifi");
+        assert_eq!(report.chip_model, "esp32s3");
+        assert_eq!(report.ota_partition_size, Some(0x3f0000));
+    }
+
+    #[tokio::test]
+    async fn test_ota_serves_firmware_target_with_numeric_force() {
+        let _config_lock = ota_test_lock();
+        let _firmware_lock = crate::firmware::test_lock().lock().await;
+        let _store = install_temp_firmware_store().await;
+
+        let mac = "12:34:56:78:9a:bd";
+        let file = "2.5.2-bread-compact-wifi-abcdef123456.bin";
+        crate::firmware::store_firmware_file(file, vec![0xE9, 1, 2, 3])
+            .await
+            .expect("写固件");
+        crate::firmware::set_firmware_target(
+            mac,
+            crate::firmware::FirmwareTarget {
+                version: "2.5.2".to_string(),
+                from_version: "2.5.1".to_string(),
+                file: file.to_string(),
+                asset: "v2.5.2_bread-compact-wifi.zip".to_string(),
+                sha256: "deadbeef".to_string(),
+                board_type: "bread-compact-wifi".to_string(),
+                board_name: "bread-compact-wifi".to_string(),
+                installed_at_ms: 1,
+                deliveries: 0,
+                delivered: false,
+            },
+        )
+        .await
+        .expect("设置目标");
+
+        let mut headers = make_headers_with_device(mac);
+        headers.insert("host", HeaderValue::from_static("example.com:9527"));
+        let response = handle_ota(
+            test_peer(),
+            test_uri(),
+            headers,
+            Json(report_body(mac, "2.5.1")),
+        )
+        .await
+        .expect("ota")
+        .0;
+
+        let firmware = response.firmware.as_ref().expect("应下发 firmware");
+        assert_eq!(firmware.version, "2.5.2");
+        assert_eq!(firmware.force, 1);
+        assert_eq!(
+            firmware.url,
+            "http://example.com:9527/xiaozhi/firmware/2.5.2-bread-compact-wifi-abcdef123456.bin"
+        );
+
+        let json = serde_json::to_value(&response).expect("序列化响应");
+        assert_eq!(
+            json["firmware"]["force"],
+            serde_json::json!(1),
+            "上游固件只认数字 1，传 true 会被忽略"
+        );
+        assert_eq!(json["firmware"]["version"], "2.5.2");
     }
 }

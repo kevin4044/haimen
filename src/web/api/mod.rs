@@ -7,4 +7,5 @@ pub mod system;
 pub mod voice_settings;
 pub mod webhook;
 pub mod xiaozhi_devices;
+pub mod xiaozhi_firmware;
 pub mod xiaozhi_settings;

@@ -171,6 +171,19 @@ pub async fn start(
     let say_token = xiaozhi_config.say_token.clone(); // xiaozhi_config 随后被 move，先取
     haimen_xiaozhi::set_xiaozhi_ota_config(xiaozhi_config);
 
+    // 固件 OTA 存储：默认 ~/.haimen/xiaozhi-firmware/（位于宿主机数据卷内）。
+    // 必须在挂载路由/设备首次拉 OTA 前安装；安装失败只禁用固件升级，不影响语音。
+    match api::xiaozhi_firmware::install_store_from_settings().await {
+        Ok(dir) => tracing::warn!(
+            dir = %dir.display(),
+            "小智固件存储目录（需位于宿主机挂载卷内，Docker 下即 /root/.haimen/xiaozhi-firmware）"
+        ),
+        Err(err) => tracing::error!(
+            error = %err,
+            "小智固件存储安装失败，OTA 升级不可用（语音链路不受影响）"
+        ),
+    }
+
     // say 接口的运行时安装：token / HTTP 端口由 web 层提供，
     // advertise_ip 由 gateway 在 MQTT 传输层启动后另行安装。
     haimen_xiaozhi::notify::set_say_token(say_token.clone());
@@ -282,6 +295,25 @@ pub async fn start(
             axum::routing::put(api::xiaozhi_settings::update_xiaozhi_settings),
         );
 
+    // 小智固件 OTA：版本概览 + 指定版本升级 + 清除目标 + 清理自检设备
+    let xiaozhi_firmware_routes = axum::Router::new()
+        .route(
+            "/api/v1/xiaozhi/firmware",
+            axum::routing::get(api::xiaozhi_firmware::get_xiaozhi_firmware),
+        )
+        .route(
+            "/api/v1/xiaozhi/firmware/upgrade",
+            axum::routing::post(api::xiaozhi_firmware::upgrade_xiaozhi_firmware),
+        )
+        .route(
+            "/api/v1/xiaozhi/firmware/target/clear",
+            axum::routing::post(api::xiaozhi_firmware::clear_xiaozhi_firmware_target),
+        )
+        .route(
+            "/api/v1/xiaozhi/firmware/report/forget",
+            axum::routing::post(api::xiaozhi_firmware::forget_xiaozhi_firmware_report),
+        );
+
     // 运行日志 SSE：实时 tail ~/.haimen/logs/app.log
     let logs_routes = axum::Router::new().route(
         "/api/v1/logs/stream",
@@ -310,6 +342,7 @@ pub async fn start(
         r = r.merge(connectors_routes);
         r = r.merge(xiaozhi_devices_routes);
         r = r.merge(xiaozhi_settings_routes);
+        r = r.merge(xiaozhi_firmware_routes);
         r = r.merge(logs_routes);
         r.fallback(r#static::handle)
     } else {
@@ -327,6 +360,7 @@ pub async fn start(
         r = r.merge(connectors_routes);
         r = r.merge(xiaozhi_devices_routes);
         r = r.merge(xiaozhi_settings_routes);
+        r = r.merge(xiaozhi_firmware_routes);
         r = r.merge(logs_routes);
         r.fallback(r#static::handle)
     };
