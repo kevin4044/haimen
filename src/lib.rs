@@ -6,6 +6,7 @@ pub mod commands;
 pub mod config;
 pub mod connectors;
 pub mod datetime;
+pub mod emotion;
 pub mod gateway;
 pub mod logging;
 pub mod tts_factory;

@@ -1891,6 +1891,11 @@ async fn drive_playback_inner(
                     return false;
                 }
             }
+            Some(PlaybackEvent::Emotion { emotion, emoji }) => {
+                if !publish_llm_emotion(shared, &job.client_id, &emotion, emoji.as_deref()).await {
+                    return false;
+                }
+            }
             Some(PlaybackEvent::LlmSentence(text)) => sentences.push(text),
             Some(PlaybackEvent::Audio(audio)) => prebuffer.push(audio),
             None => {
@@ -1978,6 +1983,11 @@ async fn drive_playback_inner(
         match event {
             PlaybackEvent::Stt(text) => {
                 if !publish_stt(shared, &job.client_id, &text).await {
+                    return false;
+                }
+            }
+            PlaybackEvent::Emotion { emotion, emoji } => {
+                if !publish_llm_emotion(shared, &job.client_id, &emotion, emoji.as_deref()).await {
                     return false;
                 }
             }
@@ -2222,6 +2232,30 @@ fn ensure_session<'a>(tables: &'a mut Tables, client_id: &str) -> &'a mut Device
 
 fn cancelled(cancel: &watch::Receiver<bool>, shared: &Shared) -> bool {
     *cancel.borrow() || *shared.shutdown_tx.borrow()
+}
+
+async fn publish_llm_emotion(
+    shared: &Shared,
+    client_id: &str,
+    emotion: &str,
+    emoji: Option<&str>,
+) -> bool {
+    let session_id = match protocol_session_id(shared, client_id).await {
+        Some(session_id) => session_id,
+        None => return false,
+    };
+    let body = match serde_json::to_string(&ServerMessage::Llm {
+        session_id,
+        emotion: emotion.to_owned(),
+        text: emoji.map(str::to_owned),
+    }) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "llm 情绪消息序列化失败");
+            return false;
+        }
+    };
+    publish_body(shared, client_id, &body).await
 }
 
 async fn publish_stt(shared: &Shared, client_id: &str, text: &str) -> bool {

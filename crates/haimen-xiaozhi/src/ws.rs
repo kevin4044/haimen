@@ -749,6 +749,12 @@ async fn playback_frames_stream(
                             PlaybackEvent::LlmSentence(text) => {
                                 pending_sentences.push(text.clone());
                             }
+                            PlaybackEvent::Emotion { .. } => {
+                                if !send_text_event(socket, session, &event).await {
+                                    session.state = SessionState::Ready;
+                                    return;
+                                }
+                            }
                             PlaybackEvent::Audio(frame) => {
                                 record_frame_arrival_gap(
                                     session,
@@ -875,8 +881,10 @@ async fn playback_frames_stream(
                 match event {
                     Some(event) => {
                         match &event {
-                            PlaybackEvent::Stt(_) | PlaybackEvent::LlmSentence(_) => {
-                                // 稳态阶段文本事件立即转发（Tts::Start 已发出）
+                            PlaybackEvent::Stt(_)
+                            | PlaybackEvent::LlmSentence(_)
+                            | PlaybackEvent::Emotion { .. } => {
+                                // 稳态阶段文本/情绪事件立即转发（Tts::Start 已发出）
                                 if !send_text_event(socket, session, &event).await {
                                     session.state = SessionState::Ready;
                                     return;
@@ -938,7 +946,9 @@ async fn playback_frames_stream(
             // Drain 剩余事件（仍在 channel 中的已完成事件）
             while let Some(event) = frame_rx.recv().await {
                 match &event {
-                    PlaybackEvent::Stt(_) | PlaybackEvent::LlmSentence(_) => {
+                    PlaybackEvent::Stt(_)
+                    | PlaybackEvent::LlmSentence(_)
+                    | PlaybackEvent::Emotion { .. } => {
                         if !send_text_event(socket, session, &event).await {
                             break;
                         }
@@ -1019,11 +1029,21 @@ async fn playback_frames_stream(
 
 // ─── 工具函数 ──────────────────────────────────────────────
 
-/// 发送文本事件对应的设备消息（`stt` / `tts/sentence_start`）
+/// 发送文本/情绪事件对应的设备消息（`stt` / `tts/sentence_start` / `llm`）
 ///
 /// 返回 `false` 表示发送失败（连接已断开），调用方应停止回放并复位状态。
 async fn send_text_event(socket: &mut WebSocket, session: &Session, event: &PlaybackEvent) -> bool {
     match event {
+        PlaybackEvent::Emotion { emotion, emoji } => send_json(
+            socket,
+            &ServerMessage::Llm {
+                session_id: session.session_id.clone(),
+                emotion: emotion.clone(),
+                text: emoji.clone(),
+            },
+        )
+        .await
+        .is_ok(),
         PlaybackEvent::Stt(text) => send_json(
             socket,
             &ServerMessage::Stt {

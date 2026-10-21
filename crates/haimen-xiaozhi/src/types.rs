@@ -51,6 +51,13 @@ pub enum ServerMessage {
         session_id: String,
         text: String,
     },
+    /// 助手情绪：设备收到后执行 `SetEmotion`，显示 assets 里的表情图。
+    Llm {
+        session_id: String,
+        emotion: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
     Error {
         code: String,
         message: String,
@@ -530,6 +537,42 @@ pub enum PlaybackEvent {
     Stt(String),
     /// LLM 回复文本（句级）→ 设备 `tts/sentence_start` 消息
     LlmSentence(String),
+    /// 助手情绪 → 设备 `llm` 消息（`SetEmotion`）
+    Emotion {
+        emotion: String,
+        emoji: Option<String>,
+    },
     /// TTS 音频帧 → Opus 二进制帧
     Audio(AudioFrame),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llm_emotion_serializes_for_device_protocol() {
+        let value = serde_json::to_value(ServerMessage::Llm {
+            session_id: "s1".to_owned(),
+            emotion: "happy".to_owned(),
+            text: Some("🙂".to_owned()),
+        })
+        .expect("序列化");
+        assert_eq!(value["type"], "llm");
+        assert_eq!(value["session_id"], "s1");
+        assert_eq!(value["emotion"], "happy");
+        assert_eq!(value["text"], "🙂");
+    }
+
+    #[test]
+    fn llm_emotion_omits_empty_text() {
+        let value = serde_json::to_value(ServerMessage::Llm {
+            session_id: "s1".to_owned(),
+            emotion: "neutral".to_owned(),
+            text: None,
+        })
+        .expect("序列化");
+        assert_eq!(value["type"], "llm");
+        assert!(value.get("text").is_none());
+    }
 }

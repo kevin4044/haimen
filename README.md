@@ -254,6 +254,16 @@ curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/assets/apply \
 - assets 文件存于 `~/.haimen/xiaozhi-firmware/assets/`（随现有数据卷持久化）；端点与 settings API 一样不做鉴权，只建议内网使用。
 - 详细协议与官方链路调研见 [docs/research/xiaozhi-custom-theme-2026-10.md](docs/research/xiaozhi-custom-theme-2026-10.md)。
 
+### 10. 助手表情（emoji → `llm`）
+
+Hermes 侧约定每条回复开头带一个情绪 emoji；haimen 会在 TTS 前做两件事：
+
+1. 把开头的 emoji 映射成设备认识的 21 个 emotion 名称（如 `🙂 → happy`、`😔 → sad`）；
+2. 通过 MQTT/WS 下发 `{"type":"llm","emotion":"happy"}`，并把 emoji 从 TTS 文本里剥掉，避免朗读表情。
+
+支持的名称与 assets 主题的 21 个表情槽一致：`neutral / happy / laughing / funny / sad / angry / crying / loving / embarrassed / surprised / shocked / thinking / winking / cool / relaxed / delicious / kissy / confident / sleepy / silly / confused`。
+常见 emoji 变体（如 `😊`、`😀`、`😡`、`😢`）会归一到对应名称；正文中间出现的 emoji 不会触发表情。
+
 ## 快速开始
 
 ### 方式一：Docker（推荐，本机不需要 Rust）
