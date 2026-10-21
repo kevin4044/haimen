@@ -33,6 +33,7 @@
 | 主动播报 | 无 | `POST /api/v1/xiaozhi/say`，经 MQTT `notify` 下发 |
 | OTA 安全 | 无来源限制 | 默认只接受私网/回环来源，可配 `ota_token` |
 | 固件 OTA 升级 | 无服务端版本管理 | Web UI 查看设备版本、匹配 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32/releases)，支持指定版本刷写 |
+| 自定义桌面主题 | 官方主题页（浏览器生成 assets.bin） | Web UI 生成/上传 assets.bin，经设备 MCP 下发 `set_download_url` + `reboot`，不经过 LLM |
 | 语音链路 | 能量阈值 VAD、批处理 ASR | Silero VAD、ASR 2.0、判停/超时/首帧/下行节奏调优 |
 | Agent | 4 个 provider（以 CLI 子进程为主） | 新增 OpenAI 兼容 HTTP provider（SSE 流式） |
 | 工程化 | 本机 cargo + GitHub Actions | Docker 化开发/CI 工具链、设备模拟器与端到端脚本 |
@@ -222,6 +223,34 @@ curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/firmware/target/clear \
   -H 'Content-Type: application/json' \
   -d '{"device":"84:c7:bb:59:93:64"}'
 ```
+
+### 9. 自定义桌面主题（assets）
+
+Web 控制台的「小智设备」页新增「自定义主题」面板（不重编固件、不使用 iframe）：
+
+1. 选择设备，读取屏幕分辨率和 assets 分区大小。
+2. 配置浅色/深色背景（纯色或图片）、21 个情绪表情、隐藏字幕；可选上传预编译 CBin 字体。
+3. 浏览器在本地生成 `assets.bin`（格式与官方 `78/xiaozhi-assets-generator` 一致：12 字节头 + 44 字节文件表 + `0x5A5A` 数据 + checksum）。
+4. 上传到 haimen 后，haimen 通过设备 MQTT 直接发 MCP `self.assets.set_download_url` + `self.reboot`；设备重启后自己下载并写入 assets 分区。**全程不经过 LLM/Agent。**
+
+```bash
+# 上传 assets.bin（octet-stream）
+curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/assets \
+  -H 'Content-Type: application/octet-stream' --data-binary @assets.bin
+
+# 下发到设备（file 用上传返回的文件名）
+curl -X POST http://127.0.0.1:9527/api/v1/xiaozhi/assets/apply \
+  -H 'Content-Type: application/json' \
+  -d '{"device":"84:c7:bb:59:93:64","file":"assets-0123456789abcdef.bin"}'
+```
+
+关键限制：
+
+- assets 分区只有一份、整体覆盖，**没有 A/B 回滚**；换主题前建议先用 `esptool read_flash` 备份 assets 分区。
+- 只换 UI 资源，不改字幕布局/字号/位置；`hide_subtitle` 对 WeChat 气泡风格固件可能不生效。
+- 自定义字体沿用官方生成器的 CBin 格式；当前页面不把 TTF 转 CBin。
+- assets 文件存于 `~/.haimen/xiaozhi-firmware/assets/`（随现有数据卷持久化）；端点与 settings API 一样不做鉴权，只建议内网使用。
+- 详细协议与官方链路调研见 [docs/research/xiaozhi-custom-theme-2026-10.md](docs/research/xiaozhi-custom-theme-2026-10.md)。
 
 ## 快速开始
 

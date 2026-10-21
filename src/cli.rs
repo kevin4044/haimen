@@ -516,6 +516,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                         // serve 时 say_hub() 永远是 None，/api/v1/xiaozhi/say
                         // 会一直报 device_offline。
                         haimen_xiaozhi::mqtt_udp::install_say_hub(t.say_hub());
+                        haimen_xiaozhi::install_device_mcp_hub(t.device_mcp_hub());
                         haimen_xiaozhi::notify::set_say_advertise_ip(advertise_ip);
                         tracing::warn!(
                             broker = %t.broker_addr(),

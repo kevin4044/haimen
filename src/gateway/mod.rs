@@ -214,6 +214,7 @@ pub async fn start_all(cli_open_browser: bool) -> Result<(), String> {
                             // 安装 notify 通路的设备门面与 URL 基址。
                             // 必须在传输层 start 成功后装：say_hub 句柄依赖活着的 broker。
                             haimen_xiaozhi::mqtt_udp::install_say_hub(t.say_hub());
+                            haimen_xiaozhi::install_device_mcp_hub(t.device_mcp_hub());
                             haimen_xiaozhi::notify::set_say_advertise_ip(advertise_ip);
                             tracing::warn!(
                                 broker = %t.broker_addr(),

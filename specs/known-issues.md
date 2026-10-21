@@ -2,7 +2,7 @@
 
 > 记录真机测试中发现、但尚未修复的问题。
 > 每条都附有日志证据，便于后续定位。
-> 最后更新：2026-10-18
+> 最后更新：2026-10-21
 
 ---
 
@@ -411,17 +411,23 @@ esptool.py --chip esp32s3 -p <port> -b 460800 write_flash 0x0 merged-binary.bin
 
 ---
 
-## 待调研：官方自定义 UI / 生成 assets 固件
+## 已调研：官方自定义 UI / 生成 assets（2026-10-21）
 
-**状态**：已知入口，暂不深究（2026-10-19 记录）
+**状态**：已调研（2026-10-21）
+**报告**：[docs/research/xiaozhi-custom-theme-2026-10.md](../docs/research/xiaozhi-custom-theme-2026-10.md)
 
-用户提及官网有「自定义界面」的地方，可以生成 asset 固件。
+用户提及官网有「自定义界面」的地方可以换主题。调研结论：**不是「服务端生成固件」**，
+而是浏览器端开源生成器（`78/xiaozhi-assets-generator`，MIT）在本地生成 `assets.bin`，
+官方闭源服务端只做设备 token、MCP proxy（`/api/messaging/device/tools/call`）和
+transfer 文件托管；固件**不重编**，只是下载并覆盖 **assets 分区**，重启后解析 `index.json`
+应用字体/表情/皮肤/`hide_subtitle`。全程走控制面 MCP（`self.assets.set_download_url` +
+`self.reboot`），**不需要 LLM/Agent/ASR/TTS**，haimen 可绕开官方云自己实现等价链路。
 
 **为什么重要**：`hide_subtitle`（是否隐藏底部对话字幕）**只从 assets 的
 主题配置读取**，代码里没有任何运行时开关，也没有 MCP 工具：
 
 ```cpp
-// main/assets.cc:428-433
+// main/assets.cc:422-429（v2.5.2）
 cJSON* hide_subtitle = cJSON_GetObjectItem(root.get(), "hide_subtitle");
 if (cJSON_IsBool(hide_subtitle)) {
     display->SetHideSubtitle(cJSON_IsTrue(hide_subtitle));
@@ -430,13 +436,22 @@ if (cJSON_IsBool(hide_subtitle)) {
 
 而 2.5.x 的默认显示风格把对话文字从「中部气泡区（保留多轮）」
 改成了「底部单行字幕」（`bottom_bar_` + `chat_message_label_`），
-且只在 `CONFIG_USE_WECHAT_MESSAGE_STYLE` 下才是气泡 UI。
+且只在 `CONFIG_USE_WECHAT_MESSAGE_STYLE` 下才是气泡 UI（该风格下没有 `bottom_bar_`，
+`hide_subtitle` 实际不生效）。字幕的字体/颜色/背景复用主题，**没有独立的字幕字号/位置配置**。
 
 **如果以后要改 UI / 显示文字**，三条路径：
-1. 官方自定义 UI 生成 assets（用户提到的入口，待调研）
+1. 官方主题页生成 `assets.bin` 并在线烧录（浏览器本地生成 + transfer；已调研，可复用其格式/打包器）
 2. 自己编译固件，加 `CONFIG_USE_WECHAT_MESSAGE_STYLE=y`
    （恢复气泡 UI）或 `CONFIG_USE_MULTILINE_CHAT_MESSAGE=y`（底部多行）
-3. 用 MCP `self.assets.set_download_url` 让设备下载自定义 assets
+3. 用 MCP `self.assets.set_download_url` 让设备下载自定义 assets（haimen 侧推荐路径）
+
+**风险（改 assets 前必读）**：
+- **单分区整体覆盖、无回滚**：assets 分区只有一份，换主题会替换厂包（可能含唤醒词 `srmodels`），旧包不可恢复。
+- **下载中断会让分区失效**：固件最后才写 12 字节 header，失败时多为「旧 header + 半新数据」，
+  下次启动 checksum 校验失败 → 主题/字体全回退内置；且 `download_url` 在下载前已从 NVS 清除，**不会自动重试**。
+- 容量受限：`assets.bin` 必须 ≤ assets 分区大小，还受 MMU 空闲页限制（C3 尤其紧）。
+- 自定义字体仍能正常显示，但会**失去 glyph push**（官方生成器不写 `text_font_meta`，缺字不再由云端补 glyph）。
+- 颜色必须 `#RRGGBB`，`#fff` 这类短写会变黑。
 
 ---
 

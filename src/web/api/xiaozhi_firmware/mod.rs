@@ -559,7 +559,7 @@ fn upgrade_lock() -> &'static tokio::sync::Mutex<()> {
     UPGRADE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn resolve_device_mac(identity: &str) -> Option<String> {
+pub(crate) fn resolve_device_mac(identity: &str) -> Option<String> {
     let identity = identity.trim();
     if identity.is_empty() {
         return None;
@@ -646,7 +646,7 @@ fn firmware_file_name(version: &str, full_name: &str, sha256: &str) -> String {
     )
 }
 
-fn http_base(headers: &HeaderMap) -> String {
+pub(crate) fn http_base(headers: &HeaderMap) -> String {
     let is_secure = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())

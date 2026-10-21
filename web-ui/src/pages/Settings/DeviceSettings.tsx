@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/table';
 import type { XiaozhiDeviceState, XiaozhiOnlineDevice } from '@/types';
 import DeviceFirmwarePanel from './DeviceFirmwarePanel';
+import DeviceThemePanel from './DeviceThemePanel';
 
 /** 编辑中的一行设备（key 只用于 React 列表渲染，不提交给后端） */
 interface EditableDevice {
@@ -369,6 +370,9 @@ function DeviceSettingsPanel() {
 
       {/* 固件面板独立加载概览；加载失败只影响本卡片，不影响上面的设备表 */}
       <DeviceFirmwarePanel />
+
+      {/* 自定义主题面板：选择设备后读取 device-info，在浏览器内打包并下发 assets.bin */}
+      <DeviceThemePanel />
     </div>
   );
 }
