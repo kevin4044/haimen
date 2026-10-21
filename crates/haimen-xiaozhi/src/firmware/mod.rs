@@ -284,6 +284,22 @@ pub async fn clear_firmware_target(device_id: &str) -> Result<(), FirmwareStoreE
     Ok(())
 }
 
+/// 删除一台设备的上报与目标，返回是否真的删除了记录。
+///
+/// 用于清理 CD 自检/已废弃设备，避免它们一直出现在固件面板里。
+/// 强一致：落盘失败时不提交内存。
+pub async fn forget_device(device_id: &str) -> Result<bool, FirmwareStoreError> {
+    let rt = runtime().ok_or(FirmwareStoreError::NotInstalled)?;
+    let _guard = rt.mutation.lock().await;
+    let mut candidate = read_snapshot(&rt);
+    if candidate.devices.remove(device_id).is_none() {
+        return Ok(false);
+    }
+    rt.metadata.save(&candidate).await?;
+    write_snapshot(&rt, candidate);
+    Ok(true)
+}
+
 /// 写入一个固件 blob。
 pub async fn store_firmware_file(name: &str, bytes: Vec<u8>) -> Result<(), FirmwareStoreError> {
     validate_blob_name(name)?;
@@ -675,6 +691,29 @@ mod tests {
             .expect("设置目标");
         record_device_report(report(mac, "2.5.1", "espressif/esp-box-3")).await;
         assert!(target_for(mac).is_none(), "板型变化应清除目标");
+    }
+
+    #[tokio::test]
+    async fn forget_device_removes_report_and_target() {
+        let _lock = test_lock().lock().await;
+        install_mem().await;
+        let mac = "aa:bb:cc:dd:ee:07";
+        let file = "2.5.2-bread-compact-wifi-abcdef123456.bin";
+        store_firmware_file(file, vec![1]).await.expect("写固件");
+        record_device_report(report(mac, "2.5.1", "bread-compact-wifi")).await;
+        set_firmware_target(mac, target("2.5.2", "bread-compact-wifi", file))
+            .await
+            .expect("设置目标");
+        assert!(report_for(mac).is_some());
+        assert!(target_for(mac).is_some());
+
+        assert!(forget_device(mac).await.expect("删除设备"));
+        assert!(report_for(mac).is_none(), "上报应被删除");
+        assert!(target_for(mac).is_none(), "目标应被删除");
+        assert!(
+            !forget_device(mac).await.expect("重复删除"),
+            "第二次应为 no-op"
+        );
     }
 
     #[tokio::test]

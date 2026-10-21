@@ -295,7 +295,7 @@ pub async fn start(
             axum::routing::put(api::xiaozhi_settings::update_xiaozhi_settings),
         );
 
-    // 小智固件 OTA：版本概览 + 指定版本升级 + 清除目标
+    // 小智固件 OTA：版本概览 + 指定版本升级 + 清除目标 + 清理自检设备
     let xiaozhi_firmware_routes = axum::Router::new()
         .route(
             "/api/v1/xiaozhi/firmware",
@@ -308,6 +308,10 @@ pub async fn start(
         .route(
             "/api/v1/xiaozhi/firmware/target/clear",
             axum::routing::post(api::xiaozhi_firmware::clear_xiaozhi_firmware_target),
+        )
+        .route(
+            "/api/v1/xiaozhi/firmware/report/forget",
+            axum::routing::post(api::xiaozhi_firmware::forget_xiaozhi_firmware_report),
         );
 
     // 运行日志 SSE：实时 tail ~/.haimen/logs/app.log

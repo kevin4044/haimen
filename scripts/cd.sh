@@ -301,6 +301,17 @@ case "${OTA_ENDPOINT}" in
   *) warn "endpoint 指向 ${OTA_ENDPOINT}，不是本机 ${SSH_DEST_HOST} —— 设备会连错地方！" ;;
 esac
 
+# 清理 OTA 自检产生的假设备记录，避免固件面板出现 DE:AD:BE:EF:00:01。
+# 旧版本没有该端点时只 warn，不阻断部署。
+FORGET_CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 8 -X POST \
+  "http://${SSH_DEST_HOST}:${HTTP_PORT}/api/v1/xiaozhi/firmware/report/forget" \
+  -H 'Content-Type: application/json' -d '{"device":"DE:AD:BE:EF:00:01"}' 2>/dev/null || echo 000)"
+if [ "${FORGET_CODE}" = "200" ]; then
+  ok "已清理 OTA 自检设备记录"
+else
+  warn "OTA 自检设备记录清理失败（HTTP ${FORGET_CODE}），可稍后手动删除"
+fi
+
 # 进程
 PID="$(remote "pgrep -f '${REMOTE_DIR}/bin/haimen serve' | head -1" 2>/dev/null || true)"
 [ -n "${PID}" ] || die "找不到运行中的 haimen 进程"

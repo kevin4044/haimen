@@ -548,6 +548,11 @@ pub struct ClearTargetRequest {
     device: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ForgetReportRequest {
+    device: String,
+}
+
 static UPGRADE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn upgrade_lock() -> &'static tokio::sync::Mutex<()> {
@@ -879,6 +884,30 @@ pub async fn clear_xiaozhi_firmware_target(
         .map_err(map_store_error)?;
     tracing::warn!(device_id = %mac, "已清除小智固件升级目标");
     Ok(Json(json!({ "ok": true, "device": mac })))
+}
+
+/// `POST /api/v1/xiaozhi/firmware/report/forget`
+///
+/// 删除一台设备的上报与目标。用于清理 CD 自检/已废弃设备，避免它们一直
+/// 出现在固件面板里。设备下次重启拉 OTA 会重新上报。
+pub async fn forget_xiaozhi_firmware_report(
+    Json(req): Json<ForgetReportRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !firmware::is_installed() {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "firmware_store_unavailable",
+            "固件存储未安装，升级功能不可用",
+        ));
+    }
+    let mac = resolve_device_mac(&req.device).ok_or_else(|| invalid_request("device 不能为空"))?;
+    let removed = firmware::forget_device(&mac)
+        .await
+        .map_err(map_store_error)?;
+    tracing::warn!(device_id = %mac, removed, "清理小智设备固件上报");
+    Ok(Json(
+        json!({ "ok": true, "device": mac, "removed": removed }),
+    ))
 }
 
 #[cfg(test)]
