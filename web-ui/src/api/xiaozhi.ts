@@ -3,6 +3,8 @@ import type {
   XiaozhiConfiguredDevice,
   XiaozhiDeviceState,
   XiaozhiDevicesData,
+  XiaozhiFirmwareOverview,
+  XiaozhiFirmwareUpgradeResult,
   XiaozhiSayResult,
   XiaozhiSettings,
 } from '@/types';
@@ -235,4 +237,64 @@ export async function sayXiaozhi({
   });
   if (!res.ok) throw await toXiaozhiError(res);
   return (await res.json()) as XiaozhiSayResult;
+}
+
+/**
+ * 读取小智固件概览（`GET /api/v1/xiaozhi/firmware`）。
+ *
+ * 上游 GitHub 不可用时后端仍返回 200，用 `stale` / `error` 字段表达，
+ * 因此这里只要 HTTP 成功就返回 overview，不因 `body.error` 抛错。
+ * `refresh` 为 true 时强制重新拉取上游 release（默认使用缓存）。
+ */
+export async function getXiaozhiFirmware(refresh = false): Promise<XiaozhiFirmwareOverview> {
+  const query = refresh ? '?refresh=true' : '';
+  const res = await fetch(`/api/v1/xiaozhi/firmware${query}`);
+  if (!res.ok) throw await toXiaozhiError(res);
+
+  const body = (await res.json()) as Partial<XiaozhiFirmwareOverview>;
+  return {
+    ok: true,
+    repository: body.repository ?? '78/xiaozhi-esp32',
+    repository_url: body.repository_url ?? 'https://github.com/78/xiaozhi-esp32',
+    fetched_at: body.fetched_at ?? '',
+    stale: Boolean(body.stale),
+    error: body.error ?? null,
+    releases: Array.isArray(body.releases) ? body.releases : [],
+    devices: Array.isArray(body.devices) ? body.devices : [],
+  };
+}
+
+/** 指定升级目标的入参：`device` 支持 MAC / MQTT client_id / 配置的设备名 */
+export interface XiaozhiFirmwareUpgradeInput {
+  device: string;
+  version: string;
+}
+
+/**
+ * 下载指定版本固件并把它设为设备的升级目标（`POST /api/v1/xiaozhi/firmware/upgrade`）。
+ *
+ * 成功只代表目标已设置、等待设备重启后拉取；失败抛 `XiaozhiError`，
+ * 页面按 `code` 给出可操作提示（见 `lib/firmware.ts#describeFirmwareError`）。
+ */
+export async function upgradeXiaozhiFirmware({
+  device,
+  version,
+}: XiaozhiFirmwareUpgradeInput): Promise<XiaozhiFirmwareUpgradeResult> {
+  const res = await fetch('/api/v1/xiaozhi/firmware/upgrade', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device, version }),
+  });
+  if (!res.ok) throw await toXiaozhiError(res);
+  return (await res.json()) as XiaozhiFirmwareUpgradeResult;
+}
+
+/** 清除设备已设置的升级目标（`POST /api/v1/xiaozhi/firmware/target/clear`） */
+export async function clearXiaozhiFirmwareTarget(device: string): Promise<void> {
+  const res = await fetch('/api/v1/xiaozhi/firmware/target/clear', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device }),
+  });
+  if (!res.ok) throw await toXiaozhiError(res);
 }

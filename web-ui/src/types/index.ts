@@ -318,6 +318,111 @@ export interface XiaozhiErrorBody {
   devices?: XiaozhiOnlineDevice[];
 }
 
+// ── 小智固件 OTA ──
+
+/** 设备 OTA 上报的固件信息（未上报时为 null） */
+export interface XiaozhiFirmwareReport {
+  version: string;
+  board_type: string;
+  board_name: string;
+  chip_model: string;
+  app_name: string;
+  /** 上报时间（毫秒时间戳） */
+  reported_at_ms: number;
+  /** 设备 OTA 分区大小（字节）；设备未上报分区表时为 null */
+  ota_partition_size: number | null;
+}
+
+/** 已为设备设置、等待其拉取的升级目标 */
+export interface XiaozhiFirmwareTarget {
+  version: string;
+  asset: string;
+  sha256: string;
+  /** 目标设置时间（毫秒时间戳） */
+  installed_at_ms: number;
+  /** 已下发次数（设备每次拉取 OTA 都会 +1） */
+  deliveries: number;
+  /** 固件文件是否仍在本地缓存中 */
+  file_present: boolean;
+}
+
+/** 上游 release 列表项 */
+export interface XiaozhiFirmwareRelease {
+  tag: string;
+  version: string;
+  name: string;
+  /** 发布时间（ISO 字符串） */
+  published_at: string;
+  prerelease: boolean;
+  html_url: string;
+}
+
+/** 与当前设备板型匹配的上游最新 release（不含 name/prerelease） */
+export interface XiaozhiFirmwareLatest {
+  tag: string;
+  version: string;
+  asset: string;
+  /** 发布时间（ISO 字符串） */
+  published_at: string;
+  html_url: string;
+}
+
+/** 固件与上游的版本关系 */
+export type XiaozhiFirmwareState =
+  | 'update_available'
+  | 'latest'
+  | 'ahead'
+  | 'unknown'
+  | 'unsupported'
+  | 'error';
+
+/** `GET /api/v1/xiaozhi/firmware` 返回的单台设备状态 */
+export interface XiaozhiFirmwareDevice {
+  device_id: string;
+  name: string;
+  room: string;
+  report: XiaozhiFirmwareReport | null;
+  target: XiaozhiFirmwareTarget | null;
+  latest: XiaozhiFirmwareLatest | null;
+  state: XiaozhiFirmwareState;
+  error: string | null;
+}
+
+/**
+ * `GET /api/v1/xiaozhi/firmware` 的响应。
+ *
+ * 上游 GitHub 不可用时仍然返回 200：`stale` 表示展示的是缓存版本列表，
+ * `error` 给出失败原因；此时页面仍可用手动输入版本升级。
+ */
+export interface XiaozhiFirmwareOverview {
+  ok: true;
+  repository: string;
+  repository_url: string;
+  /** 版本信息获取时间（ISO 字符串） */
+  fetched_at: string;
+  stale: boolean;
+  error: string | null;
+  releases: XiaozhiFirmwareRelease[];
+  devices: XiaozhiFirmwareDevice[];
+}
+
+/** `POST /api/v1/xiaozhi/firmware/upgrade` 成功响应里的升级目标 */
+export interface XiaozhiFirmwareUpgradeTarget {
+  version: string;
+  asset: string;
+  file: string;
+  sha256: string;
+  size_bytes: number;
+  file_url: string;
+}
+
+/** `POST /api/v1/xiaozhi/firmware/upgrade` 成功响应 */
+export interface XiaozhiFirmwareUpgradeResult {
+  ok: true;
+  target: XiaozhiFirmwareUpgradeTarget;
+  message: string;
+}
+
 // ── 运行日志 ──
 
 export interface RuntimeLogMeta {
