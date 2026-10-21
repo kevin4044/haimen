@@ -68,6 +68,9 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 futures-util = "0.3"
 async-trait = "0.1"
 
+# 固件 OTA：release zip 内是 deflate 压缩的 merged-bin，需要解压
+flate2 = "1"
+
 # MCP 协议
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
 hmac = "0.13.0"
@@ -127,6 +130,7 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
+flate2 = { workspace = true }
 rmcp = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

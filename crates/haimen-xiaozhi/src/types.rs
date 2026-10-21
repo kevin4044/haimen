@@ -181,6 +181,9 @@ pub struct OtaRequest {
     pub minimum_free_heap_size: Option<String>,
     #[serde(default)]
     pub ota: Option<OtaInfo>,
+    /// 设备上报的分区表。用于读取 OTA 分区大小，在服务端预检固件是否放得下。
+    #[serde(default)]
+    pub partition_table: Vec<PartitionInfo>,
 }
 
 /// OTA 响应
@@ -444,11 +447,14 @@ pub struct ServerTime {
 /// 固件信息
 #[derive(Debug, Serialize)]
 pub struct FirmwareInfo {
+    /// 必须是点分十进制（如 "2.5.2"）。上游 `ParseVersion` 不接受 `v2.5.2`。
     pub version: String,
     #[serde(default)]
     pub url: String,
+    /// 数字 1 表示强制安装；上游用 `cJSON_IsNumber(force) && force->valueint == 1`
+    /// 判断，传 `true` 会被完全忽略。默认 0。
     #[serde(default)]
-    pub force: bool,
+    pub force: u8,
 }
 
 /// 应用信息
@@ -485,6 +491,24 @@ pub struct BoardInfo {
 pub struct OtaInfo {
     #[serde(default)]
     pub label: Option<String>,
+}
+
+/// 设备上报的一个分区表项（来自 `Board::GetSystemInfoJson`）。
+///
+/// 固件体积预检只需要 app 分区：`type == 0` 且 subtype 为 factory(0x10) /
+/// ota_0(0x11)。`ota.label` 指向设备当前运行的分区，优先按它匹配。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PartitionInfo {
+    #[serde(default)]
+    pub label: String,
+    #[serde(rename = "type", default)]
+    pub r#type: u8,
+    #[serde(default)]
+    pub subtype: u8,
+    #[serde(default)]
+    pub address: u64,
+    #[serde(default)]
+    pub size: u64,
 }
 
 // ─── 音频帧 ────────────────────────────────────────────────

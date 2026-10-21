@@ -26,6 +26,8 @@ aes = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 ctr = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"
+tempfile = { workspace = true }

@@ -1,4 +1,5 @@
 pub mod devices;
+pub mod firmware;
 pub mod mqtt;
 pub mod mqtt_broker;
 pub mod mqtt_udp;
@@ -13,6 +14,10 @@ pub mod udp_audio;
 mod ws;
 
 pub use devices::{DeviceDirectory, install_device_directory, install_devices_from_config};
+pub use firmware::{
+    DeviceFirmwareReport, FirmwareBlobStore, FirmwareMetadataStore, FirmwareStoreConfig,
+    FirmwareStoreError, FirmwareTarget, JsonFileMetadataStore, LocalFileBlobStore,
+};
 pub use mqtt_udp::{MqttUdpConfig, MqttUdpError, MqttUdpTransport};
 pub use notify::SaySynthesizer;
 pub use protocol::*;
@@ -46,9 +51,11 @@ pub fn set_xiaozhi_ota_config(cfg: XiaozhiConfig) {
 /// - `POST /api/v1/xiaozhi/say`     — 主动播报：文本 → Ogg Opus → 托管 → 下发 notify
 /// - `GET  /api/v1/xiaozhi/devices` — 设备清单：配置 + 在线/忙闲状态
 /// - `GET  /xiaozhi/say/{id}`       — 一次性通知音频（实际 URL 带 `.ogg` 后缀，由 handler 剥掉）
+/// - `GET  /xiaozhi/firmware/{file}` — 设备 OTA 固件下载（经 Blob 存储层）
 ///
 /// 为什么和 [`add_routes`] 拆开：即使没有 `xiaozhi_strategy`（例如纯 REST /
-/// Web UI 场景），say 与 devices 端点也应该可用；OTA 与 WebSocket 才依赖策略。
+/// Web UI 场景），say / devices / firmware 端点也应该可用；OTA 与 WebSocket
+/// 才依赖策略。
 ///
 /// # 参数
 ///
@@ -63,6 +70,11 @@ pub fn add_control_routes<S: Clone + Send + Sync + 'static>(router: Router<S>) -
         .route(
             "/xiaozhi/say/{id}",
             axum::routing::get(say_audio::handle_say_audio),
+        )
+        // 设备 OTA 固件下载：文件名不可猜，且由 Blob 层校验，不需要额外鉴权。
+        .route(
+            "/xiaozhi/firmware/{file}",
+            axum::routing::get(firmware::handle_firmware_file),
         )
         .route(
             "/api/v1/xiaozhi/say",
