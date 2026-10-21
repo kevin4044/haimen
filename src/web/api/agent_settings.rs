@@ -19,28 +19,13 @@ use axum::extract::State;
 use axum::{Json, http::StatusCode};
 
 use crate::config::settings::AppConfig;
+use crate::web::api::common::{
+    SettingsUpdateError, error_response, load_strict, parse_providers, update_settings,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 工具函数
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// 从请求 JSON 中读取 providers 映射
-fn parse_providers(value: &serde_json::Value) -> Option<HashMap<String, HashMap<String, String>>> {
-    let obj = value.get("providers")?.as_object()?;
-    let mut providers = HashMap::new();
-    for (name, fields) in obj {
-        if let Some(fields_obj) = fields.as_object() {
-            let mut creds = HashMap::new();
-            for (k, v) in fields_obj {
-                if let Some(s) = v.as_str().filter(|s| !s.is_empty()) {
-                    creds.insert(k.clone(), s.to_string());
-                }
-            }
-            providers.insert(name.clone(), creds);
-        }
-    }
-    Some(providers)
-}
 
 /// 加载当前配置（文件不存在时返回默认值）
 fn load_config() -> AppConfig {
@@ -89,7 +74,8 @@ pub async fn update_agent_settings(
     State(shared_agent): State<crate::gateway::agent_handle::SharedAgent>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let mut cfg = load_config();
+    // 现有 settings.toml 非法时拒绝写盘，避免用默认值覆盖用户配置。
+    let mut cfg = load_strict().map_err(|e| error_response(StatusCode::CONFLICT, e))?;
 
     // 更新 active_provider（如果提供）
     if let Some(active) = body.get("active_provider").and_then(|v| v.as_str()) {
@@ -103,6 +89,9 @@ pub async fn update_agent_settings(
         cfg.gateway.providers = providers;
     }
 
+    // 本次请求要写入的 Agent 字段。候选构建用快照，落盘时再与磁盘最新配置合并。
+    let active_provider = cfg.gateway.active_provider.clone();
+    let providers = cfg.gateway.providers.clone();
     let name = cfg.gateway.resolved_agent();
 
     // 1. 构建候选（未注册的 provider → 400，零改动）
@@ -133,19 +122,12 @@ pub async fn update_agent_settings(
         ));
     }
 
-    // 3. 写盘（失败 → 500，内存未换入）
-    if let Err(e) = crate::config::settings::save_settings(&cfg) {
-        tracing::warn!(error = %e, "保存 Agent 配置到文件失败");
-        let msg = format!("保存配置失败: {}", e);
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": msg.clone(),
-                "message": msg,
-            })),
-        ));
-    }
+    // 3. 写盘：锁内重新加载最新配置，只合并 Agent 字段。
+    //
+    // 候选构建和 check_available 都在锁外（可能耗时数秒）；这里如果直接写
+    // 开头加载的旧快照，会把期间其他页面保存的 section 覆盖掉。
+    let saved_cfg = save_agent_settings(active_provider, providers)
+        .map_err(|e| error_response(e.status(), e.message()))?;
 
     // 4. 换入内存（此刻才换代，单条赋值原子生效）
     let (applied_agent, generation) = {
@@ -157,8 +139,8 @@ pub async fn update_agent_settings(
     Ok(Json(serde_json::json!({
         "success": true,
         "data": {
-            "active_provider": cfg.gateway.active_provider,
-            "providers": cfg.gateway.providers,
+            "active_provider": saved_cfg.gateway.active_provider,
+            "providers": saved_cfg.gateway.providers,
             "applied": true,
             "applied_agent": applied_agent,
             "generation": generation,
@@ -188,13 +170,63 @@ pub async fn list_agent_providers() -> Json<serde_json::Value> {
     }))
 }
 
+/// 在设置写锁内保存 Agent 配置。
+///
+/// 只覆盖 `gateway.active_provider` 与 `gateway.providers`，其余 section 从
+/// 磁盘最新配置重新加载后保留。这样 `check_available()` 等待期间其他页面
+/// 保存的 Xiaozhi / ASR / TTS 配置不会被本请求的旧快照覆盖。
+fn save_agent_settings(
+    active_provider: String,
+    providers: HashMap<String, HashMap<String, String>>,
+) -> Result<AppConfig, SettingsUpdateError> {
+    update_settings(|latest| {
+        latest.gateway.active_provider = active_provider;
+        latest.gateway.providers = providers;
+        Ok(false)
+    })
+    .map(|(cfg, _)| cfg)
+}
+
+/// 把请求体里的草稿字段合并进指定 provider 的临时配置。
+///
+/// 请求体除 `provider` 外的字符串字段都视为该 provider 的草稿参数：
+/// - 非空值写入临时配置（如 openai 的 `base_url`/`model`/`api_key`、CLI 的 `cli_path`）；
+/// - 空串删除对应 key，使「清空后验证」与保存后的环境变量回退语义一致。
+///
+/// 只改内存中的克隆配置，不写盘、不影响正在运行的 Agent。
+fn apply_draft_provider_fields(
+    cfg: &mut crate::config::settings::GatewayConfig,
+    provider: &str,
+    body: &serde_json::Value,
+) {
+    let Some(fields) = body.as_object() else {
+        return;
+    };
+    let entry = cfg.providers.entry(provider.to_string()).or_default();
+    for (key, value) in fields {
+        if key == "provider" {
+            continue;
+        }
+        let Some(raw) = value.as_str() else {
+            continue;
+        };
+        let value = raw.trim();
+        if value.is_empty() {
+            entry.remove(key);
+        } else {
+            entry.insert(key.clone(), value.to_string());
+        }
+    }
+}
+
 /// `POST /api/v1/settings/agent/verify`
 ///
 /// 验证指定 Agent 提供商是否可用。
 ///
-/// 请求体包含 `provider` 字段；可选 `cli_path` 字段用于验证**草稿**路径
-/// （尚未保存到配置）。统一通过注册表构造 Agent 并调用其
-/// `check_available()`（如 `claude --version` / `codex --version`），
+/// 请求体包含 `provider` 字段，以及该 provider 的**草稿**字段（尚未保存到配置），
+/// 例如 openai 的 `base_url` / `model` / `api_key`，或 CLI Agent 的 `cli_path`。
+/// 统一通过注册表构造 Agent 并调用其 `check_available()`
+/// （如 `claude --version` / `codex --version` / openai 的 `/models`），
 /// 新增 Agent 无需改动此处。
 pub async fn verify_agent_credentials(
     Json(body): Json<serde_json::Value>,
@@ -206,19 +238,8 @@ pub async fn verify_agent_credentials(
 
     let mut cfg = load_config();
 
-    // 可选草稿 cli_path：验证未保存的路径。注入克隆配置后由注册表构造，
-    // check_available 会用该路径做 --version 探活（不写盘、不改内存）。
-    if let Some(path) = body
-        .get("cli_path")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-    {
-        cfg.gateway
-            .providers
-            .entry(provider.to_string())
-            .or_default()
-            .insert("cli_path".to_string(), path.trim().to_string());
-    }
+    // 草稿字段只注入克隆配置，用于未保存前的探活。
+    apply_draft_provider_fields(&mut cfg.gateway, provider, &body);
 
     let agent = match crate::agents::registry::registry().build(provider, &cfg.gateway) {
         Ok(agent) => agent,
@@ -286,6 +307,82 @@ mod tests {
     fn test_parse_providers_missing() {
         let json = serde_json::json!({"other": "value"});
         assert!(parse_providers(&json).is_none());
+    }
+
+    #[test]
+    fn test_apply_draft_provider_fields_overrides_and_clears() {
+        let mut cfg = crate::config::settings::GatewayConfig::default();
+        cfg.providers.insert(
+            "openai".to_string(),
+            std::collections::HashMap::from([
+                ("base_url".to_string(), "http://old/v1".to_string()),
+                ("model".to_string(), "old-model".to_string()),
+                ("api_key".to_string(), "old-key".to_string()),
+            ]),
+        );
+
+        apply_draft_provider_fields(
+            &mut cfg,
+            "openai",
+            &serde_json::json!({
+                "provider": "openai",
+                "base_url": "  http://draft/v1  ",
+                "model": "",
+                "api_key": "draft-key",
+                "ignored_number": 42
+            }),
+        );
+
+        let openai = cfg.providers.get("openai").expect("provider 应存在");
+        assert_eq!(
+            openai.get("base_url").map(String::as_str),
+            Some("http://draft/v1")
+        );
+        assert_eq!(openai.get("api_key").map(String::as_str), Some("draft-key"));
+        // 空串表示清空草稿字段，让验证走环境变量/默认值回退
+        assert!(openai.get("model").is_none());
+        // 非字符串字段被忽略
+        assert!(openai.get("ignored_number").is_none());
+        // provider 自身不会被写成配置 key
+        assert!(openai.get("provider").is_none());
+    }
+
+    #[test]
+    fn test_save_agent_settings_preserves_other_sections() {
+        use crate::test_util::run_with_temp_home;
+
+        run_with_temp_home(|_| {
+            let mut initial = AppConfig::default();
+            initial.xiaozhi.say_token = "keep-say".to_string();
+            initial.asr.active_provider = "qwen".to_string();
+            initial.tts.active_provider = "openai".to_string();
+            crate::config::settings::save_settings(&initial).expect("预置配置应写入");
+
+            let providers = HashMap::from([(
+                "openai".to_string(),
+                HashMap::from([
+                    ("base_url".to_string(), "http://example/v1".to_string()),
+                    ("model".to_string(), "example-model".to_string()),
+                ]),
+            )]);
+
+            let saved =
+                save_agent_settings("openai".to_string(), providers).expect("Agent 配置应保存成功");
+            assert_eq!(saved.gateway.active_provider, "openai");
+            // 其他 section 必须原样保留，不能被 Agent 的旧快照覆盖。
+            assert_eq!(saved.xiaozhi.say_token, "keep-say");
+            assert_eq!(saved.asr.active_provider, "qwen");
+            assert_eq!(saved.tts.active_provider, "openai");
+
+            let loaded = crate::config::settings::load_settings()
+                .unwrap()
+                .expect("settings.toml 应存在");
+            assert_eq!(loaded.gateway.active_provider, "openai");
+            assert_eq!(loaded.gateway.providers["openai"]["model"], "example-model");
+            assert_eq!(loaded.xiaozhi.say_token, "keep-say");
+            assert_eq!(loaded.asr.active_provider, "qwen");
+            assert_eq!(loaded.tts.active_provider, "openai");
+        });
     }
 
     // ─── 热切换原子性（回滚）测试 ─────────────────────────

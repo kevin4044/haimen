@@ -127,6 +127,12 @@ async fn handle_ws_connection(
         return;
     }
 
+    // 把「策略层会话号」映射到物理设备身份（`Device-Id` 头）。
+    // 策略据此查设备目录里的房间/名字，在交给 LLM 之前注入房间上下文。
+    session
+        .strategy
+        .on_device_identified(&session.session_id, &session.device_id);
+
     // ── 消息循环 ──
     loop {
         // 录音状态下，用 select! 竞争消息、VAD 完成信号和安全超时
@@ -1595,6 +1601,82 @@ mod tests {
             "断档恢复后的帧被突发连发（耗时仅 {:?}），会冲击设备 jitter buffer 导致语速压缩",
             resume_span,
         );
+    }
+
+    /// 记录设备身份的测试策略：只验证 HELLO 后钩子是否被调用、值是否正确。
+    struct DeviceIdStrategy {
+        seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl ResponseStrategy for DeviceIdStrategy {
+        fn name(&self) -> &'static str {
+            "device-id-probe"
+        }
+
+        async fn generate_response(
+            &self,
+            _audio_buffer: Vec<AudioFrame>,
+            _session_id: &str,
+        ) -> Result<Vec<AudioFrame>, String> {
+            Ok(Vec::new())
+        }
+
+        fn on_device_identified(&self, session_key: &str, device_id: &str) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((session_key.to_owned(), device_id.to_owned()));
+        }
+    }
+
+    /// WS 路径：HELLO 之后要把 `Device-Id` 头告诉策略，供房间上下文查询。
+    #[tokio::test]
+    async fn hello_reports_device_id_header_to_strategy() {
+        use crate::add_routes;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let strategy = Arc::new(DeviceIdStrategy { seen: seen.clone() });
+        let app = add_routes(axum::Router::new(), strategy);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定测试端口失败");
+        let addr = listener.local_addr().expect("获取测试端口失败");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("测试服务器启动失败");
+        });
+
+        let url = format!("ws://{}/xiaozhi/ws", addr);
+        let mut request = url.into_client_request().expect("构造 WS 请求");
+        request
+            .headers_mut()
+            .insert("device-id", "84:C7:BB:59:93:64".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("连接测试服务器失败");
+
+        let hello = r#"{"type":"hello","version":3,"transport":"websocket","audio_params":{"format":"opus","sample_rate":16000,"channels":1,"frame_duration":60},"features":{}}"#;
+        ws.send(TMessage::Text(hello.into()))
+            .await
+            .expect("发送 HELLO 失败");
+        let resp = ws.next().await.expect("读取 HELLO 响应失败").unwrap();
+        assert!(matches!(resp, TMessage::Text(_)), "应收到 HELLO 响应");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while seen.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "on_device_identified 没有被调用"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, "84:C7:BB:59:93:64");
+        assert!(!seen[0].0.is_empty(), "session_key 应是 WS 会话号");
     }
 
     /// `snap_send_clock`：时钟落后超过一帧时长才快进，正常抖动（< 一帧）不动作

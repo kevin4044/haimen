@@ -21,8 +21,14 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
 
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new ApiError(body.code || 'UNKNOWN', body.message || res.statusText, res.status);
+    const raw = await res.json().catch(() => ({}));
+    const body = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+    const message =
+      (typeof body.message === 'string' && body.message) ||
+      (typeof body.error === 'string' && body.error) ||
+      (typeof body.detail === 'string' && body.detail) ||
+      res.statusText;
+    throw new ApiError(typeof body.code === 'string' ? body.code : 'UNKNOWN', message, res.status);
   }
 
   return res.json() as Promise<T>;

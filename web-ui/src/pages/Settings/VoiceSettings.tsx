@@ -21,7 +21,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import VoiceSelector from '@/components/VoiceSelector';
 import { ASR_PROVIDERS } from '@/data/asr-providers';
 import { TTS_PROVIDERS } from '@/data/tts-providers';
-import type { TtsVoice } from '@/types';
+import type { AsrSettings, TtsSettings, TtsVoice } from '@/types';
 
 function PasswordInput({
   id,
@@ -58,6 +58,12 @@ function PasswordInput({
   );
 }
 
+/** 配置中缺少该字段、但后端已解析出回退值时的提示（不展示具体值） */
+function ResolvedHint({ show, value }: { show: boolean; value: string | null | undefined }) {
+  if (!show || !value) return null;
+  return <p className="text-xs text-muted-foreground">当前生效值来自环境变量/默认值</p>;
+}
+
 // ─── ASR 配置区域 ───────────────────────────────────────────
 
 function AsrSettingsPanel() {
@@ -72,15 +78,27 @@ function AsrSettingsPanel() {
   const [verifyResult, setVerifyResult] = useState<{ valid: boolean; message: string } | null>(
     null,
   );
+  const [resolved, setResolved] = useState<AsrSettings['resolved']>(undefined);
+  const [providerWarning, setProviderWarning] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const data = await getAsrSettings();
+      const active = data.active_provider ?? 'doubao';
+      const known = ASR_PROVIDERS.some((p) => p.id === active);
+      const fallback = ASR_PROVIDERS[0]?.id ?? 'doubao';
+      const fallbackName = ASR_PROVIDERS.find((p) => p.id === fallback)?.name ?? fallback;
       setEditState(data.providers ?? {});
-      setActiveProvider(data.active_provider ?? 'doubao');
-      setSelectedTab(data.active_provider ?? 'doubao');
+      setResolved(data.resolved);
+      setActiveProvider(active);
+      setSelectedTab(known ? active : fallback);
+      setProviderWarning(
+        known
+          ? null
+          : `当前激活服务商「${active}」不在支持列表中，已切换到「${fallbackName}」标签页，请重新选择后再保存。`,
+      );
       setLoading(false);
     } catch {
       setError('加载 ASR 配置失败');
@@ -107,6 +125,7 @@ function AsrSettingsPanel() {
     try {
       const data = await getAsrSettings();
       setEditState(data.providers ?? {});
+      setResolved(data.resolved);
       setActiveProvider(data.active_provider ?? 'doubao');
     } catch {
       // 静默失败
@@ -139,6 +158,7 @@ function AsrSettingsPanel() {
         providers: editState,
       });
       setActiveProvider(selectedTab);
+      setProviderWarning(null);
       setSaveResult('已切换激活服务商');
       await reloadAsrData();
     } catch {
@@ -196,12 +216,20 @@ function AsrSettingsPanel() {
     );
   }
 
+  const resolvedMap = resolved as Record<string, string | null> | undefined;
+
   return (
     <Card>
       <CardHeader className="pb-3">
         <CardTitle className="flex items-center gap-2 text-base">ASR 语音识别</CardTitle>
       </CardHeader>
       <CardContent>
+        {providerWarning && (
+          <Alert className="mb-4">
+            <AlertTitle>激活服务商不可用</AlertTitle>
+            <AlertDescription>{providerWarning}</AlertDescription>
+          </Alert>
+        )}
         <Tabs value={selectedTab} onValueChange={setSelectedTab} className="w-full">
           {/* Tab 栏 */}
           <TabsList>
@@ -242,11 +270,32 @@ function AsrSettingsPanel() {
               {p.fields.map((field) => (
                 <div key={field.key} className="space-y-2">
                   <span className="text-sm font-medium">{field.label}</span>
-                  <PasswordInput
-                    id={`asr-${p.id}-${field.key}`}
-                    placeholder={field.placeholder ?? `输入${field.label}`}
-                    value={editState[p.id]?.[field.key] ?? ''}
-                    onChange={(v) => handleFieldChange(field.key, v)}
+                  {field.type === 'select' && field.options ? (
+                    <Combobox
+                      options={field.options.map((opt) => ({ value: opt, label: opt }))}
+                      value={editState[p.id]?.[field.key] ?? null}
+                      onChange={(v) => handleFieldChange(field.key, v)}
+                      placeholder={field.placeholder ?? '请选择...'}
+                    />
+                  ) : field.type === 'number' || field.type === 'text' ? (
+                    <Input
+                      id={`asr-${p.id}-${field.key}`}
+                      type={field.type}
+                      placeholder={field.placeholder ?? `输入${field.label}`}
+                      value={editState[p.id]?.[field.key] ?? ''}
+                      onChange={(e) => handleFieldChange(field.key, e.target.value)}
+                    />
+                  ) : (
+                    <PasswordInput
+                      id={`asr-${p.id}-${field.key}`}
+                      placeholder={field.placeholder ?? `输入${field.label}`}
+                      value={editState[p.id]?.[field.key] ?? ''}
+                      onChange={(v) => handleFieldChange(field.key, v)}
+                    />
+                  )}
+                  <ResolvedHint
+                    show={!editState[p.id]?.[field.key] && p.id === activeProvider}
+                    value={resolvedMap?.[field.key]}
                   />
                 </div>
               ))}
@@ -308,6 +357,10 @@ function TtsSettingsPanel() {
   const [wakeGreeting, setWakeGreeting] = useState('');
   const [noSpeechGoodbye, setNoSpeechGoodbye] = useState('');
   const [noSpeechTimeoutSecs, setNoSpeechTimeoutSecs] = useState(10);
+  const [thinkingFeedbackEnabled, setThinkingFeedbackEnabled] = useState(true);
+  const [thinkingFeedbackIntervalSecs, setThinkingFeedbackIntervalSecs] = useState(15);
+  const [thinkingFeedbackText, setThinkingFeedbackText] = useState('');
+  const [thinkingFeedbackTimeoutText, setThinkingFeedbackTimeoutText] = useState('');
   const [activeProvider, setActiveProvider] = useState('doubao');
   const [selectedTab, setSelectedTab] = useState('doubao');
   const [voices, setVoices] = useState<TtsVoice[]>([]);
@@ -317,12 +370,18 @@ function TtsSettingsPanel() {
   const [verifyResult, setVerifyResult] = useState<{ valid: boolean; message: string } | null>(
     null,
   );
+  const [resolved, setResolved] = useState<TtsSettings['resolved']>(undefined);
+  const [providerWarning, setProviderWarning] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const data = await getTtsSettings();
+      const active = data.active_provider ?? 'doubao';
+      const known = TTS_PROVIDERS.some((p) => p.id === active);
+      const fallback = TTS_PROVIDERS[0]?.id ?? 'doubao';
+      const fallbackName = TTS_PROVIDERS.find((p) => p.id === fallback)?.name ?? fallback;
       setEditState(data.providers ?? {});
       setFixedTextEnabled(data.fixed_text_enabled ?? false);
       setFixedText(data.fixed_text ?? '');
@@ -330,8 +389,18 @@ function TtsSettingsPanel() {
       setWakeGreeting(data.wake_greeting ?? '');
       setNoSpeechGoodbye(data.no_speech_goodbye ?? '');
       setNoSpeechTimeoutSecs((data.no_speech_timeout_ms ?? 10000) / 1000);
-      setActiveProvider(data.active_provider ?? 'doubao');
-      setSelectedTab(data.active_provider ?? 'doubao');
+      setThinkingFeedbackEnabled(data.thinking_feedback_enabled ?? true);
+      setThinkingFeedbackIntervalSecs((data.thinking_feedback_interval_ms ?? 15000) / 1000);
+      setThinkingFeedbackText(data.thinking_feedback_text ?? '');
+      setThinkingFeedbackTimeoutText(data.thinking_feedback_timeout_text ?? '');
+      setResolved(data.resolved);
+      setActiveProvider(active);
+      setSelectedTab(known ? active : fallback);
+      setProviderWarning(
+        known
+          ? null
+          : `当前激活服务商「${active}」不在支持列表中，已切换到「${fallbackName}」标签页，请重新选择后再保存。`,
+      );
       // 音色列表由下方 effect（依赖 selectedTab / currentModel）加载
     } catch {
       setError('加载 TTS 配置失败');
@@ -349,6 +418,9 @@ function TtsSettingsPanel() {
   // 选择音色时自动设置对应的 resource_id，无需用户手动切换模型。
   useEffect(() => {
     let cancelled = false;
+    // 先清空，避免切换 Tab 时短暂沿用上一个提供商的音色列表
+    //（如 openai 没有音色列表，不能复用豆包的选择器）。
+    setVoices([]);
     listTtsVoices(selectedTab)
       .then((list) => {
         if (cancelled) return;
@@ -375,6 +447,7 @@ function TtsSettingsPanel() {
     try {
       const data = await getTtsSettings();
       setEditState(data.providers ?? {});
+      setResolved(data.resolved);
       setActiveProvider(data.active_provider ?? 'doubao');
     } catch {
       // 静默失败，保持已有状态
@@ -393,6 +466,10 @@ function TtsSettingsPanel() {
         wake_greeting: wakeGreeting || null,
         no_speech_goodbye: noSpeechGoodbye || null,
         no_speech_timeout_ms: noSpeechTimeoutSecs * 1000,
+        thinking_feedback_enabled: thinkingFeedbackEnabled,
+        thinking_feedback_interval_ms: Math.round(thinkingFeedbackIntervalSecs * 1000),
+        thinking_feedback_text: thinkingFeedbackText || null,
+        thinking_feedback_timeout_text: thinkingFeedbackTimeoutText || null,
       });
       setSaveResult('保存成功');
       setVerifyResult(null);
@@ -417,8 +494,13 @@ function TtsSettingsPanel() {
         wake_greeting: wakeGreeting || null,
         no_speech_goodbye: noSpeechGoodbye || null,
         no_speech_timeout_ms: noSpeechTimeoutSecs * 1000,
+        thinking_feedback_enabled: thinkingFeedbackEnabled,
+        thinking_feedback_interval_ms: Math.round(thinkingFeedbackIntervalSecs * 1000),
+        thinking_feedback_text: thinkingFeedbackText || null,
+        thinking_feedback_timeout_text: thinkingFeedbackTimeoutText || null,
       });
       setActiveProvider(selectedTab);
+      setProviderWarning(null);
       setSaveResult('已切换激活服务商');
       await reloadData();
     } catch {
@@ -476,12 +558,20 @@ function TtsSettingsPanel() {
     );
   }
 
+  const resolvedMap = resolved as Record<string, string | null> | undefined;
+
   return (
     <Card>
       <CardHeader className="pb-3">
         <CardTitle className="flex items-center gap-2 text-base">TTS 语音合成</CardTitle>
       </CardHeader>
       <CardContent>
+        {providerWarning && (
+          <Alert className="mb-4">
+            <AlertTitle>激活服务商不可用</AlertTitle>
+            <AlertDescription>{providerWarning}</AlertDescription>
+          </Alert>
+        )}
         <Tabs value={selectedTab} onValueChange={setSelectedTab} className="w-full">
           {/* Tab 栏 */}
           <TabsList>
@@ -537,6 +627,17 @@ function TtsSettingsPanel() {
                       value={editState[p.id]?.[field.key] ?? ''}
                       onChange={(e) => handleFieldChange(field.key, e.target.value)}
                     />
+                  ) : field.type === 'number' ? (
+                    <Input
+                      id={`tts-${p.id}-${field.key}`}
+                      type="number"
+                      min={field.min}
+                      max={field.max}
+                      step={field.step}
+                      placeholder={field.placeholder ?? `输入${field.label}`}
+                      value={editState[p.id]?.[field.key] ?? ''}
+                      onChange={(e) => handleFieldChange(field.key, e.target.value)}
+                    />
                   ) : (
                     <PasswordInput
                       id={`tts-${p.id}-${field.key}`}
@@ -545,6 +646,10 @@ function TtsSettingsPanel() {
                       onChange={(v) => handleFieldChange(field.key, v)}
                     />
                   )}
+                  <ResolvedHint
+                    show={!editState[p.id]?.[field.key] && p.id === activeProvider}
+                    value={resolvedMap?.[field.key]}
+                  />
                 </div>
               ))}
 
@@ -554,20 +659,34 @@ function TtsSettingsPanel() {
                   <span className="text-sm font-medium" id="tts-voice-label">
                     TTS 音色
                   </span>
-                  <div>
-                    <VoiceSelector
-                      voices={voices}
-                      selectedVoice={editState[p.id]?.voice ?? null}
-                      onChange={(voiceId) => {
-                        handleFieldChange('voice', voiceId);
-                        // 音色决定模型：选择音色时自动把 resource_id 设为该音色所属模型
-                        const voice = voices.find((v) => v.id === voiceId);
-                        if (voice?.model) {
-                          handleFieldChange('resource_id', voice.model);
-                        }
-                      }}
-                    />
+                  <div className="flex items-start gap-2">
+                    <div className="flex-1">
+                      <VoiceSelector
+                        voices={voices}
+                        selectedVoice={editState[p.id]?.voice ?? null}
+                        onChange={(voiceId) => {
+                          handleFieldChange('voice', voiceId);
+                          // 音色决定模型：选择音色时自动把 resource_id 设为该音色所属模型
+                          const voice = voices.find((v) => v.id === voiceId);
+                          if (voice?.model) {
+                            handleFieldChange('resource_id', voice.model);
+                          }
+                        }}
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleFieldChange('voice', '')}
+                    >
+                      使用默认音色
+                    </Button>
                   </div>
+                  <ResolvedHint
+                    show={!editState[p.id]?.voice && p.id === activeProvider}
+                    value={resolved?.voice}
+                  />
                 </div>
               )}
 
@@ -676,6 +795,56 @@ function TtsSettingsPanel() {
               />
               <span className="text-sm text-muted-foreground">秒无语音后触发（0 禁用）</span>
             </div>
+          </div>
+        </div>
+
+        {/* ── 处理进度提示 ── */}
+        <div className="mt-6 rounded-lg border p-4 space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <span className="text-sm font-medium">处理进度提示</span>
+              <p className="text-xs text-muted-foreground">
+                等待 Agent 首个可播文本期间按间隔播报提示语；间隔为 0 时仅在等待超时后兜底播报
+              </p>
+            </div>
+            <Switch
+              checked={thinkingFeedbackEnabled}
+              onCheckedChange={setThinkingFeedbackEnabled}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <span className="text-sm font-medium">提示间隔（秒）</span>
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                placeholder="15"
+                value={thinkingFeedbackIntervalSecs}
+                onChange={(e) => setThinkingFeedbackIntervalSecs(Number(e.target.value) || 0)}
+                className="w-28"
+              />
+              <span className="text-xs text-muted-foreground">0 表示仅在等待超时后兜底提示</span>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <span className="text-sm font-medium">周期提示文案</span>
+            <Input
+              placeholder="等待时的周期提示，留空用默认"
+              value={thinkingFeedbackText}
+              onChange={(e) => setThinkingFeedbackText(e.target.value)}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <span className="text-sm font-medium">超时兜底文案</span>
+            <Input
+              placeholder="超时兜底文案，留空用默认"
+              value={thinkingFeedbackTimeoutText}
+              onChange={(e) => setThinkingFeedbackTimeoutText(e.target.value)}
+            />
           </div>
         </div>
       </CardContent>

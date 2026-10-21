@@ -431,6 +431,11 @@ pub async fn run(cli: Cli) -> Result<(), String> {
                 .flatten()
                 .unwrap_or_default();
 
+            // 安装设备目录（设备身份 → 名字/房间）。必须在构建策略、启动 MQTT
+            // 传输层之前：策略收到第一句语音时就要能查到房间，notify 也要能按
+            // 房间/设备名寻址。目录为空时行为与旧版本完全一致。
+            haimen_xiaozhi::devices::install_devices_from_config(&settings.xiaozhi.devices);
+
             // 构建共享 Agent 句柄（webhook / xiaozhi / Web API 共用，支持运行时热切换）
             let serve_agent = crate::gateway::agent_handle::build_shared_agent(
                 &settings,

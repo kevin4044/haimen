@@ -6,7 +6,7 @@ export interface ProviderField {
   key: string;
   /** 界面显示名 */
   label: string;
-  /** 输入控件类型（当前 Agent 仅用 text） */
+  /** 输入控件类型 */
   type: 'password' | 'text' | 'select';
   placeholder?: string;
   options?: string[];
@@ -45,6 +45,13 @@ export const AGENT_PROVIDERS: ProviderInfo[] = [
         type: 'text',
         placeholder: '留空使用 PATH 查找 codex',
       },
+      {
+        key: 'sandbox',
+        label: '沙箱策略',
+        type: 'select',
+        placeholder: 'danger-full-access',
+        options: ['danger-full-access', 'workspace-write', 'read-only'],
+      },
     ],
   },
   {
@@ -57,6 +64,12 @@ export const AGENT_PROVIDERS: ProviderInfo[] = [
         type: 'text',
         placeholder: '留空使用 PATH 查找 openclaw',
       },
+      {
+        key: 'agent',
+        label: 'Agent ID',
+        type: 'text',
+        placeholder: 'main',
+      },
     ],
   },
   {
@@ -68,6 +81,30 @@ export const AGENT_PROVIDERS: ProviderInfo[] = [
         label: 'CLI 路径',
         type: 'text',
         placeholder: '留空使用 PATH 查找 hermes',
+      },
+    ],
+  },
+  {
+    id: 'openai',
+    name: 'OpenAI 兼容',
+    fields: [
+      {
+        key: 'base_url',
+        label: 'Base URL',
+        type: 'text',
+        placeholder: 'http://127.0.0.1:8642/v1',
+      },
+      {
+        key: 'model',
+        label: '模型',
+        type: 'text',
+        placeholder: '例如 qwen2.5:7b',
+      },
+      {
+        key: 'api_key',
+        label: 'API Key',
+        type: 'password',
+        placeholder: '留空则不发送 Authorization',
       },
     ],
   },

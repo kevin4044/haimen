@@ -5,6 +5,7 @@ import {
   updateAgentSettings,
   verifyAgentCredentials,
 } from '@/api/agent';
+import Combobox from '@/components/Combobox';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -124,9 +125,9 @@ function AgentSettingsPanel() {
   const handleVerify = async () => {
     setVerifying(true);
     try {
-      // 携带草稿 cli_path（未保存也能先验证路径是否正确）
-      const draftCliPath = editState[selectedTab]?.cli_path;
-      const result = await verifyAgentCredentials(selectedTab, draftCliPath);
+      // 携带当前 Tab 的全部草稿字段：CLI Agent 验证 cli_path，
+      // OpenAI 兼容 Agent 验证 base_url/model/api_key，均无需先保存。
+      const result = await verifyAgentCredentials(selectedTab, editState[selectedTab] ?? {});
       setVerifyResult(result);
     } catch {
       setVerifyResult({ valid: false, message: '网络请求失败' });
@@ -209,17 +210,26 @@ function AgentSettingsPanel() {
                 )}
               </div>
 
-              {/* 可配置字段（如 CLI 路径） */}
+              {/* 可配置字段：CLI 路径、沙箱策略、OpenAI base_url/model/api_key 等 */}
               {p.fields.map((field) => (
                 <div key={field.key} className="space-y-2">
                   <span className="text-sm font-medium">{field.label}</span>
-                  <Input
-                    id={`agent-${p.id}-${field.key}`}
-                    type="text"
-                    placeholder={field.placeholder ?? `输入${field.label}`}
-                    value={editState[p.id]?.[field.key] ?? ''}
-                    onChange={(e) => handleFieldChange(field.key, e.target.value)}
-                  />
+                  {field.type === 'select' && field.options ? (
+                    <Combobox
+                      options={field.options.map((option) => ({ value: option, label: option }))}
+                      value={editState[p.id]?.[field.key] ?? null}
+                      onChange={(value) => handleFieldChange(field.key, value)}
+                      placeholder={field.placeholder ?? '请选择...'}
+                    />
+                  ) : (
+                    <Input
+                      id={`agent-${p.id}-${field.key}`}
+                      type={field.type === 'password' ? 'password' : 'text'}
+                      placeholder={field.placeholder ?? `输入${field.label}`}
+                      value={editState[p.id]?.[field.key] ?? ''}
+                      onChange={(e) => handleFieldChange(field.key, e.target.value)}
+                    />
+                  )}
                 </div>
               ))}
 

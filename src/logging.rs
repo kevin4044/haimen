@@ -22,7 +22,7 @@ use tracing_subscriber::{EnvFilter, Registry, fmt};
 ///
 /// 使用 `try_init()` 而非 `init()`，以便在测试中多次调用不会 panic。
 pub fn init_logging(terminal_level: Option<&str>) {
-    let log_path = get_log_path();
+    let log_path = log_file_path();
 
     // 确保日志目录存在
     if let Some(parent) = log_path.parent() {
@@ -97,8 +97,11 @@ fn make_file_writer(log_path: PathBuf) -> impl Fn() -> Box<dyn io::Write> {
     }
 }
 
-/// 获取日志文件路径
-fn get_log_path() -> PathBuf {
+/// 获取日志文件路径（`~/.haimen/logs/app.log`）
+///
+/// Web 端实时日志流需要和文件日志层指向同一个文件，因此公开此路径。
+/// 路径只表示位置，不保证文件已存在：日志层在首次写入时创建它。
+pub fn log_file_path() -> PathBuf {
     get_log_dir().join("app.log")
 }
 
@@ -116,7 +119,7 @@ mod tests {
     #[test]
     fn test_log_path_uses_project_dir() {
         run_with_temp_home(|_home| {
-            let log_path = get_log_path();
+            let log_path = log_file_path();
             assert!(log_path.starts_with(_home.join(".haimen/logs")));
             assert_eq!(
                 log_path.file_name().unwrap(),

@@ -582,6 +582,11 @@ struct SessionAsrState {
     end_of_conversation: Arc<AtomicBool>,
     /// Silero VAD（有状态，按会话隔离）；初始化失败时为 None，回退能量阈值。
     silero: Option<SileroVad>,
+    /// 本会话对应的物理设备 MAC（由传输层 `on_device_identified` 写入）。
+    ///
+    /// MQTT 路径的会话键本身就是 client_id，但 WS 路径的会话键是每次连接
+    /// 新生成的会话号；统一存一份 MAC，房间上下文查询就不用区分传输层了。
+    device_id: Option<String>,
 }
 
 impl SessionAsrState {
@@ -596,6 +601,7 @@ impl SessionAsrState {
             asr_received_text: Arc::new(AtomicBool::new(false)),
             end_of_conversation: Arc::new(AtomicBool::new(false)),
             silero: SileroVad::new(),
+            device_id: None,
         }
     }
 }
@@ -1409,6 +1415,45 @@ impl AsrLlmTtsStrategy {
         Ok(Some(text))
     }
 
+    /// 给用户文本加上「当前设备所在房间」的上下文前缀。
+    ///
+    /// 多台小智分房间部署时，LLM 必须知道这句话是从哪个房间说的：
+    /// 用户问「灯关了吗」时，客厅和卧室的答案可能完全不同。
+    ///
+    /// - 房间上下文来自 `[xiaozhi.devices]` 设备目录（按 MAC/名字/房间配置）；
+    /// - 未配置设备或未填 `room` → 原样返回，不产生任何额外 token；
+    /// - **只影响送给 LLM 的输入**：设备屏幕上的 ASR 文本、agent 日志里的
+    ///   `input` 都记录原始识别文本，排查时不会被前缀干扰。
+    ///
+    /// 前缀每轮都加（约一行、十几个 token）：LLM 会话历史可能被 Agent 侧压缩
+    /// 或换代清空，只在首轮注入会丢；每轮注入保证「永远知道」。
+    fn contextualize_user_text(&self, session_id: &str, user_text: &str) -> String {
+        let Some(directory) = haimen_xiaozhi::devices::device_directory() else {
+            return user_text.to_string();
+        };
+
+        let device_id = self
+            .read_session(session_id, |state| {
+                state.and_then(|state| state.device_id.clone())
+            })
+            .ok()
+            .flatten()
+            // 老路径兜底：MQTT 的会话键本身就是 client_id，可直接从里面取 MAC。
+            .unwrap_or_else(|| haimen_xiaozhi::devices::device_id_from_client_id(session_id));
+
+        match directory.context_for_client(&device_id) {
+            Some(prefix) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    device_id = %device_id,
+                    "已注入设备房间上下文"
+                );
+                format!("{prefix}{user_text}")
+            }
+            None => user_text.to_string(),
+        }
+    }
+
     /// 初始化流式 ASR 管道（惰性创建）
     ///
     /// 创建 mpsc channel + Doubao ASR 实例 + Opus 解码器，
@@ -1938,6 +1983,20 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
         Ok(())
     }
 
+    /// 传输层识别出物理设备身份（归一化 MAC）后调用一次。
+    ///
+    /// 存进会话状态，后续 [`Self::contextualize_user_text`] 用它查设备目录里的
+    /// 房间并注入 LLM 输入。MQTT 会话键本身就是 client_id，但 WS 会话键是
+    /// 每次连接新生成的会话号，必须靠这个钩子把两者关联起来。
+    fn on_device_identified(&self, session_key: &str, device_id: &str) {
+        let device_id = haimen_xiaozhi::devices::normalize_device_id(device_id);
+        if let Err(err) = self.with_session(session_key, |state| {
+            state.device_id = Some(device_id);
+        }) {
+            tracing::warn!(%session_key, %err, "记录设备身份失败，房间上下文可能缺失");
+        }
+    }
+
     /// 每收到一帧 Opus 数据时，实时解码并喂入 ASR 管道
     ///
     /// 如果 ASR 管道尚未初始化（惰性），第一帧音频到达时会自动创建。
@@ -2132,6 +2191,9 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             }
         };
 
+        // 送给 LLM 的输入带房间上下文；设备屏幕（Stt 事件）和日志仍用原始识别文本。
+        let agent_input = self.contextualize_user_text(session_id, &user_text);
+
         tracing::info!(
             session_id = %session_id,
             text_len = user_text.len(),
@@ -2215,7 +2277,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 let (text_stream_inner, new_llm_session_id, events_rx) = match tokio::time::timeout(
                     AGENT_CONNECT_TIMEOUT,
                     agent_snap.agent.process_stream(
-                        &user_text,
+                        &agent_input,
                         current_llm_session.as_deref(),
                         &self.work_dir,
                     ),
@@ -2775,6 +2837,9 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             }
         };
 
+        // 送给 LLM 的输入带房间上下文；日志仍用原始识别文本。
+        let agent_input = self.contextualize_user_text(session_id, &user_text);
+
         // ════════════════════════════════════════════════════════════════
         // Phase 2: 生成回复文本（AI Agent 或固定文本）
         // ════════════════════════════════════════════════════════════════
@@ -2820,7 +2885,7 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
             let llm_response = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
                 agent_snap.agent.process(
-                    &user_text,
+                    &agent_input,
                     current_llm_session.as_deref(),
                     &self.work_dir,
                 ),
@@ -3953,6 +4018,61 @@ mod tests {
             shared,
             "/tmp".to_string(),
         )
+    }
+
+    /// 房间上下文只注入给配置了房间的设备，且只影响送给 LLM 的输入。
+    ///
+    /// 所有断言放在同一个用例里：设备目录是进程级全局槽，拆成多个用例并行跑
+    /// 会互相覆盖（CI 虽然单线程，但本地默认是多线程）。
+    #[test]
+    fn room_context_injection_follows_device_directory() {
+        // 设备目录与 HOME 都是进程级全局态：与 web::api::xiaozhi_devices 的
+        // 配置测试共用同一把锁，避免并行执行时被对方的 reset 清空。
+        let _guard = crate::test_util::acquire_home_lock();
+        let strategy = make_strategy(Arc::new(MockAgent));
+        haimen_xiaozhi::devices::install_devices_from_config(&[
+            haimen_xiaozhi::XiaozhiDeviceConfig {
+                device_id: "84:c7:bb:59:93:64".to_string(),
+                name: "客厅小智".to_string(),
+                room: "客厅".to_string(),
+            },
+            haimen_xiaozhi::XiaozhiDeviceConfig {
+                device_id: "aa:bb:cc:dd:ee:ff".to_string(),
+                name: "书房小智".to_string(),
+                room: String::new(),
+            },
+        ]);
+
+        // 1) 传输层显式告知设备身份（MQTT/WS 的正常路径）
+        strategy.on_device_identified("session-a", "84:c7:bb:59:93:64");
+        let input = strategy.contextualize_user_text("session-a", "客厅的灯关了吗");
+        assert!(input.contains("客厅"), "{input}");
+        assert!(input.contains("客厅小智"), "{input}");
+        assert!(
+            input.ends_with("客厅的灯关了吗"),
+            "原始用户文本必须保留在末尾：{input}"
+        );
+
+        // 2) 没走钩子时按 client_id 里的 MAC 兜底（老路径/重放日志也能工作）
+        let input = strategy
+            .contextualize_user_text("GID_haimen@@@84_c7_bb_59_93_64@@@84_c7_bb_59_93_64", "你好");
+        assert!(input.contains("客厅"), "{input}");
+
+        // 3) 未配置房间 → 一字不加，避免给 LLM 无意义噪音
+        strategy.on_device_identified("session-b", "aa:bb:cc:dd:ee:ff");
+        assert_eq!(
+            strategy.contextualize_user_text("session-b", "你好"),
+            "你好"
+        );
+
+        // 4) 未配置设备 → 一字不加
+        assert_eq!(
+            strategy.contextualize_user_text("unknown-session", "你好"),
+            "你好"
+        );
+
+        // 清理全局槽，避免影响同进程其它用例
+        haimen_xiaozhi::devices::install_devices_from_config(&[]);
     }
 
     /// 长期不用的会话状态必须被回收，否则 WS 每次重连换 session_id

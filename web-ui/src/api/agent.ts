@@ -46,13 +46,13 @@ export async function updateAgentSettings(settings: {
 
 export async function verifyAgentCredentials(
   provider: string,
-  cliPath?: string,
+  fields: Record<string, string> = {},
 ): Promise<{ valid: boolean; message: string }> {
   const res = await apiFetch<ApiResponse<{ valid: boolean; message: string }>>(
     '/api/v1/settings/agent/verify',
     {
       method: 'POST',
-      body: JSON.stringify({ provider, cli_path: cliPath ?? '' }),
+      body: JSON.stringify({ provider, ...fields }),
     },
   );
   return ensureData(res);

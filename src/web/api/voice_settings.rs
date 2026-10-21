@@ -23,28 +23,11 @@ use axum::{Json, extract::Query, extract::State, http::StatusCode};
 use crate::config::settings::AppConfig;
 use crate::config::settings::AsrConfig;
 use crate::config::settings::TtsConfig;
+use crate::web::api::common::{SettingsUpdateError, parse_providers, update_settings};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 工具函数
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// 从请求 JSON 中读取 providers 映射
-fn parse_providers(value: &serde_json::Value) -> Option<HashMap<String, HashMap<String, String>>> {
-    let obj = value.get("providers")?.as_object()?;
-    let mut providers = HashMap::new();
-    for (name, fields) in obj {
-        if let Some(fields_obj) = fields.as_object() {
-            let mut creds = HashMap::new();
-            for (k, v) in fields_obj {
-                if let Some(s) = v.as_str().filter(|s| !s.is_empty()) {
-                    creds.insert(k.clone(), s.to_string());
-                }
-            }
-            providers.insert(name.clone(), creds);
-        }
-    }
-    Some(providers)
-}
 
 /// 加载当前配置（文件不存在时返回默认值）
 fn load_config() -> AppConfig {
@@ -52,6 +35,129 @@ fn load_config() -> AppConfig {
         .ok()
         .flatten()
         .unwrap_or_default()
+}
+
+/// 把共享设置写操作的错误映射成 HTTP 响应。
+fn settings_update_error(e: SettingsUpdateError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = e.status();
+    let message = e.message();
+    (
+        status,
+        Json(serde_json::json!({
+            "success": false,
+            "error": message,
+            "message": message,
+        })),
+    )
+}
+
+/// ASR 配置的 JSON 形态（GET 与 PUT 共用）。
+fn asr_settings_json(cfg: &AsrConfig) -> serde_json::Value {
+    serde_json::json!({
+        "active_provider": cfg.active_provider,
+        "providers": cfg.providers,
+        "resolved": {
+            "api_key": cfg.resolved_api_key().ok(),
+        }
+    })
+}
+
+/// TTS 配置的 JSON 形态（GET 与 PUT 共用）。
+///
+/// PUT 之前只回 active_provider/providers，导致前端保存后刷新前无法拿到
+/// fixed_text/greeting/thinking 的最新值；这里统一返回完整配置。
+fn tts_settings_json(cfg: &TtsConfig) -> serde_json::Value {
+    serde_json::json!({
+        "active_provider": cfg.active_provider,
+        "providers": cfg.providers,
+        "fixed_text_enabled": cfg.fixed_text_enabled,
+        "fixed_text": cfg.fixed_text,
+        "wake_greeting_enabled": cfg.wake_greeting_enabled,
+        "wake_greeting": cfg.wake_greeting,
+        "no_speech_goodbye": cfg.no_speech_goodbye,
+        "no_speech_timeout_ms": cfg.no_speech_timeout_ms,
+        "thinking_feedback_enabled": cfg.thinking_feedback_enabled,
+        "thinking_feedback_interval_ms": cfg.thinking_feedback_interval_ms,
+        "thinking_feedback_text": cfg.thinking_feedback_text,
+        "thinking_feedback_timeout_text": cfg.thinking_feedback_timeout_text,
+        "resolved": {
+            "api_key": cfg.resolved_api_key().ok(),
+            "voice": Some(cfg.resolved_voice()),
+        }
+    })
+}
+
+/// 把 PUT 请求体应用到 TTS 配置（纯内存修改，不写盘）。
+fn apply_tts_update(cfg: &mut TtsConfig, body: &serde_json::Value) {
+    if let Some(active) = body.get("active_provider").and_then(|v| v.as_str()) {
+        if !active.is_empty() {
+            cfg.active_provider = active.to_string();
+        }
+    }
+
+    if let Some(providers) = parse_providers(body) {
+        cfg.providers = providers;
+    }
+
+    if let Some(enabled) = body.get("fixed_text_enabled").and_then(|v| v.as_bool()) {
+        cfg.fixed_text_enabled = enabled;
+    }
+    if body.get("fixed_text").is_some() {
+        let text = body
+            .get("fixed_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.fixed_text = (!text.is_empty()).then(|| text.to_string());
+    }
+
+    if let Some(enabled) = body.get("wake_greeting_enabled").and_then(|v| v.as_bool()) {
+        cfg.wake_greeting_enabled = enabled;
+    }
+    if body.get("wake_greeting").is_some() {
+        let text = body
+            .get("wake_greeting")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.wake_greeting = (!text.is_empty()).then(|| text.to_string());
+    }
+
+    if body.get("no_speech_goodbye").is_some() {
+        let text = body
+            .get("no_speech_goodbye")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.no_speech_goodbye = (!text.is_empty()).then(|| text.to_string());
+    }
+    if let Some(ms) = body.get("no_speech_timeout_ms").and_then(|v| v.as_u64()) {
+        cfg.no_speech_timeout_ms = ms;
+    }
+
+    if let Some(enabled) = body
+        .get("thinking_feedback_enabled")
+        .and_then(|v| v.as_bool())
+    {
+        cfg.thinking_feedback_enabled = enabled;
+    }
+    if let Some(ms) = body
+        .get("thinking_feedback_interval_ms")
+        .and_then(|v| v.as_u64())
+    {
+        cfg.thinking_feedback_interval_ms = ms;
+    }
+    if body.get("thinking_feedback_text").is_some() {
+        let text = body
+            .get("thinking_feedback_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.thinking_feedback_text = (!text.is_empty()).then(|| text.to_string());
+    }
+    if body.get("thinking_feedback_timeout_text").is_some() {
+        let text = body
+            .get("thinking_feedback_timeout_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cfg.thinking_feedback_timeout_text = (!text.is_empty()).then(|| text.to_string());
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -87,13 +193,7 @@ pub async fn get_asr_settings() -> Json<serde_json::Value> {
     let cfg = load_config();
     Json(serde_json::json!({
         "success": true,
-        "data": {
-            "active_provider": cfg.asr.active_provider,
-            "providers": cfg.asr.providers,
-            "resolved": {
-                "api_key": cfg.asr.resolved_api_key().ok(),
-            }
-        }
+        "data": asr_settings_json(&cfg.asr),
     }))
 }
 
@@ -108,40 +208,30 @@ pub async fn update_asr_settings(
     State(asr_config): State<Arc<RwLock<AsrConfig>>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let mut cfg = load_config();
-
-    // 更新 active_provider（如果提供）
-    if let Some(active) = body.get("active_provider").and_then(|v| v.as_str()) {
-        if !active.is_empty() {
-            cfg.asr.active_provider = active.to_string();
+    let (cfg, _) = update_settings(|cfg| {
+        if let Some(active) = body.get("active_provider").and_then(|v| v.as_str()) {
+            if !active.is_empty() {
+                cfg.asr.active_provider = active.to_string();
+            }
         }
-    }
 
-    // 更新 providers（如果提供）
-    if let Some(providers) = parse_providers(&body) {
-        cfg.asr.providers = providers;
-    }
+        // 空串会删除对应 key，运行时回退环境变量/默认值。
+        if let Some(providers) = parse_providers(&body) {
+            cfg.asr.providers = providers;
+        }
 
-    if let Err(e) = crate::config::settings::save_settings(&cfg) {
-        tracing::warn!(error = %e, "保存 ASR 配置到文件失败");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": format!("保存配置失败: {}", e)
-            })),
-        ));
-    }
+        Ok(false)
+    })
+    .map_err(settings_update_error)?;
 
     // 热加载：更新共享内存中的 ASR 配置，下次 ASR 调用立即生效
     *asr_config.write().unwrap() = cfg.asr.clone();
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "data": {
-            "active_provider": cfg.asr.active_provider,
-            "providers": cfg.asr.providers,
-        }
+        "data": asr_settings_json(&cfg.asr),
+        "restart_required": false,
+        "message": "已保存",
     })))
 }
 
@@ -349,24 +439,7 @@ pub async fn get_tts_settings() -> Json<serde_json::Value> {
     let cfg = load_config();
     Json(serde_json::json!({
         "success": true,
-        "data": {
-            "active_provider": cfg.tts.active_provider,
-            "providers": cfg.tts.providers,
-            "fixed_text_enabled": cfg.tts.fixed_text_enabled,
-            "fixed_text": cfg.tts.fixed_text,
-            "wake_greeting_enabled": cfg.tts.wake_greeting_enabled,
-            "wake_greeting": cfg.tts.wake_greeting,
-            "no_speech_goodbye": cfg.tts.no_speech_goodbye,
-            "no_speech_timeout_ms": cfg.tts.no_speech_timeout_ms,
-            "thinking_feedback_enabled": cfg.tts.thinking_feedback_enabled,
-            "thinking_feedback_interval_ms": cfg.tts.thinking_feedback_interval_ms,
-            "thinking_feedback_text": cfg.tts.thinking_feedback_text,
-            "thinking_feedback_timeout_text": cfg.tts.thinking_feedback_timeout_text,
-            "resolved": {
-                "api_key": cfg.tts.resolved_api_key().ok(),
-                "voice": Some(cfg.tts.resolved_voice()),
-            }
-        }
+        "data": tts_settings_json(&cfg.tts),
     }))
 }
 
@@ -389,136 +462,20 @@ pub async fn update_tts_settings(
     State(tts_config): State<Arc<RwLock<TtsConfig>>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let mut cfg = load_config();
-
-    // 更新 active_provider（如果提供）
-    if let Some(active) = body.get("active_provider").and_then(|v| v.as_str()) {
-        if !active.is_empty() {
-            cfg.tts.active_provider = active.to_string();
-        }
-    }
-
-    // 更新 providers（如果提供）
-    if let Some(providers) = parse_providers(&body) {
-        cfg.tts.providers = providers;
-    }
-
-    // 更新固定文本模式（如果提供）
-    if let Some(enabled) = body.get("fixed_text_enabled").and_then(|v| v.as_bool()) {
-        cfg.tts.fixed_text_enabled = enabled;
-    }
-
-    // 更新固定文本内容（如果提供）
-    if body.get("fixed_text").is_some() {
-        let text = body
-            .get("fixed_text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        cfg.tts.fixed_text = if text.is_empty() {
-            None
-        } else {
-            Some(text.to_string())
-        };
-    }
-
-    // 更新唤醒问候开关（如果提供）
-    if let Some(enabled) = body.get("wake_greeting_enabled").and_then(|v| v.as_bool()) {
-        cfg.tts.wake_greeting_enabled = enabled;
-    }
-
-    // 更新唤醒问候文案（如果提供）
-    if body.get("wake_greeting").is_some() {
-        let text = body
-            .get("wake_greeting")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        cfg.tts.wake_greeting = if text.is_empty() {
-            None
-        } else {
-            Some(text.to_string())
-        };
-    }
-
-    // 更新无语音告别文案（如果提供；空串视为未设置，回退「拜拜」）
-    if body.get("no_speech_goodbye").is_some() {
-        let text = body
-            .get("no_speech_goodbye")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        cfg.tts.no_speech_goodbye = if text.is_empty() {
-            None
-        } else {
-            Some(text.to_string())
-        };
-    }
-
-    // 更新无语音超时时长（如果提供；0 表示禁用）
-    if let Some(ms) = body.get("no_speech_timeout_ms").and_then(|v| v.as_u64()) {
-        cfg.tts.no_speech_timeout_ms = ms;
-    }
-
-    // 更新处理进度提示开关（如果提供）
-    if let Some(enabled) = body
-        .get("thinking_feedback_enabled")
-        .and_then(|v| v.as_bool())
-    {
-        cfg.tts.thinking_feedback_enabled = enabled;
-    }
-
-    // 更新进度提示播报间隔（如果提供；0 表示仅保留超时兜底）
-    if let Some(ms) = body
-        .get("thinking_feedback_interval_ms")
-        .and_then(|v| v.as_u64())
-    {
-        cfg.tts.thinking_feedback_interval_ms = ms;
-    }
-
-    // 更新周期进度提示文案（如果提供；空串视为未设置，回退默认）
-    if body.get("thinking_feedback_text").is_some() {
-        let text = body
-            .get("thinking_feedback_text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        cfg.tts.thinking_feedback_text = if text.is_empty() {
-            None
-        } else {
-            Some(text.to_string())
-        };
-    }
-
-    // 更新超时兜底文案（如果提供；空串视为未设置，回退默认）
-    if body.get("thinking_feedback_timeout_text").is_some() {
-        let text = body
-            .get("thinking_feedback_timeout_text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        cfg.tts.thinking_feedback_timeout_text = if text.is_empty() {
-            None
-        } else {
-            Some(text.to_string())
-        };
-    }
-
-    if let Err(e) = crate::config::settings::save_settings(&cfg) {
-        tracing::warn!(error = %e, "保存 TTS 配置到文件失败");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": format!("保存配置失败: {}", e)
-            })),
-        ));
-    }
+    let (cfg, _) = update_settings(|cfg| {
+        apply_tts_update(&mut cfg.tts, &body);
+        Ok(false)
+    })
+    .map_err(settings_update_error)?;
 
     // 更新内存中的共享 TTS 配置，使运行时策略即时感知变更
     *tts_config.write().unwrap() = cfg.tts.clone();
 
     Ok(Json(serde_json::json!({
         "success": true,
-        "data": {
-            "active_provider": cfg.tts.active_provider,
-            "providers": cfg.tts.providers,
-        }
+        "data": tts_settings_json(&cfg.tts),
+        "restart_required": false,
+        "message": "已保存",
     })))
 }
 
@@ -758,6 +715,83 @@ mod tests {
     fn test_parse_providers_missing() {
         let json = serde_json::json!({"other": "value"});
         assert!(parse_providers(&json).is_none());
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn update_tts_clears_empty_provider_key_and_returns_full_settings() {
+        use crate::test_util::run_with_temp_home;
+
+        run_with_temp_home(|_| {
+            let shared = Arc::new(RwLock::new(TtsConfig::default()));
+
+            // 第一次写入完整 map（UI 每次提交的是当前 Tab 的完整字段）。
+            let first = serde_json::json!({
+                "active_provider": "doubao",
+                "providers": {
+                    "doubao": {
+                        "api_key": "secret",
+                        "voice": "zh_female_vv_uranus_bigtts"
+                    }
+                },
+                "fixed_text_enabled": true,
+                "fixed_text": "固定文本",
+                "thinking_feedback_enabled": false,
+                "thinking_feedback_interval_ms": 5000,
+                "thinking_feedback_text": "请稍等",
+                "thinking_feedback_timeout_text": "还在处理"
+            });
+            let res = block_on(update_tts_settings(State(shared.clone()), Json(first)))
+                .expect("首次保存应成功");
+            assert_eq!(res.0["restart_required"], false);
+            assert_eq!(res.0["data"]["fixed_text_enabled"], true);
+            assert_eq!(res.0["data"]["thinking_feedback_interval_ms"], 5000);
+            assert_eq!(res.0["data"]["thinking_feedback_text"], "请稍等");
+
+            // 清空 api_key：key 应被剪掉，voice 保留；运行时回退环境变量。
+            let second = serde_json::json!({
+                "providers": {
+                    "doubao": {
+                        "api_key": "",
+                        "voice": "zh_female_vv_uranus_bigtts"
+                    }
+                }
+            });
+            let res = block_on(update_tts_settings(State(shared), Json(second)))
+                .expect("清空 key 应成功");
+            let doubao = &res.0["data"]["providers"]["doubao"];
+            assert!(doubao.get("api_key").is_none(), "空串应删除 api_key");
+            assert_eq!(doubao["voice"], "zh_female_vv_uranus_bigtts");
+            // 未提供的顶层字段保持不变
+            assert_eq!(res.0["data"]["fixed_text_enabled"], true);
+            assert_eq!(res.0["data"]["thinking_feedback_enabled"], false);
+        });
+    }
+
+    #[test]
+    fn update_asr_clears_empty_provider_key() {
+        use crate::test_util::run_with_temp_home;
+
+        run_with_temp_home(|_| {
+            let shared = Arc::new(RwLock::new(AsrConfig::default()));
+            let first = serde_json::json!({
+                "active_provider": "doubao",
+                "providers": { "doubao": { "api_key": "secret", "resource_id": "volc.seedasr.sauc.duration" } }
+            });
+            let _ = block_on(update_asr_settings(State(shared.clone()), Json(first)))
+                .expect("保存成功");
+
+            let second = serde_json::json!({
+                "providers": { "doubao": { "api_key": "", "resource_id": "volc.seedasr.sauc.duration" } }
+            });
+            let res = block_on(update_asr_settings(State(shared), Json(second))).expect("清空成功");
+            let doubao = &res.0["data"]["providers"]["doubao"];
+            assert!(doubao.get("api_key").is_none());
+            assert_eq!(doubao["resource_id"], "volc.seedasr.sauc.duration");
+        });
     }
 
     // ─── doubao_voice_model 分类器 ──────────────────────────
