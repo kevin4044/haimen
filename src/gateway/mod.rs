@@ -531,6 +531,10 @@ pub(crate) fn build_mqtt_udp_config(
         prebuffer_count: 5,
         frame_duration_ms: 60,
         tail_extra_frames: 2,
+        // MQTT 控制面与 UDP 是两条链路：start 后留一段静默窗口给固件切
+        // Speaking，否则预缓冲帧会被静默丢弃，设备 jitter buffer 从 0 开始
+        // 持续 underrun。默认 100ms，可用 `[xiaozhi.udp] tts_start_settle_ms` 调。
+        tts_start_settle_ms: x.udp.tts_start_settle_ms,
         advertise_ip,
     }
 }

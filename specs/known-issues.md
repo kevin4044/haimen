@@ -222,8 +222,43 @@ TTS 合成没有断供。
 
 ## KI-004 TTS 轻微掉帧
 
-**状态**：待排查
+**状态**：根因已定位，修复待真机 A/B 验证（2026-10-21，分支 `fix/voice-frame-drop`）
 **严重度**：中（影响听感，不致命）
+
+### 根因（2026-10-21 诊断）
+
+MQTT+UDP 路径在 `publish_tts(TtsState::Start)` 之后**立刻**经 UDP 连发 5 帧预缓冲
+（`mqtt_udp.rs::drive_playback_inner`）。但 `publish_to` 只把 start 报文放进
+per-client 写队列就返回（写 socket 在另一个任务里），UDP 帧却立刻出网；固件要等
+`Schedule` 异步执行完才切到 `Speaking`，而这之前收到的音频只在协议层校验、**应用层
+静默丢弃**，且 `remote_sequence_` 已前进、不重传。
+
+结果：整批预缓冲（300ms）被丢，设备 jitter buffer 实际为 **0**；之后发送严格按
+60ms 实时节奏，不会自行重建余量 —— 任何 UDP/设备调度抖动都直接 underrun，听感就是
+「整轮都在掉帧」。也解释了为什么只补尾帧（T1）无效、以及为什么切 MQTT 后更明显
+（WS 的 start 与音频同走一条有序 TCP，没有跨链路竞态，但固件异步窗口仍在）。
+
+完整证据与日志统计见 `specs/voice-frame-drop/diagnosis.md`。
+
+### 修复
+
+`tts start` 之后、首帧之前留一段可取消的静默窗口（settle），让固件先切进 Speaking：
+
+```toml
+[xiaozhi.udp]
+tts_start_settle_ms = 100   # 默认 100；0 = 旧行为，真机 A/B 用
+```
+
+覆盖正常回放与主动播报（`say_raw_frames`）；`下行播放统计` 日志新增 `settle_ms`
+字段，便于确认线上配置生效。
+
+### A/B 验证步骤
+
+1. 部署后确认 `settings.toml` 有 `[xiaozhi.udp] tts_start_settle_ms`（不写默认 100）；
+2. 设 0 播 10 轮、设 100 播 10 轮，对比句中卡顿次数；
+3. 看 `下行播放统计` 的 `settle_ms` 确认每轮配置真正生效；
+4. 若 100ms 仍偶发掉帧 → 先排除网络/固件侧（见 diagnosis §6.5），再考虑
+   prebuffer 5 → 8（不要一次改两个变量）。
 
 ### 现象
 
@@ -248,6 +283,11 @@ MQTT+UDP：音频帧走 UDP，不可靠、可能乱序/丢包
 3. **本地网络**：Mac Studio ↔ 设备在同一网段，丢包应该很少；可用 ping 大包压测
 4. **单包大小**：`opus` VBR 导致包长波动，是否触发设备侧缓冲异常
 5. **对比实验**：同一段文本，WS 模式 vs MQTT 模式各播一次，对比掉帧情况
+
+> 以上 5 条是 2026-10-18 的排查方向。2026-10-21 的复核结论：发送侧（1）已用
+> 86 轮日志证明无丢帧/无停顿；网络侧（3）实测 0% 丢包但有 WiFi 省电型 RTT
+> 抖动（残留风险）；主因是上文的 start 竞态。若 settle 修复后仍有掉帧，再回来
+> 查这些方向。
 
 ---
 
