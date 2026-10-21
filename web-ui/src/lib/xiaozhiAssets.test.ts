@@ -10,11 +10,13 @@ import {
   coverFitRect,
   describeAssetsError,
   EMOJI_NAMES,
+  EMOJI_PRESETS,
   fileExtension,
   formatBytes,
   isGifFile,
   isSupportedEmojiFile,
   LVGL_IMAGE_HEADER_SIZE,
+  presetEmojiUrl,
   rgbaToRgb565,
   wrapBackgroundRaw,
 } from './xiaozhiAssets';
@@ -58,6 +60,20 @@ function expectHeader(bin: Uint8Array, totalFiles: number): Uint8Array {
   expect(readU32(bin, 4)).toBe(checksum);
   return combined;
 }
+
+describe('官方表情预设', () => {
+  it('提供 Twemoji 64 PNG 与 Noto Emoji 64 GIF 两套', () => {
+    expect(EMOJI_PRESETS.map((preset) => [preset.id, preset.format, preset.size])).toEqual([
+      ['twemoji64', 'png', 64],
+      ['noto-emoji_64', 'gif', 64],
+    ]);
+  });
+
+  it('预设 URL 指向内置 public/emojis 目录', () => {
+    expect(presetEmojiUrl(EMOJI_PRESETS[0], 'happy')).toBe('/emojis/twemoji64/happy.png');
+    expect(presetEmojiUrl(EMOJI_PRESETS[1], 'neutral')).toBe('/emojis/noto-emoji_64/neutral.gif');
+  });
+});
 
 describe('buildAssetsBin', () => {
   it('只包含 index.json 时生成 12 字节头 + 44 字节表 + data', () => {

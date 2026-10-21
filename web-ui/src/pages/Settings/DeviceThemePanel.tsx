@@ -32,11 +32,14 @@ import {
   DEFAULT_LIGHT_BACKGROUND,
   describeAssetsError,
   EMOJI_NAMES,
+  EMOJI_PRESETS,
   type EmojiName,
+  type EmojiPresetId,
   emojiFileToAssets,
   formatBytes,
   imageToBackgroundRaw,
   isGifFile,
+  presetEmojiUrl,
   readFileBytes,
 } from '@/lib/xiaozhiAssets';
 
@@ -438,6 +441,10 @@ export default function DeviceThemePanel() {
     createBackgroundDraft(DEFAULT_DARK_BACKGROUND),
   );
   const [emojis, setEmojis] = useState<Record<EmojiName, EmojiDraft>>(createEmojiDrafts);
+  const [emojiPreset, setEmojiPreset] = useState<EmojiPresetId | 'none'>('twemoji64');
+  const [presetLoading, setPresetLoading] = useState(false);
+  const [presetError, setPresetError] = useState<string | null>(null);
+  const presetRequest = useRef(0);
   const [fontFile, setFontFile] = useState<File | null>(null);
   const [fontData, setFontData] = useState<Uint8Array | null>(null);
   const [fontConverting, setFontConverting] = useState(false);
@@ -626,6 +633,91 @@ export default function DeviceThemePanel() {
     updateEmoji(name, createEmojiDraft());
   };
 
+  /** 清空全部表情槽：保留设备当前表情，不写 emoji_collection。 */
+  const clearEmojiPreset = () => {
+    presetRequest.current += 1;
+    setEmojiPreset('none');
+    setPresetLoading(false);
+    setPresetError(null);
+    setEmojis(createEmojiDrafts());
+  };
+
+  /**
+   * 加载内置官方表情包：
+   * - Twemoji 64 PNG：静态、体积小，默认；
+   * - Noto Emoji 64 GIF：动态，设备需要 PSRAM。
+   */
+  const loadEmojiPreset = useCallback(async (id: EmojiPresetId) => {
+    const preset = EMOJI_PRESETS.find((item) => item.id === id);
+    if (!preset) return;
+    const seq = presetRequest.current + 1;
+    presetRequest.current = seq;
+    setEmojiPreset(id);
+    setPresetLoading(true);
+    setPresetError(null);
+    setEmojis((prev) => {
+      const next = { ...prev };
+      for (const name of EMOJI_NAMES) {
+        next[name] = { ...next[name], converting: true, error: null };
+      }
+      return next;
+    });
+    try {
+      const results = await Promise.all(
+        EMOJI_NAMES.map(async (name) => {
+          const response = await fetch(presetEmojiUrl(preset, name), { cache: 'force-cache' });
+          if (!response.ok) {
+            throw new Error(`${name}: HTTP ${response.status}`);
+          }
+          const blob = await response.blob();
+          const file = new File([blob], `${name}.${preset.format}`, {
+            type: preset.format === 'gif' ? 'image/gif' : 'image/png',
+          });
+          const processed = await emojiFileToAssets(file);
+          return { name, file, processed };
+        }),
+      );
+      if (presetRequest.current !== seq) return;
+      setEmojis((prev) => {
+        const next = { ...prev };
+        for (const item of results) {
+          next[item.name] = {
+            file: item.file,
+            data: item.processed.data,
+            width: item.processed.width,
+            height: item.processed.height,
+            ext: item.processed.ext,
+            isGif: item.processed.isGif,
+            converting: false,
+            error: null,
+          };
+        }
+        return next;
+      });
+    } catch (error) {
+      if (presetRequest.current !== seq) return;
+      setPresetError(
+        error instanceof Error
+          ? `加载 ${preset.name} 失败：${error.message}`
+          : `加载 ${preset.name} 失败`,
+      );
+      setEmojis((prev) => {
+        const next = { ...prev };
+        for (const name of EMOJI_NAMES) {
+          next[name] = { ...next[name], converting: false };
+        }
+        return next;
+      });
+    } finally {
+      if (presetRequest.current === seq) setPresetLoading(false);
+    }
+  }, []);
+
+  // 默认使用官方 Twemoji 64 静态表情；用户可切到 Noto GIF 或“保持当前”。
+  useEffect(() => {
+    void loadEmojiPreset('twemoji64');
+  }, [loadEmojiPreset]);
+
   const handleFontFile = async (file: File) => {
     setFontError(null);
     setNotice(null);
@@ -751,6 +843,7 @@ export default function DeviceThemePanel() {
     light.converting ||
     dark.converting ||
     fontConverting ||
+    presetLoading ||
     EMOJI_NAMES.some((name) => emojis[name].converting);
 
   const blockReason: string | null = !selectedDevice
@@ -988,8 +1081,68 @@ export default function DeviceThemePanel() {
           <div>
             <h3 className="text-sm font-medium">表情包（{EMOJI_NAMES.length} 个槽位）</h3>
             <p className="text-xs text-muted-foreground">
-              支持 PNG/GIF/JPG/WEBP；静态图会自动缩放到 64×64 以内，GIF
+              内置官方 Twemoji / Noto Emoji 预设，也可以逐槽上传
+              PNG/GIF/JPG/WEBP；静态图会自动缩放到 64×64 以内，GIF
               原样上传。只要自定义了表情，就必须提供 neutral。
+            </p>
+          </div>
+          <div className="space-y-2 rounded-lg border p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-sm font-medium">官方预设</span>
+              <Badge variant="outline" className="text-muted-foreground">
+                内置
+              </Badge>
+            </div>
+            <div className="grid gap-2 md:grid-cols-3">
+              <button
+                type="button"
+                onClick={clearEmojiPreset}
+                disabled={phase !== 'idle' || presetLoading}
+                className={cn(
+                  'rounded-lg border p-2 text-left transition-colors',
+                  emojiPreset === 'none'
+                    ? 'border-primary bg-primary/5'
+                    : 'border-input hover:border-primary/50',
+                )}
+              >
+                <div className="text-sm font-medium">保持设备当前表情</div>
+                <div className="text-xs text-muted-foreground">不写入 emoji_collection</div>
+              </button>
+              {EMOJI_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() => void loadEmojiPreset(preset.id)}
+                  disabled={phase !== 'idle' || presetLoading}
+                  className={cn(
+                    'rounded-lg border p-2 text-left transition-colors',
+                    emojiPreset === preset.id
+                      ? 'border-primary bg-primary/5'
+                      : 'border-input hover:border-primary/50',
+                  )}
+                >
+                  <div className="mb-1 flex gap-1">
+                    {EMOJI_NAMES.slice(0, 7).map((name) => (
+                      <img
+                        key={name}
+                        src={presetEmojiUrl(preset, name)}
+                        alt=""
+                        loading="lazy"
+                        className="h-6 w-6 object-contain"
+                      />
+                    ))}
+                  </div>
+                  <div className="text-sm font-medium">{preset.name}</div>
+                  <div className="text-xs text-muted-foreground">{preset.description}</div>
+                </button>
+              ))}
+            </div>
+            {presetLoading && (
+              <p className="text-xs text-muted-foreground">正在加载官方表情预设...</p>
+            )}
+            {presetError && <p className="text-xs text-destructive">{presetError}</p>}
+            <p className="text-[11px] text-muted-foreground">
+              Twemoji：CC-BY 4.0 · Noto Emoji：OFL-1.1；Noto GIF 需要设备 PSRAM。
             </p>
           </div>
           {neutralMissing && (
@@ -1017,7 +1170,7 @@ export default function DeviceThemePanel() {
                 key={name}
                 name={name}
                 draft={emojis[name]}
-                disabled={phase !== 'idle'}
+                disabled={phase !== 'idle' || presetLoading}
                 onPickFile={(file) => void handleEmojiFile(name, file)}
                 onClear={() => clearEmoji(name)}
               />

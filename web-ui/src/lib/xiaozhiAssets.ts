@@ -37,6 +37,43 @@ export const EMOJI_NAMES = [
 
 export type EmojiName = (typeof EMOJI_NAMES)[number];
 
+/** 内置官方表情包 ID（对应 `web-ui/public/emojis/<basePath>`） */
+export type EmojiPresetId = 'twemoji64' | 'noto-emoji_64';
+
+/** 官方主题页同款表情包；64px 版本体积可控，且 Twemoji 不需要 PSRAM。 */
+export interface EmojiPreset {
+  id: EmojiPresetId;
+  name: string;
+  description: string;
+  format: 'png' | 'gif';
+  size: number;
+  basePath: string;
+}
+
+export const EMOJI_PRESETS: readonly EmojiPreset[] = [
+  {
+    id: 'twemoji64',
+    name: 'Twemoji 64×64',
+    description: '静态 PNG、透明背景，体积小，默认推荐',
+    format: 'png',
+    size: 64,
+    basePath: 'twemoji64',
+  },
+  {
+    id: 'noto-emoji_64',
+    name: 'Noto Emoji 64×64',
+    description: '动态 GIF，更生动；设备需要 PSRAM',
+    format: 'gif',
+    size: 64,
+    basePath: 'noto-emoji_64',
+  },
+] as const;
+
+/** 取内置表情包某个情绪的静态资源 URL。 */
+export function presetEmojiUrl(preset: EmojiPreset, name: EmojiName): string {
+  return `/emojis/${preset.basePath}/${name}.${preset.format}`;
+}
+
 /** 表情文件允许的上传格式（小写扩展名） */
 export const EMOJI_EXTENSIONS = ['png', 'gif', 'jpg', 'jpeg', 'webp'] as const;
 
