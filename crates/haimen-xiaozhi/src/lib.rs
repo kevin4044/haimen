@@ -1,3 +1,4 @@
+pub mod device_mcp;
 pub mod devices;
 pub mod firmware;
 pub mod mqtt;
@@ -13,6 +14,7 @@ pub mod types;
 pub mod udp_audio;
 mod ws;
 
+pub use device_mcp::{DeviceMcpError, DeviceMcpHub, device_mcp_hub, install_device_mcp_hub};
 pub use devices::{DeviceDirectory, install_device_directory, install_devices_from_config};
 pub use firmware::{
     DeviceFirmwareReport, FirmwareBlobStore, FirmwareMetadataStore, FirmwareStoreConfig,

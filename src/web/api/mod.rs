@@ -6,6 +6,7 @@ pub mod logs;
 pub mod system;
 pub mod voice_settings;
 pub mod webhook;
+pub mod xiaozhi_assets;
 pub mod xiaozhi_devices;
 pub mod xiaozhi_firmware;
 pub mod xiaozhi_settings;

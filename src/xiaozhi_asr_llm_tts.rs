@@ -401,6 +401,47 @@ impl TtsTextAggregator {
 }
 
 /// 聚合后台任务：清洗 + 按句/阈值/定时把块送入 agg_tx，并累计清洗全文（供零音频兜底重试）
+/// 从回复流开头提取一个情绪 emoji，并把去掉 emoji 的文本转发给 TTS/字幕。
+///
+/// Hermes 侧约定每条回复以情绪 emoji 开头；官方服务端也是从第一条文本里
+/// 取 emoji 后发 `llm`。这里只检查第一个非空块，避免正文里的 emoji 被误判。
+fn strip_emotion_prefix_stream(
+    mut input: Box<dyn futures_util::Stream<Item = String> + Unpin + Send>,
+    emotion_tx: mpsc::Sender<PlaybackEvent>,
+) -> ReceiverStream<String> {
+    let (clean_tx, clean_rx) = mpsc::channel::<String>(64);
+    tokio::spawn(async move {
+        let mut emotion_checked = false;
+        while let Some(chunk) = input.next().await {
+            let cleaned = if !emotion_checked && !chunk.trim().is_empty() {
+                emotion_checked = true;
+                let (signal, cleaned) = crate::emotion::extract_leading_emotion(&chunk);
+                if let Some(signal) = signal {
+                    tracing::warn!(
+                        emotion = %signal.emotion,
+                        emoji = %signal.emoji,
+                        "助手回复带情绪 emoji，下发 llm 表情"
+                    );
+                    let event = PlaybackEvent::Emotion {
+                        emotion: signal.emotion.to_owned(),
+                        emoji: Some(signal.emoji.to_owned()),
+                    };
+                    if emotion_tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+                cleaned
+            } else {
+                chunk
+            };
+            if !cleaned.is_empty() && clean_tx.send(cleaned).await.is_err() {
+                return;
+            }
+        }
+    });
+    ReceiverStream::new(clean_rx)
+}
+
 async fn tts_aggregate_task(
     mut input: Box<dyn futures_util::Stream<Item = String> + Unpin + Send>,
     agg_tx: mpsc::Sender<String>,
@@ -2350,6 +2391,12 @@ impl ResponseStrategy for AsrLlmTtsStrategy {
                 Box::new(text_stream_inner)
             };
 
+        // ── 情绪前缀：Hermes 约定每条回复开头带一个 emoji ──
+        // 只检查第一个非空文本块；识别后立即把 Emotion 事件送入回放通道，
+        // 并从文本里剥掉 emoji，避免 TTS 把表情念出来、也避免字幕里重复。
+        let text_stream: Box<dyn futures_util::Stream<Item = String> + Unpin + Send> =
+            Box::new(strip_emotion_prefix_stream(text_stream, frame_tx.clone()));
+
         // ── 句切分：按句末标点把文本流切分为句子，逐句下发设备屏幕 ──
         // speak_stream 惰性消费 text_stream（边合成边按需拉取文本），因此句子事件
         // 在 TTS 拉取文本的瞬间产生，与音频节奏天然近似同步，且先于该句音频
@@ -4000,6 +4047,47 @@ fn make_fallback_audio_frames() -> Result<Vec<AudioFrame>, String> {
 mod tests {
     use super::*;
     use crate::gateway::provider::AgentOutput;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn emotion_prefix_stream_emits_event_and_strips_emoji() {
+        let (tx, mut rx) = mpsc::channel::<PlaybackEvent>(8);
+        let stream = strip_emotion_prefix_stream(
+            Box::new(futures_util::stream::iter(vec![
+                "🙂你好".to_string(),
+                "，世界".to_string(),
+            ])),
+            tx,
+        );
+        let chunks: Vec<String> = stream.collect().await;
+        assert_eq!(chunks, vec!["你好".to_string(), "，世界".to_string()]);
+        match rx.recv().await.expect("应收到情绪事件") {
+            PlaybackEvent::Emotion { emotion, emoji } => {
+                assert_eq!(emotion, "happy");
+                assert_eq!(emoji.as_deref(), Some("🙂"));
+            }
+            other => panic!("期望 Emotion，实际 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emotion_prefix_stream_ignores_later_or_unknown_emoji() {
+        let (tx, mut rx) = mpsc::channel::<PlaybackEvent>(8);
+        let stream = strip_emotion_prefix_stream(
+            Box::new(futures_util::stream::iter(vec![
+                "先说一句话".to_string(),
+                "🙂后置表情".to_string(),
+            ])),
+            tx,
+        );
+        let chunks: Vec<String> = stream.collect().await;
+        assert_eq!(
+            chunks,
+            vec!["先说一句话".to_string(), "🙂后置表情".to_string()]
+        );
+        assert!(rx.try_recv().is_err(), "正文里的 emoji 不应产生情绪事件");
+    }
+
     use crate::gateway::provider::AgentProvider;
     use crate::xiaozhi_tts::pcm_to_opus_frames;
 

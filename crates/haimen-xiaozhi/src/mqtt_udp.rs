@@ -8,15 +8,16 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 
+use crate::device_mcp::{DeviceMcpError, DeviceMcpHub};
 use crate::devices::{device_directory, device_id_from_client_id};
 use crate::mqtt_broker::{
     BrokerIncoming, BrokerOutgoing, MqttBrokerConfig, MqttBrokerError, MqttBrokerHandle,
@@ -285,6 +286,9 @@ struct Tables {
     udp_index: HashMap<u32, String>,
 }
 
+type McpResponseSender = oneshot::Sender<Result<serde_json::Value, DeviceMcpError>>;
+type PendingMcp = HashMap<(String, i64), McpResponseSender>;
+
 struct Shared {
     broker: MqttBrokerHandle,
     udp: UdpAudioHandle,
@@ -293,6 +297,10 @@ struct Shared {
     tables: Mutex<Tables>,
     playbacks: Mutex<Vec<JoinHandle<()>>>,
     shutdown_tx: watch::Sender<bool>,
+    /// 设备 MCP JSON-RPC 请求 id（单调递增；固件要求 number）。
+    mcp_next_id: AtomicI64,
+    /// `(client_id, jsonrpc id)` → 等待中的响应通道。
+    pending_mcp: Mutex<PendingMcp>,
 }
 
 struct PlaybackJob {
@@ -390,6 +398,8 @@ impl MqttUdpTransport {
             }),
             playbacks: Mutex::new(Vec::new()),
             shutdown_tx: shutdown_tx.clone(),
+            mcp_next_id: AtomicI64::new(1),
+            pending_mcp: Mutex::new(HashMap::new()),
         });
         let task_shared = Arc::clone(&shared);
         let task = tokio::spawn(async move {
@@ -444,6 +454,13 @@ impl MqttUdpTransport {
     /// 只需要这三个能力，不该看到传输层的内部表结构。
     pub fn say_hub(&self) -> Arc<dyn SayDeviceHub> {
         Arc::new(SayHubImpl {
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
+    /// 管理面设备 MCP 门面：只做 `tools/call`，与 notify/对话策略无关。
+    pub fn device_mcp_hub(&self) -> Arc<dyn DeviceMcpHub> {
+        Arc::new(DeviceMcpHubImpl {
             shared: Arc::clone(&self.shared),
         })
     }
@@ -562,6 +579,180 @@ impl SayDeviceHub for SayHubImpl {
             }
         }
     }
+}
+
+/// 设备 MCP 客户端：把 `tools/call` 封装成设备能识别的 `type:"mcp"` JSON。
+///
+/// 这里刻意不复用 `src/agents/mcp_client.rs`：那是给 AI Agent 连接外部
+/// MCP server 的进程内客户端；设备 MCP 走的是设备自己的 MQTT 连接。
+struct DeviceMcpHubImpl {
+    shared: Arc<Shared>,
+}
+
+impl DeviceMcpHubImpl {
+    async fn publish_tool_call(
+        &self,
+        client_id: &str,
+        id: i64,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<(), DeviceMcpError> {
+        let session_id = protocol_session_id(&self.shared, client_id)
+            .await
+            .unwrap_or_default();
+        let arguments = if arguments.is_null() {
+            serde_json::json!({})
+        } else {
+            arguments
+        };
+        let body = build_mcp_tool_call(&session_id, id, tool, arguments).to_string();
+        let topic = self
+            .shared
+            .cfg
+            .downlink_topic_template
+            .replace("{mac}", &device_id_from_client_id(client_id));
+        let published = tokio::time::timeout(
+            MQTT_WRITE_TIMEOUT,
+            self.shared.broker.publish_to(BrokerOutgoing {
+                client_id: client_id.to_owned(),
+                topic,
+                payload: body.into_bytes(),
+            }),
+        )
+        .await;
+        match published {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err(DeviceMcpError::Offline),
+            Ok(Err(err)) => Err(DeviceMcpError::Transport(err.to_string())),
+            Err(_) => Err(DeviceMcpError::Transport("下发写队列超时".to_owned())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl DeviceMcpHub for DeviceMcpHubImpl {
+    async fn call_tool(
+        &self,
+        client_id: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, DeviceMcpError> {
+        let id = self.shared.mcp_next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.shared
+            .pending_mcp
+            .lock()
+            .await
+            .insert((client_id.to_owned(), id), tx);
+
+        if let Err(err) = self.publish_tool_call(client_id, id, tool, arguments).await {
+            self.shared
+                .pending_mcp
+                .lock()
+                .await
+                .remove(&(client_id.to_owned(), id));
+            return Err(err);
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(err))) => Err(err),
+            Ok(Err(_)) => Err(DeviceMcpError::Transport("响应通道已关闭".to_owned())),
+            Err(_) => {
+                self.shared
+                    .pending_mcp
+                    .lock()
+                    .await
+                    .remove(&(client_id.to_owned(), id));
+                Err(DeviceMcpError::Timeout)
+            }
+        }
+    }
+
+    async fn notify_tool(
+        &self,
+        client_id: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<(), DeviceMcpError> {
+        let id = self.shared.mcp_next_id.fetch_add(1, Ordering::Relaxed);
+        self.publish_tool_call(client_id, id, tool, arguments).await
+    }
+}
+
+/// 构造设备 MCP 请求外层。单独抽出便于单测校验字段，不依赖 broker。
+fn build_mcp_tool_call(
+    session_id: &str,
+    id: i64,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "type": "mcp",
+        "payload": {
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": arguments,
+            }
+        }
+    })
+}
+
+/// 处理设备回上来的 `type:"mcp"` 消息。
+///
+/// 只认带数字 `id` 的 JSON-RPC response；设备主动发的 request/notification
+/// 目前没有业务用途，记录后丢弃。
+async fn handle_mcp_message(shared: &Shared, client_id: &str, value: serde_json::Value) {
+    let Some(payload) = value.get("payload").and_then(|item| item.as_object()) else {
+        tracing::warn!(%client_id, "MCP 消息缺少 payload，丢弃");
+        return;
+    };
+    if payload.get("method").is_some() {
+        tracing::debug!(%client_id, "忽略设备主动发送的 MCP request/notification");
+        return;
+    }
+    let Some(id) = payload.get("id").and_then(|item| item.as_i64()) else {
+        tracing::warn!(%client_id, "MCP 响应缺少数字 id，丢弃");
+        return;
+    };
+    let sender = shared
+        .pending_mcp
+        .lock()
+        .await
+        .remove(&(client_id.to_owned(), id));
+    let Some(sender) = sender else {
+        tracing::debug!(%client_id, id, "没有等待中的 MCP 请求，忽略响应");
+        return;
+    };
+
+    let outcome = if let Some(error) = payload.get("error") {
+        let code = error
+            .get("code")
+            .and_then(|item| item.as_i64())
+            .unwrap_or(0);
+        let message = error
+            .get("message")
+            .and_then(|item| item.as_str())
+            .unwrap_or("unknown error");
+        if code == -32601 || code == -32602 || message.starts_with("Unknown tool") {
+            Err(DeviceMcpError::Unsupported(message.to_owned()))
+        } else {
+            Err(DeviceMcpError::ToolError(format!(
+                "{message} (code {code})"
+            )))
+        }
+    } else {
+        Ok(payload
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    };
+    let _ = sender.send(outcome);
 }
 
 /// notify 全局槽。
@@ -842,11 +1033,6 @@ async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
 
     // ── 以下是设备上行消息的正常处理 ──
 
-    {
-        let mut tables = shared.tables.lock().await;
-        let session = ensure_session(&mut tables, &msg.client_id);
-        session.last_activity = Instant::now();
-    }
     let text = match std::str::from_utf8(&msg.payload) {
         Ok(text) => text,
         Err(err) => {
@@ -865,6 +1051,19 @@ async fn handle_mqtt(shared: &Arc<Shared>, msg: BrokerIncoming) {
         .get("type")
         .and_then(|item| item.as_str())
         .unwrap_or("");
+
+    // MCP 响应可能来自一台尚未 hello 的设备（例如刚重启、只回了工具调用）。
+    // 先处理它，避免 ensure_session 把一个纯控制面响应误当成对话开始。
+    if kind == "mcp" {
+        handle_mcp_message(shared, &msg.client_id, value).await;
+        return;
+    }
+
+    {
+        let mut tables = shared.tables.lock().await;
+        let session = ensure_session(&mut tables, &msg.client_id);
+        session.last_activity = Instant::now();
+    }
     match kind {
         "hello" => handle_hello(shared, &msg.client_id, value).await,
         "listen" => handle_listen(shared, &msg.client_id, value).await,
@@ -1692,6 +1891,11 @@ async fn drive_playback_inner(
                     return false;
                 }
             }
+            Some(PlaybackEvent::Emotion { emotion, emoji }) => {
+                if !publish_llm_emotion(shared, &job.client_id, &emotion, emoji.as_deref()).await {
+                    return false;
+                }
+            }
             Some(PlaybackEvent::LlmSentence(text)) => sentences.push(text),
             Some(PlaybackEvent::Audio(audio)) => prebuffer.push(audio),
             None => {
@@ -1779,6 +1983,11 @@ async fn drive_playback_inner(
         match event {
             PlaybackEvent::Stt(text) => {
                 if !publish_stt(shared, &job.client_id, &text).await {
+                    return false;
+                }
+            }
+            PlaybackEvent::Emotion { emotion, emoji } => {
+                if !publish_llm_emotion(shared, &job.client_id, &emotion, emoji.as_deref()).await {
                     return false;
                 }
             }
@@ -1933,6 +2142,21 @@ async fn release_udp(shared: &Shared, client_id: &str, reason: &str) {
 
 /// `publish_to` 返回 false 时设备已经不在 broker 上，整份会话都清掉。
 async fn drop_client(shared: &Shared, client_id: &str) {
+    // 先让所有等待中的 MCP 调用立即失败，避免 HTTP 请求挂到超时。
+    {
+        let mut pending = shared.pending_mcp.lock().await;
+        let keys: Vec<_> = pending
+            .keys()
+            .filter(|(owner, _)| owner == client_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(tx) = pending.remove(&key) {
+                let _ = tx.send(Err(DeviceMcpError::Offline));
+            }
+        }
+    }
+
     let udp_id = {
         let mut tables = shared.tables.lock().await;
         let Some(session) = tables.sessions.remove(client_id) else {
@@ -2008,6 +2232,30 @@ fn ensure_session<'a>(tables: &'a mut Tables, client_id: &str) -> &'a mut Device
 
 fn cancelled(cancel: &watch::Receiver<bool>, shared: &Shared) -> bool {
     *cancel.borrow() || *shared.shutdown_tx.borrow()
+}
+
+async fn publish_llm_emotion(
+    shared: &Shared,
+    client_id: &str,
+    emotion: &str,
+    emoji: Option<&str>,
+) -> bool {
+    let session_id = match protocol_session_id(shared, client_id).await {
+        Some(session_id) => session_id,
+        None => return false,
+    };
+    let body = match serde_json::to_string(&ServerMessage::Llm {
+        session_id,
+        emotion: emotion.to_owned(),
+        text: emoji.map(str::to_owned),
+    }) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "llm 情绪消息序列化失败");
+            return false;
+        }
+    };
+    publish_body(shared, client_id, &body).await
 }
 
 async fn publish_stt(shared: &Shared, client_id: &str, text: &str) -> bool {
@@ -2771,6 +3019,118 @@ mod tests {
             .await;
         let packets = collect_downlink(&env, &crypto, 8).await;
         (env, packets)
+    }
+
+    #[tokio::test]
+    async fn device_mcp_tool_call_round_trips_without_dialogue() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.hello().await;
+        let hub = env.transport.device_mcp_hub();
+        let call = tokio::spawn(async move {
+            hub.call_tool(
+                CLIENT_ID,
+                "self.assets.set_download_url",
+                serde_json::json!({ "url": "http://192.168.1.2/xiaozhi/assets/a.bin" }),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        let request = env.link.wait_type("mcp", Duration::from_secs(2)).await;
+        assert_eq!(request["payload"]["jsonrpc"], "2.0");
+        assert_eq!(request["payload"]["method"], "tools/call");
+        assert_eq!(
+            request["payload"]["params"]["name"],
+            "self.assets.set_download_url"
+        );
+        assert_eq!(
+            request["payload"]["params"]["arguments"]["url"],
+            "http://192.168.1.2/xiaozhi/assets/a.bin"
+        );
+        let id = request["payload"]["id"].as_i64().expect("数字 id");
+
+        let response = serde_json::json!({
+            "type": "mcp",
+            "payload": {
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": "true" }],
+                    "isError": false
+                }
+            }
+        });
+        env.link
+            .publish(
+                "device-server",
+                &serde_json::to_vec(&response).expect("序列化"),
+            )
+            .await;
+
+        let result = call.await.expect("任务").expect("工具调用");
+        assert_eq!(result["content"][0]["text"], "true");
+        // 对话策略不应被调用：这是控制面直连，不是 LLM/ASR 链路。
+        assert!(env.mock.lock().recording_starts.is_empty());
+        assert!(env.mock.lock().audio_frames.is_empty());
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn device_mcp_unknown_tool_maps_to_unsupported() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.hello().await;
+        let hub = env.transport.device_mcp_hub();
+        let call = tokio::spawn(async move {
+            hub.call_tool(
+                CLIENT_ID,
+                "self.assets.set_download_url",
+                serde_json::json!({ "url": "http://x/a.bin" }),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+        let request = env.link.wait_type("mcp", Duration::from_secs(2)).await;
+        let id = request["payload"]["id"].as_i64().expect("数字 id");
+        let response = serde_json::json!({
+            "type": "mcp",
+            "payload": {
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": "Unknown tool: self.assets.set_download_url" }
+            }
+        });
+        env.link
+            .publish(
+                "device-server",
+                &serde_json::to_vec(&response).expect("序列化"),
+            )
+            .await;
+        let error = call.await.expect("任务").expect_err("应失败");
+        assert!(matches!(
+            error,
+            crate::device_mcp::DeviceMcpError::Unsupported(_)
+        ));
+        env.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn device_mcp_timeout_cleans_pending() {
+        let mut env = Env::boot(Vec::new()).await;
+        env.hello().await;
+        let hub = env.transport.device_mcp_hub();
+        let call = tokio::spawn(async move {
+            hub.call_tool(
+                CLIENT_ID,
+                "self.assets.set_download_url",
+                serde_json::json!({ "url": "http://x/a.bin" }),
+                Duration::from_millis(80),
+            )
+            .await
+        });
+        let _request = env.link.wait_type("mcp", Duration::from_secs(2)).await;
+        let error = call.await.expect("任务").expect_err("应超时");
+        assert!(matches!(error, crate::device_mcp::DeviceMcpError::Timeout));
+        env.shutdown().await;
     }
 
     #[tokio::test]

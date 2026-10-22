@@ -92,6 +92,22 @@ pub fn set_say_http_port(port: u16) {
     lock_settings().http_port = port;
 }
 
+/// 设备可达的 HTTP 基址（优先 MQTT advertise_ip，其次局域网 IP）。
+///
+/// assets 主题包下载也用它：设备能连 MQTT broker 的 host，就一定能访问
+/// 同一台机器上的 HTTP 端口；不要退回 `localhost`。
+pub fn device_http_base() -> Option<String> {
+    let settings = read_settings();
+    let host = settings
+        .advertise_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|ip| !ip.is_empty())
+        .map(str::to_string)
+        .or_else(crate::mqtt_udp::lan_ip)?;
+    Some(format!("http://{host}:{}", settings.http_port))
+}
+
 #[derive(Deserialize)]
 pub struct SayRequest {
     text: String,

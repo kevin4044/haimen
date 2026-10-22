@@ -314,6 +314,28 @@ pub async fn start(
             axum::routing::post(api::xiaozhi_firmware::forget_xiaozhi_firmware_report),
         );
 
+    // 小智自定义主题 assets：上传/列表/设备信息/应用 + 设备下载
+    let xiaozhi_assets_routes = axum::Router::new()
+        .route(
+            "/api/v1/xiaozhi/assets",
+            axum::routing::get(api::xiaozhi_assets::list_xiaozhi_assets)
+                .post(api::xiaozhi_assets::upload_xiaozhi_assets),
+        )
+        .route(
+            "/api/v1/xiaozhi/assets/device-info",
+            axum::routing::get(api::xiaozhi_assets::get_xiaozhi_assets_device_info),
+        )
+        .route(
+            "/api/v1/xiaozhi/assets/apply",
+            axum::routing::post(api::xiaozhi_assets::apply_xiaozhi_assets),
+        )
+        .route(
+            "/xiaozhi/assets/{file}",
+            axum::routing::get(api::xiaozhi_assets::get_xiaozhi_asset),
+        )
+        // assets.bin 常到几 MB，axum 默认 2MB body limit 会直接 413。
+        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024));
+
     // 运行日志 SSE：实时 tail ~/.haimen/logs/app.log
     let logs_routes = axum::Router::new().route(
         "/api/v1/logs/stream",
@@ -343,6 +365,7 @@ pub async fn start(
         r = r.merge(xiaozhi_devices_routes);
         r = r.merge(xiaozhi_settings_routes);
         r = r.merge(xiaozhi_firmware_routes);
+        r = r.merge(xiaozhi_assets_routes);
         r = r.merge(logs_routes);
         r.fallback(r#static::handle)
     } else {
@@ -361,6 +384,7 @@ pub async fn start(
         r = r.merge(xiaozhi_devices_routes);
         r = r.merge(xiaozhi_settings_routes);
         r = r.merge(xiaozhi_firmware_routes);
+        r = r.merge(xiaozhi_assets_routes);
         r = r.merge(logs_routes);
         r.fallback(r#static::handle)
     };

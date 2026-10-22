@@ -19,6 +19,9 @@ use sha2::{Digest, Sha256};
 /// app 镜像大小上限（16 MiB）。
 pub const MAX_APP_BYTES: usize = 16 * 1024 * 1024;
 
+/// assets 分区镜像大小上限（16 MiB）。
+pub const MAX_ASSETS_BYTES: usize = 16 * 1024 * 1024;
+
 /// 解压后的固件条目上限（32 MiB）。
 ///
 /// release zip 内是整片 flash 的 merged-bin（含 bootloader/分区表/app/assets），
@@ -96,6 +99,10 @@ pub enum ArchiveError {
     InvalidImage(String),
     #[error("应用镜像校验失败: {0}")]
     Integrity(String),
+    #[error("合并固件中找不到 assets 分区: {0}")]
+    AssetsNotFound(String),
+    #[error("不是有效的 assets 镜像: {0}")]
+    InvalidAssets(String),
 }
 
 /// 提取出的 app 镜像及其元数据。
@@ -121,6 +128,102 @@ pub fn extract_app_image(
     let entry = select_firmware_entry(&entries)?;
     let firmware = read_entry(zip_bytes, entry, MAX_MERGED_BYTES)?;
     extract_from_firmware(&firmware, max_app_bytes)
+}
+
+/// 从 release ZIP 的 merged-bin 中提取 assets 分区镜像。
+///
+/// 主题下发会整体覆盖 assets 分区；为了保住唤醒词 `srmodels.bin` 和
+/// `common` 中文字体，haimen 在 apply 前从官方固件包取一份 factory assets
+/// 作为基础资源（见 `xiaozhi_firmware::factory_assets_for_device`）。
+pub fn extract_assets_image(
+    zip_bytes: &[u8],
+    max_assets_bytes: usize,
+) -> Result<Vec<u8>, ArchiveError> {
+    let entries = parse_zip_entries(zip_bytes)?;
+    let entry = select_firmware_entry(&entries)?;
+    let firmware = read_entry(zip_bytes, entry, MAX_MERGED_BYTES)?;
+    extract_assets_from_firmware(&firmware, max_assets_bytes)
+}
+
+fn extract_assets_from_firmware(
+    firmware: &[u8],
+    max_assets_bytes: usize,
+) -> Result<Vec<u8>, ArchiveError> {
+    let partition = find_assets_partition(firmware)?;
+    if partition.offset >= firmware.len() {
+        return Err(ArchiveError::InvalidAssets(format!(
+            "assets 分区 offset 0x{:X} 超出固件长度 {}",
+            partition.offset,
+            firmware.len()
+        )));
+    }
+    let end = partition
+        .offset
+        .saturating_add(partition.size)
+        .min(firmware.len());
+    let slice = &firmware[partition.offset..end];
+    if slice.len() < 12 {
+        return Err(ArchiveError::InvalidAssets(
+            "assets 分区不足 12 字节".into(),
+        ));
+    }
+    let total_files = u32_le(slice, 0).unwrap_or(0);
+    let combined_len = u32_le(slice, 8).unwrap_or(0) as usize;
+    if total_files == 0 || combined_len == 0 {
+        return Err(ArchiveError::InvalidAssets("assets 头文件为空".into()));
+    }
+    let total_len = 12usize
+        .checked_add(combined_len)
+        .ok_or_else(|| ArchiveError::InvalidAssets("assets 长度溢出".into()))?;
+    if total_len > slice.len() || total_len > max_assets_bytes {
+        return Err(ArchiveError::InvalidAssets(format!(
+            "assets 镜像 {total_len} 字节超过分区/上限"
+        )));
+    }
+    Ok(slice[..total_len].to_vec())
+}
+
+fn find_assets_partition(firmware: &[u8]) -> Result<AppPartition, ArchiveError> {
+    let table_start = PARTITION_TABLE_OFFSET;
+    if firmware.len() < table_start + PARTITION_ENTRY_SIZE {
+        return Err(ArchiveError::AssetsNotFound(
+            "固件不足 0x8000 字节，无法读取分区表".into(),
+        ));
+    }
+    let table_end =
+        (table_start + MAX_PARTITION_ENTRIES * PARTITION_ENTRY_SIZE).min(firmware.len());
+    let mut saw_magic = false;
+    let mut cursor = table_start;
+    while cursor + PARTITION_ENTRY_SIZE <= table_end {
+        if !partition_magic_ok(firmware, cursor) {
+            break;
+        }
+        saw_magic = true;
+        let partition_type = firmware[cursor + 2];
+        let subtype = firmware[cursor + 3];
+        let offset = u32_le(firmware, cursor + 4).unwrap_or(0) as usize;
+        let size = u32_le(firmware, cursor + 8).unwrap_or(0) as usize;
+        let label_bytes = &firmware[cursor + 12..cursor + 28];
+        let label_end = label_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(label_bytes.len());
+        let label = String::from_utf8_lossy(&label_bytes[..label_end]);
+        if size > 0
+            && (label.eq_ignore_ascii_case("assets") || (partition_type == 1 && subtype == 0x82))
+        {
+            return Ok(AppPartition { offset, size });
+        }
+        cursor += PARTITION_ENTRY_SIZE;
+    }
+    if !saw_magic {
+        return Err(ArchiveError::AssetsNotFound(
+            "0x8000 处没有有效的分区表".into(),
+        ));
+    }
+    Err(ArchiveError::AssetsNotFound(
+        "分区表中没有 assets 分区".into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
